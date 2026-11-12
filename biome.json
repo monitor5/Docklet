@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["**", "!**/src-tauri/gen", "!**/src-tauri/icons"]
+    "includes": ["**", "!**/src-tauri/gen", "!**/src-tauri/icons", "!skills"]
   },
   "formatter": {
     "indentStyle": "space",

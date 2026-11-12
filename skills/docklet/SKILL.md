@@ -1,5 +1,4 @@
 ---
-
 name: docklet
 description: Manage Docker Engine and Kubernetes on Windows through Docklet (a dedicated WSL2 distro, no Docker Desktop). Use when the user wants to start or stop the Docker engine, check its status, run docker or docker compose against it, or switch the local Kubernetes cluster on or off on a machine where the `docklet` CLI is installed.
 ---
