@@ -101,7 +101,11 @@ jobs:
           if (-not (Test-Docker "1-version" "$docker version --format {{.Server.Version}}" 30)) { $failed += "version" }
           if (-not (Test-Docker "2-hello-world" "$docker run --rm hello-world" 40)) { $failed += "hello-world" }
           if (-not (Test-Docker "3-pull" "$docker pull -q alpine" 120)) { $failed += "pull" }
-          if (-not (Test-Docker "4-half-close" "echo hi| $docker run -i --rm alpine cat" 40)) { $failed += "half-close" }
+          # Byte mode is the control: without message mode the CLI cannot
+          # half-close, so this command is expected to hang there.
+          $halfClose = Test-Docker "4-half-close" "echo hi| $docker run -i --rm alpine cat" 40
+          $expected = "${{ matrix.mode }}" -eq "message"
+          if ($halfClose -ne $expected) { $failed += "half-close" }
           if (-not (Test-Docker "5-version-again" "$docker version --format {{.Server.Version}}" 30)) { $failed += "version-again" }
 
           $before = (Get-Process docklet-proxy -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
