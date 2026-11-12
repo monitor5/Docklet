@@ -1,5 +1,5 @@
 [package]
-name = "docklet"
+name = "docklet-desktop"
 description = "Lightweight WSL2 + Docker Engine manager for Windows"
 version.workspace = true
 edition.workspace = true

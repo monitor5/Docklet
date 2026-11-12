@@ -1,6 +1,7 @@
 # M0 spike 1: can a GitHub-hosted Windows runner run dockerd inside WSL2?
-# Each step is a separate checkpoint, so the first failing step shows how far
-# the hosted runner gets. Results are recorded in docs/spikes.md.
+# Imports the released docklet rootfs, exactly as the app will. Each step is a
+# checkpoint and reports its output as a notice annotation, so the result can
+# be read without downloading logs. Results are recorded in docs/spikes.md.
 name: Spike - WSL2 dockerd on hosted runner
 
 on:
@@ -12,38 +13,53 @@ on:
 permissions:
   contents: read
 
+env:
+  WSL_UTF8: "1"
+  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.1.0/rootfs.tar.gz
+
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   wsl2-dockerd:
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
+      - name: Define checkpoint helper
+        run: |
+          $helper = @'
+          function Checkpoint([string]$Title, [scriptblock]$Body) {
+            $output = (& $Body 2>&1 | Out-String).Trim()
+            $code = $LASTEXITCODE
+            Write-Host $output
+            $flat = ($output -replace "`0", "" -replace "\s*\r?\n\s*", " | ")
+            if ($flat.Length -gt 900) { $flat = $flat.Substring($flat.Length - 900) }
+            $kind = if ($code -eq 0) { "notice" } else { "error" }
+            Write-Host "::$kind title=$Title (exit $code)::$flat"
+            if ($code -ne 0) { exit 1 }
+          }
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\checkpoint.ps1" -Value $helper
       - name: 1. WSL is present
-        shell: pwsh
         run: |
-          $env:WSL_UTF8 = "1"
-          wsl --version
-          wsl --status
-      - name: 2. Install a WSL2 distro
-        uses: Vampire/setup-wsl@v7
-        with:
-          distribution: Debian
-          wsl-version: 2
-      - name: 3. Distro runs on a WSL2 kernel
-        shell: pwsh
+          . "$env:RUNNER_TEMP\checkpoint.ps1"
+          Checkpoint "wsl --version" { wsl --version }
+      - name: 2. Import the docklet rootfs as WSL2
         run: |
-          $env:WSL_UTF8 = "1"
-          wsl -l -v
-          wsl -d Debian -u root -- uname -a
-          wsl -d Debian -u root -- sh -c "uname -r | grep -qi microsoft"
-      - name: 4. Install docker-ce
-        shell: pwsh
+          . "$env:RUNNER_TEMP\checkpoint.ps1"
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\rootfs.tar.gz" $env:ROOTFS_URL
+          Checkpoint "wsl --import" { wsl --import docklet "$env:RUNNER_TEMP\docklet" "$env:RUNNER_TEMP\rootfs.tar.gz" --version 2 }
+      - name: 3. Distro boots on a WSL2 kernel
         run: |
-          wsl -d Debian -u root -- sh -c "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl iptables && curl -fsSL https://get.docker.com | sh"
-      - name: 5. dockerd starts
-        shell: pwsh
+          . "$env:RUNNER_TEMP\checkpoint.ps1"
+          Checkpoint "uname" { wsl -d docklet --exec uname -a }
+          Checkpoint "wsl -l -v" { wsl -l -v }
+      - name: 4. systemd starts dockerd
         run: |
-          wsl -d Debian -u root -- sh -c "(dockerd >/var/log/dockerd.log 2>&1 &) ; for i in `$(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker info || { cat /var/log/dockerd.log; exit 1; }"
-      - name: 6. hello-world runs
-        shell: pwsh
+          . "$env:RUNNER_TEMP\checkpoint.ps1"
+          Checkpoint "docker info" { wsl -d docklet --exec sh -c "for i in `$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker info --format '{{.ServerVersion}} {{.Driver}} {{.CgroupVersion}}' || { systemctl --no-pager status docker | tail -n 15; exit 1; }" }
+      - name: 5. hello-world runs
         run: |
-          wsl -d Debian -u root -- sh -c "(pgrep dockerd >/dev/null || (dockerd >/var/log/dockerd.log 2>&1 &)) ; for i in `$(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker run --rm hello-world"
+          . "$env:RUNNER_TEMP\checkpoint.ps1"
+          Checkpoint "hello-world" { wsl -d docklet --exec sh -c "for i in `$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker run --rm hello-world | head -n 3" }

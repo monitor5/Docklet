@@ -124,7 +124,10 @@ fn create_instance(
 #[derive(Debug)]
 enum RelayEnd {
     /// The child closed its stdout: the server side finished the exchange.
-    ServerDone { to_client: u64 },
+    ServerDone {
+        #[allow(dead_code, reason = "shown in trace output through Debug")]
+        to_client: u64,
+    },
     /// The client went away before the server side finished.
     ClientGone,
 }
@@ -165,14 +168,11 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
                 }
                 Ok(n) => {
                     total += n as u64;
-                    match child_in.as_mut() {
-                        Some(stdin) => {
-                            if stdin.write_all(&buffer[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                        // Data after EOF is a protocol violation; drop it.
-                        None => {}
+                    // Data after EOF is a protocol violation and is dropped.
+                    if let Some(stdin) = child_in.as_mut()
+                        && stdin.write_all(&buffer[..n]).await.is_err()
+                    {
+                        return;
                     }
                 }
                 Err(err) if err.raw_os_error() == Some(ERROR_MORE_DATA) => {

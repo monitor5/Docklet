@@ -1,0 +1,15 @@
+[package]
+name = "docklet-cli"
+description = "Docklet command line interface (docklet.exe)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "docklet"
+path = "src/main.rs"
+
+[dependencies]
+docklet-core = { workspace = true }

@@ -29,9 +29,9 @@ jobs:
       # The Tauri shell needs WebKitGTK on Linux and is Windows-only anyway,
       # so Linux covers the platform-neutral crates.
       - name: Clippy
-        run: cargo clippy -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl --all-targets -- -D warnings
+        run: cargo clippy -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl --all-targets -- -D warnings
       - name: Test
-        run: cargo test -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl
+        run: cargo test -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl
 
   windows:
     name: App (Windows)

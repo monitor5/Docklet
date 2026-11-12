@@ -635,14 +635,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "docklet"
+name = "docklet-cli"
 version = "0.1.0"
 dependencies = [
  "docklet-core",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
 ]
 
 [[package]]
@@ -650,6 +646,17 @@ name = "docklet-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "docklet-desktop"
+version = "0.1.0"
+dependencies = [
+ "docklet-core",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]
