@@ -15,7 +15,7 @@ permissions:
 
 env:
   WSL_UTF8: "1"
-  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.1.0/rootfs.tar.gz
+  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.1.1/rootfs.tar.gz
   DOCKER_CLI_URL: https://download.docker.com/win/static/stable/x86_64/docker-29.9.3.zip
   DOCKER_HOST: npipe:////./pipe/docklet_engine
 
@@ -31,7 +31,6 @@ jobs:
       fail-fast: false
       matrix:
         mode: [message, byte]
-        relay: [socat]
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
@@ -72,65 +71,25 @@ jobs:
           Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
       - name: Import rootfs and fetch the Docker CLI
         run: |
-          curl.exe -fsSL -o "$env:RUNNER_TEMP\rootfs.tar.gz" $env:ROOTFS_URL
+          # The rootfs release may still be building when this workflow starts.
+          for ($i = 0; $i -lt 40; $i++) {
+            curl.exe -fsSL -o "$env:RUNNER_TEMP\rootfs.tar.gz" $env:ROOTFS_URL
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 15
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           wsl --import docklet "$env:RUNNER_TEMP\docklet" "$env:RUNNER_TEMP\rootfs.tar.gz" --version 2
           curl.exe -fsSL -o "$env:RUNNER_TEMP\docker.zip" $env:DOCKER_CLI_URL
           Expand-Archive "$env:RUNNER_TEMP\docker.zip" -DestinationPath "$env:RUNNER_TEMP\cli"
-      # Which in-distro relay lets the Windows side see dockerd closing the
-      # connection while stdin is still open? HTTP/1.0 makes dockerd close
-      # after one response. No proxy involved: plain wsl.exe stdio.
-      - name: Diagnose relay end-of-stream
-        if: matrix.mode == 'message'
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
-          Start-Process wsl -ArgumentList "-d docklet --exec /bin/sleep infinity" -WindowStyle Hidden
-          wsl -d docklet --exec sh -c "for i in `$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; apt-get update -qq && apt-get install -y -qq --no-install-recommends netcat-openbsd >/dev/null; command -v nc socat"
-          $variants = [ordered]@{
-            "socat-stdio-t86400"  = "socat -t 86400 STDIO UNIX-CONNECT:/var/run/docker.sock"
-            "socat-shut-close"    = "socat -t 86400 STDIN!!STDOUT,shut-close UNIX-CONNECT:/var/run/docker.sock"
-            "socat-default-t"     = "socat STDIO UNIX-CONNECT:/var/run/docker.sock"
-            "nc"                  = "nc -U /var/run/docker.sock"
-            "nc-N"                = "nc -N -U /var/run/docker.sock"
-            "nc-q0"               = "nc -q 0 -U /var/run/docker.sock"
-          }
-          $summary = @()
-          foreach ($name in $variants.Keys) {
-            foreach ($closeStdin in @($false, $true)) {
-              $psi = New-Object System.Diagnostics.ProcessStartInfo
-              $psi.FileName = "wsl.exe"
-              $psi.Arguments = "-d docklet -u root --exec " + $variants[$name]
-              $psi.RedirectStandardInput = $true
-              $psi.RedirectStandardOutput = $true
-              $psi.RedirectStandardError = $true
-              $psi.UseShellExecute = $false
-              $p = [System.Diagnostics.Process]::Start($psi)
-              $watch = [Diagnostics.Stopwatch]::StartNew()
-              $read = $p.StandardOutput.ReadToEndAsync()
-              $p.StandardInput.Write("GET /_ping HTTP/1.0`r`nHost: docker`r`n`r`n")
-              $p.StandardInput.Flush()
-              if ($closeStdin) { $p.StandardInput.Close() }
-              if ($read.Wait(8000)) { $result = "EOF after $($watch.ElapsedMilliseconds) ms, $($read.Result.Length) bytes" }
-              else { $result = "NO EOF within 8s" }
-              $exited = $p.WaitForExit(500)
-              if (-not $exited) { $p.Kill() }
-              $summary += "$name stdin-closed=$closeStdin => $result; process exited=$exited"
-            }
-          }
-          Report "notice" "relay end-of-stream" ($summary -join "`n")
-          wsl --terminate docklet
       # Background processes do not survive the end of a step, so the proxy,
       # the keepalive and every test share one step.
-      - name: Run pipe tests (${{ matrix.mode }} mode, ${{ matrix.relay }} relay)
+      - name: Run pipe tests (${{ matrix.mode }} mode)
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Start-Process wsl -ArgumentList "-d docklet --exec /bin/sleep infinity" -WindowStyle Hidden
           wsl -d docklet --exec sh -c "for i in `$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker info --format '{{.ServerVersion}}'"
           $proxyArgs = @("--trace")
           if ("${{ matrix.mode }}" -eq "byte") { $proxyArgs += "--byte" }
-          if ("${{ matrix.relay }}" -eq "nc") {
-            wsl -d docklet --exec sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends netcat-openbsd >/dev/null && command -v nc"
-            $proxyArgs += @("--", "wsl.exe", "-d", "docklet", "-u", "root", "--exec", "nc", "-N", "-U", "/var/run/docker.sock")
-          }
           Start-Process "target\release\docklet-proxy.exe" -ArgumentList $proxyArgs -RedirectStandardError "$env:RUNNER_TEMP\proxy.err" -WindowStyle Hidden
           Start-Sleep -Seconds 2
 

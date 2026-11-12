@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["apps/desktop/src-tauri", "crates/*"]
+# Built for Linux inside the distro image, with its own lockfile.
+exclude = ["distro/relay"]
 
 [workspace.package]
 version = "0.1.0"

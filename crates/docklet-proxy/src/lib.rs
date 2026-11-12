@@ -1,5 +1,5 @@
 //! Named pipe server that relays each Docker API connection to a child
-//! process (in production: `wsl.exe ... socat STDIO UNIX-CONNECT:docker.sock`).
+//! process (in production: `wsl.exe ... docklet-relay`).
 
 #[cfg(windows)]
 mod security;

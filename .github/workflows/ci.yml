@@ -30,6 +30,10 @@ jobs:
       # so Linux covers the platform-neutral crates.
       - name: Clippy
         run: cargo clippy -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl --all-targets -- -D warnings
+      - name: Relay (distro binary)
+        run: |
+          cargo fmt --manifest-path distro/relay/Cargo.toml --check
+          cargo clippy --manifest-path distro/relay/Cargo.toml --locked -- -D warnings
       - name: Test
         run: cargo test -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl
 

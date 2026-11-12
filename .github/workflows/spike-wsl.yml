@@ -15,7 +15,7 @@ permissions:
 
 env:
   WSL_UTF8: "1"
-  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.1.0/rootfs.tar.gz
+  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.1.1/rootfs.tar.gz
 
 defaults:
   run:

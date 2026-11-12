@@ -28,25 +28,18 @@ pub struct RelayCommand {
 }
 
 impl RelayCommand {
-    /// `wsl.exe -d <distro> -u root --exec socat ...` bridging stdio to the
-    /// Docker socket inside the distro.
-    pub fn wsl_socat(distro: &str) -> Self {
+    /// `wsl.exe -d <distro> -u root --exec docklet-relay ...` bridging stdio
+    /// to the Docker socket inside the distro. `docklet-relay` ships in the
+    /// rootfs (see `distro/relay`).
+    pub fn wsl_relay(distro: &str) -> Self {
         let args = [
             "-d",
             distro,
             "-u",
             "root",
             "--exec",
-            "socat",
-            "-t",
-            "86400",
-            // `shut-close` makes socat close its stdout as soon as dockerd
-            // closes the socket. Without it socat keeps stdout open for the
-            // whole `-t` timeout and the client never sees the end of the
-            // stream. `-t` itself must stay long: after the client's stdin
-            // EOF the container may keep producing output indefinitely.
-            "STDIN!!STDOUT,shut-close",
-            "UNIX-CONNECT:/var/run/docker.sock",
+            "/usr/local/bin/docklet-relay",
+            "/var/run/docker.sock",
         ];
         Self {
             program: "wsl.exe".into(),
@@ -54,7 +47,6 @@ impl RelayCommand {
         }
     }
 }
-
 #[derive(Debug, Clone)]
 pub struct PipeProxyConfig {
     /// Full pipe path, e.g. `\\.\pipe\docklet_engine`.

@@ -5,7 +5,7 @@
 //! docklet-proxy [--pipe NAME] [--distro NAME] [--byte] [--trace] [-- PROGRAM ARGS...]
 //! ```
 //! Without `-- PROGRAM`, each connection is relayed through
-//! `wsl.exe -d <distro> ... socat` to the Docker socket.
+//! `wsl.exe -d <distro> ... docklet-relay` to the Docker socket.
 
 #[cfg(windows)]
 #[tokio::main]
@@ -39,7 +39,7 @@ async fn main() -> std::io::Result<()> {
     let config = PipeProxyConfig {
         pipe_name,
         message_mode,
-        relay: custom.unwrap_or_else(|| RelayCommand::wsl_socat(&distro)),
+        relay: custom.unwrap_or_else(|| RelayCommand::wsl_relay(&distro)),
         trace,
     };
     eprintln!(
