@@ -1,0 +1,49 @@
+# M0 spike 1: can a GitHub-hosted Windows runner run dockerd inside WSL2?
+# Each step is a separate checkpoint, so the first failing step shows how far
+# the hosted runner gets. Results are recorded in docs/spikes.md.
+name: Spike - WSL2 dockerd on hosted runner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/spike-wsl.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  wsl2-dockerd:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: 1. WSL is present
+        shell: pwsh
+        run: |
+          $env:WSL_UTF8 = "1"
+          wsl --version
+          wsl --status
+      - name: 2. Install a WSL2 distro
+        uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Debian
+          wsl-version: 2
+      - name: 3. Distro runs on a WSL2 kernel
+        shell: pwsh
+        run: |
+          $env:WSL_UTF8 = "1"
+          wsl -l -v
+          wsl -d Debian -u root -- uname -a
+          wsl -d Debian -u root -- sh -c "uname -r | grep -qi microsoft"
+      - name: 4. Install docker-ce
+        shell: pwsh
+        run: |
+          wsl -d Debian -u root -- sh -c "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl iptables && curl -fsSL https://get.docker.com | sh"
+      - name: 5. dockerd starts
+        shell: pwsh
+        run: |
+          wsl -d Debian -u root -- sh -c "(dockerd >/var/log/dockerd.log 2>&1 &) ; for i in `$(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker info || { cat /var/log/dockerd.log; exit 1; }"
+      - name: 6. hello-world runs
+        shell: pwsh
+        run: |
+          wsl -d Debian -u root -- sh -c "(pgrep dockerd >/dev/null || (dockerd >/var/log/dockerd.log 2>&1 &)) ; for i in `$(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker run --rm hello-world"

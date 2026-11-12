@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+*.log
+*.local
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# distro build output
+distro/out/
+*.tar
+*.tar.gz

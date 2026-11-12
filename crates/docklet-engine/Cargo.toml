@@ -1,0 +1,11 @@
+[package]
+name = "docklet-engine"
+description = "Docker Engine client wrapper: events, logs, stats, exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+docklet-core = { workspace = true }
