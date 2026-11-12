@@ -40,7 +40,12 @@ impl RelayCommand {
             "socat",
             "-t",
             "86400",
-            "STDIO",
+            // `shut-close` makes socat close its stdout as soon as dockerd
+            // closes the socket. Without it socat keeps stdout open for the
+            // whole `-t` timeout and the client never sees the end of the
+            // stream. `-t` itself must stay long: after the client's stdin
+            // EOF the container may keep producing output indefinitely.
+            "STDIN!!STDOUT,shut-close",
             "UNIX-CONNECT:/var/run/docker.sock",
         ];
         Self {
