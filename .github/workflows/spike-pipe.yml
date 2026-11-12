@@ -31,6 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         mode: [message, byte]
+        relay: [socat, nc]
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
@@ -72,13 +73,17 @@ jobs:
           Expand-Archive "$env:RUNNER_TEMP\docker.zip" -DestinationPath "$env:RUNNER_TEMP\cli"
       # Background processes do not survive the end of a step, so the proxy,
       # the keepalive and every test share one step.
-      - name: Run pipe tests (${{ matrix.mode }} mode)
+      - name: Run pipe tests (${{ matrix.mode }} mode, ${{ matrix.relay }} relay)
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Start-Process wsl -ArgumentList "-d docklet --exec /bin/sleep infinity" -WindowStyle Hidden
           wsl -d docklet --exec sh -c "for i in `$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker info --format '{{.ServerVersion}}'"
           $proxyArgs = @("--trace")
           if ("${{ matrix.mode }}" -eq "byte") { $proxyArgs += "--byte" }
+          if ("${{ matrix.relay }}" -eq "nc") {
+            wsl -d docklet --exec sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends netcat-openbsd >/dev/null && command -v nc"
+            $proxyArgs += @("--", "wsl.exe", "-d", "docklet", "-u", "root", "--exec", "nc", "-N", "-U", "/var/run/docker.sock")
+          }
           Start-Process "target\release\docklet-proxy.exe" -ArgumentList $proxyArgs -RedirectStandardError "$env:RUNNER_TEMP\proxy.err" -WindowStyle Hidden
           Start-Sleep -Seconds 2
 
