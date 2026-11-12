@@ -143,7 +143,7 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true)
         .spawn()?;
-    let mut child_in = child.stdin.take().expect("stdin is piped");
+    let child_in = child.stdin.take().expect("stdin is piped");
     let mut child_out = child.stdout.take().expect("stdout is piped");
     let (mut pipe_rd, mut pipe_wr) = tokio::io::split(pipe);
 
@@ -157,16 +157,19 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
     // would spin a CPU core per connection.
     let upstream = async move {
         let mut buffer = vec![0u8; RELAY_BUFFER];
-        let mut child_in = Some(&mut child_in);
+        let mut child_in = Some(child_in);
         let mut total = 0u64;
         loop {
             match pipe_rd.read(&mut buffer).await {
                 Ok(0) => match child_in.take() {
-                    Some(stdin) => {
+                    Some(mut stdin) => {
                         if trace {
                             eprintln!("[conn {id}] client EOF after {total} bytes");
                         }
-                        let _ = stdin.shutdown().await;
+                        // Only dropping the handle closes the child's stdin;
+                        // `shutdown` on a process pipe just flushes.
+                        let _ = stdin.flush().await;
+                        drop(stdin);
                     }
                     None => {
                         if trace {

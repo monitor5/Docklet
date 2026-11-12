@@ -48,7 +48,12 @@ jobs:
       - name: 2. Import the docklet rootfs as WSL2
         run: |
           . "$env:RUNNER_TEMP\checkpoint.ps1"
-          curl.exe -fsSL -o "$env:RUNNER_TEMP\rootfs.tar.gz" $env:ROOTFS_URL
+          # The rootfs release may still be building when this workflow starts.
+          for ($i = 0; $i -lt 40; $i++) {
+            curl.exe -fsSL -o "$env:RUNNER_TEMP\rootfs.tar.gz" $env:ROOTFS_URL
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 15
+          }
           Checkpoint "wsl --import" { wsl --import docklet "$env:RUNNER_TEMP\docklet" "$env:RUNNER_TEMP\rootfs.tar.gz" --version 2 }
       - name: 3. Distro boots on a WSL2 kernel
         run: |
