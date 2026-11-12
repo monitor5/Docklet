@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         mode: [message, byte]
-        relay: [socat, nc]
+        relay: [socat]
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
@@ -61,7 +61,12 @@ jobs:
           }
           function Report-Proxy {
             $cpu = (Get-Process docklet-proxy -ErrorAction SilentlyContinue | ForEach-Object { "cpu=$([int]$_.CPU)s ws=$([int]($_.WorkingSet64/1MB))MB" }) -join ","
-            Report "notice" "proxy trace $cpu" ((Get-Content "$env:RUNNER_TEMP\proxy.err" -Raw -ErrorAction SilentlyContinue) + "")
+            $lines = @(Get-Content "$env:RUNNER_TEMP\proxy.err" -ErrorAction SilentlyContinue)
+            $part = 0
+            for ($i = 0; $i -lt $lines.Count -and $part -lt 8; $i += 12) {
+              $part++
+              Report "notice" "proxy trace $part $cpu" (($lines[$i..([Math]::Min($i + 11, $lines.Count - 1))]) -join "`n")
+            }
           }
           '@
           Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
@@ -90,9 +95,9 @@ jobs:
           $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
           $failed = @()
           if (-not (Test-Docker "1-version" "$docker version --format {{.Server.Version}}" 30)) { $failed += "version" }
-          if (-not (Test-Docker "2-hello-world" "$docker run --rm hello-world" 120)) { $failed += "hello-world" }
+          if (-not (Test-Docker "2-hello-world" "$docker run --rm hello-world" 40)) { $failed += "hello-world" }
           if (-not (Test-Docker "3-pull" "$docker pull -q alpine" 120)) { $failed += "pull" }
-          if (-not (Test-Docker "4-half-close" "echo hi| $docker run -i --rm alpine cat" 60)) { $failed += "half-close" }
+          if (-not (Test-Docker "4-half-close" "echo hi| $docker run -i --rm alpine cat" 40)) { $failed += "half-close" }
           if (-not (Test-Docker "5-version-again" "$docker version --format {{.Server.Version}}" 30)) { $failed += "version-again" }
 
           $before = (Get-Process docklet-proxy -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum

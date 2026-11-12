@@ -176,9 +176,18 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
                         }
                         let _ = stdin.shutdown().await;
                     }
-                    None => return,
+                    None => {
+                        if trace {
+                            eprintln!("[conn {id}] second zero-length read: client gone");
+                        }
+                        return;
+                    }
                 },
                 Ok(n) => {
+                    if trace && total == 0 {
+                        let line = buffer[..n].split(|b| *b == b'\r').next().unwrap_or(&[]);
+                        eprintln!("[conn {id}] request: {}", String::from_utf8_lossy(line));
+                    }
                     total += n as u64;
                     // Data after EOF is a protocol violation and is dropped.
                     if let Some(stdin) = child_in.as_mut()
@@ -203,6 +212,9 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
     // Child → client.
     let downstream = async {
         let copied = tokio::io::copy(&mut child_out, &mut pipe_wr).await;
+        if trace {
+            eprintln!("[conn {id}] relay stdout ended: {copied:?}");
+        }
         let _ = pipe_wr.flush().await;
         copied
     };
