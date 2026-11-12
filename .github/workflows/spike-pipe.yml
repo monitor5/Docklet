@@ -50,12 +50,12 @@ jobs:
           function Test-Docker([string]$Name, [string]$CommandLine, [int]$Seconds) {
             $out = "$env:RUNNER_TEMP\$Name.txt"
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            $p = Start-Process cmd -ArgumentList "/c $CommandLine > `"$out`" 2>&1" -PassThru -WindowStyle Hidden
+            $p = Start-Process cmd -ArgumentList "/s /c `"$CommandLine > `"$out`" 2>&1`"" -PassThru -WindowStyle Hidden
             if ($p.WaitForExit($Seconds * 1000)) { $state = "exit $($p.ExitCode)" }
             else { taskkill /F /T /PID $p.Id | Out-Null; $state = "TIMEOUT after ${Seconds}s" }
             $text = (Get-Content $out -Raw -ErrorAction SilentlyContinue) + ""
             $ok = $state -eq "exit 0"
-            Report ($(if ($ok) { "notice" } else { "error" })) "$Name - $state - $($watch.ElapsedMilliseconds) ms" $text
+            Report ($(if ($ok) { "notice" } else { "error" })) "$Name - $state - $($watch.ElapsedMilliseconds) ms" "[$state] $text"
             return $ok
           }
           function Report-Proxy {

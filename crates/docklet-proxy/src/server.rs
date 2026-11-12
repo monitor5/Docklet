@@ -150,22 +150,29 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
     let mut child_out = child.stdout.take().expect("stdout is piped");
     let (mut pipe_rd, mut pipe_wr) = tokio::io::split(pipe);
 
-    // Client → child. Resolves only when the client is gone; a half-close just
-    // closes the child's stdin and keeps watching the pipe.
+    // Client → child. Resolves only when the client is gone.
+    //
+    // A zero-length read is ambiguous: it is either the client's half-close
+    // (a zero-byte message, after which reads block again) or a disconnect
+    // (after which every read returns zero immediately). The first one closes
+    // the child's stdin; a second one can only mean the client is gone. The
+    // loop must never retry a read that keeps completing without data, or it
+    // would spin a CPU core per connection.
     let upstream = async move {
         let mut buffer = vec![0u8; RELAY_BUFFER];
         let mut child_in = Some(&mut child_in);
         let mut total = 0u64;
         loop {
             match pipe_rd.read(&mut buffer).await {
-                Ok(0) => {
-                    if let Some(stdin) = child_in.take() {
+                Ok(0) => match child_in.take() {
+                    Some(stdin) => {
                         if trace {
                             eprintln!("[conn {id}] client EOF after {total} bytes");
                         }
                         let _ = stdin.shutdown().await;
                     }
-                }
+                    None => return,
+                },
                 Ok(n) => {
                     total += n as u64;
                     // Data after EOF is a protocol violation and is dropped.
@@ -175,21 +182,19 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
                         return;
                     }
                 }
-                Err(err) if err.raw_os_error() == Some(ERROR_MORE_DATA) => {
-                    if trace {
-                        eprintln!("[conn {id}] ERROR_MORE_DATA on read");
-                    }
-                }
                 Err(err) => {
                     if trace {
-                        eprintln!("[conn {id}] client read ended: {err}");
+                        let more = err.raw_os_error() == Some(ERROR_MORE_DATA);
+                        eprintln!("[conn {id}] client read ended: {err} (more_data={more})");
                     }
                     return;
                 }
             }
+            // Let the other direction and other connections run even if the
+            // pipe keeps this task ready.
+            tokio::task::yield_now().await;
         }
     };
-
     // Child → client.
     let downstream = async {
         let copied = tokio::io::copy(&mut child_out, &mut pipe_wr).await;
