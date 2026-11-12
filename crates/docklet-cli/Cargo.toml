@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 docklet-core = { workspace = true }
+docklet-wsl = { workspace = true }

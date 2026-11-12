@@ -1,0 +1,4 @@
+# Bases the docklet rootfs is built for. The first entry is the default.
+# name          base image          Docker apt repo   suite
+debian-13       debian:trixie-slim  debian            trixie
+ubuntu-26.04    ubuntu:26.04        ubuntu            resolute

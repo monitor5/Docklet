@@ -18,7 +18,7 @@ permissions:
 
 env:
   WSL_UTF8: "1"
-  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.1.1/rootfs.tar.gz
+  ROOTFS_URL: https://github.com/${{ github.repository }}/releases/download/distro-v0.2.0/rootfs-debian-13.tar.gz
   DOCKER_CLI_URL: https://download.docker.com/win/static/stable/x86_64/docker-29.9.3.zip
   DOCKER_HOST: npipe:////./pipe/docklet_engine
 

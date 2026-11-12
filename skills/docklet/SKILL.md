@@ -22,14 +22,23 @@ it needs no window and prints plain text.
 
 ## Commands
 
-| Command                    | Purpose                                           |
-| -------------------------- | ------------------------------------------------- |
-| `docklet --help`           | List the commands available in this version       |
-| `docklet version`          | Print the Docklet version                         |
-| `docklet skills status`    | Show whether this skill is registered and current |
-| `docklet skills install`   | Register or update this skill for AI agents       |
-| `docklet skills uninstall` | Remove this skill                                 |
+| Command | Purpose |
+| --- | --- |
+| `docklet --help` | List the commands available in this version |
+| `docklet status` | Engine state: `wsl-missing`, `not-installed`, `stopped`, `starting`, `running` or `error: ...` (first word of the output) |
+| `docklet bases` | Linux bases available for the engine distro |
+| `docklet install [--base NAME]` | Download and install the engine distro (once) |
+| `docklet start` | Start the engine and wait until Docker is ready |
+| `docklet stop` | Stop the engine; frees its memory |
+| `docklet uninstall --yes` | Delete the engine distro and all its data. Ask the user first |
+| `docklet skills status` | Show whether this skill is registered and current |
+| `docklet skills install` | Register or update this skill for AI agents |
+| `docklet version` | Print the Docklet version |
 
+Exit codes: 0 success, 1 the command failed (reason on stderr), 2 wrong usage.
+
+Typical flow: `docklet status`; if `not-installed`, `docklet install`; if
+`stopped`, `docklet start`; then use Docker.
 ## Using Docker once the engine is running
 
 Docker commands go through the `docklet` context:

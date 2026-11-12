@@ -1,4 +1,4 @@
-# Builds the docklet WSL2 rootfs and publishes it as a release asset.
+# Builds the docklet WSL2 rootfs for every base and publishes release assets.
 name: Distro rootfs
 
 on:
@@ -15,20 +15,42 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with distro/bases.txt.
+        base: [debian-13, ubuntu-26.04]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - name: Build rootfs
-        run: ./distro/build.sh
-      - name: Publish release asset
+      - name: Build rootfs (${{ matrix.base }})
+        run: ./distro/build.sh "${{ matrix.base }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rootfs-${{ matrix.base }}
+          path: distro/out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(cat distro/VERSION)"
           tag="distro-v${version}"
           notes="docklet WSL2 rootfs ${version} (built from ${GITHUB_SHA})"
+          ls -lh out
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" distro/out/* --clobber
+            gh release upload "$tag" out/* --clobber
           else
-            gh release create "$tag" distro/out/* --title "$tag" --notes "$notes" --prerelease --target "$GITHUB_SHA"
+            gh release create "$tag" out/* --title "$tag" --notes "$notes" --prerelease --target "$GITHUB_SHA"
           fi

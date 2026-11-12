@@ -1,0 +1,118 @@
+# End-to-end test of the engine lifecycle through the docklet CLI, on a real
+# WSL2 (hosted runners support it, see docs/spikes.md). Runs for every base.
+name: E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/e2e.yml
+      - crates/**
+      - distro/**
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+env:
+  WSL_UTF8: "1"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  engine:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with distro/bases.txt.
+        base: [debian-13, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI
+        run: cargo build --release -p docklet-cli
+      - name: Define helpers
+        run: |
+          $helper = @'
+          $docklet = "$env:GITHUB_WORKSPACE\target\release\docklet.exe"
+          function Report([string]$Kind, [string]$Title, [string]$Text) {
+            $flat = ($Text -replace "`0", "" -replace "\s*\r?\n\s*", " | ").Trim()
+            if ($flat.Length -gt 900) { $flat = $flat.Substring($flat.Length - 900) }
+            Write-Host "::${Kind} title=$Title::$flat"
+          }
+          # Runs a command, reports its output, fails the step on a wrong exit code.
+          function Step([string]$Title, [scriptblock]$Body, [int]$ExpectedExit = 0) {
+            $output = (& $Body 2>&1 | Out-String).Trim()
+            $code = $LASTEXITCODE
+            Write-Host $output
+            $ok = $code -eq $ExpectedExit
+            Report ($(if ($ok) { "notice" } else { "error" })) "$Title - exit $code" "[exit $code] $output"
+            if (-not $ok) { exit 1 }
+            return
+          }
+          function Running { @(wsl --list --running --quiet 2>$null) -contains "docklet" }
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
+      - name: Wait for the rootfs release
+        run: |
+          $version = (Get-Content distro/VERSION).Trim()
+          $url = "https://github.com/${{ github.repository }}/releases/download/distro-v$version/rootfs-${{ matrix.base }}.tar.gz.sha256"
+          for ($i = 0; $i -lt 60; $i++) {
+            curl.exe -fsSL -o NUL $url
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 15
+          }
+          exit 1
+      - name: 1. status before install
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "status (fresh)" { & $docklet status }
+          if ((& $docklet status) -notlike "not-installed*") { exit 1 }
+      - name: 2. install
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "install" { & $docklet install --base "${{ matrix.base }}" }
+          if ((& $docklet status) -ne "stopped") { exit 1 }
+      - name: 3. start, docker info, hello-world
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          Step "start" { & $docklet start }
+          Report "notice" "start duration" "$($watch.ElapsedMilliseconds) ms"
+          if ((& $docklet status) -ne "running") { exit 1 }
+          Step "docker info" { wsl -d docklet -- docker info --format "{{.ServerVersion}} {{.Driver}} cgroup{{.CgroupVersion}} {{.OperatingSystem}}" }
+          Step "versions.txt" { wsl -d docklet --exec cat /usr/local/share/docklet/versions.txt }
+          Step "hello-world" { wsl -d docklet --exec sh -c "docker run --rm hello-world | head -n 2" }
+          # The keepalive must hold the distro up with nothing else attached.
+          Start-Sleep -Seconds 45
+          if (-not (Running)) { Report "error" "keepalive" "distro stopped while the engine was started"; exit 1 }
+          Report "notice" "keepalive" "distro still running 45 s after start"
+      - name: 4. stop
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "stop" { & $docklet stop }
+          if (Running) { Report "error" "stop" "docklet still listed as running"; exit 1 }
+          if ((& $docklet status) -ne "stopped") { exit 1 }
+          if (Get-Process wsl -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 3 }
+          Report "notice" "after stop" "wsl.exe processes: $(@(Get-Process wsl -ErrorAction SilentlyContinue).Count)"
+      - name: 5. Lifetime without keepalive
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          wsl -d docklet --exec true
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          while ((Running) -and $watch.Elapsed.TotalSeconds -lt 180) { Start-Sleep -Seconds 2 }
+          $text = if (Running) { "still running after 180 s" } else { "stopped after about $([int]$watch.Elapsed.TotalSeconds) s" }
+          Report "notice" "lifetime without keepalive" $text
+      - name: 6. uninstall
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "uninstall without --yes" { & $docklet uninstall } 2
+          Step "uninstall" { & $docklet uninstall --yes }
+          if ((& $docklet status) -notlike "not-installed*") { exit 1 }

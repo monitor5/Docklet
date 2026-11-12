@@ -7,53 +7,154 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use docklet_core::skills::{self, InstallOutcome, SkillStatus};
+use docklet_core::{EngineState, engine};
+use docklet_wsl::{Engine, RootfsSource};
 
 const HELP: &str = "\
 Docklet - Docker Engine on WSL2 without Docker Desktop
 
 Usage: docklet <command>
 
-Commands:
-  version             Print the Docklet version
-  skills status       Show whether the Docklet agent skill is registered
-  skills install      Register or update the skill for AI agents (Claude Code, Codex)
-  skills uninstall    Remove the skill
-  help                Show this help
+Engine:
+  status                    Show the engine state
+  install [--base NAME]     Download and install the docklet distro
+          [--rootfs FILE]   ...or install it from a local rootfs.tar.gz
+  bases                     List the Linux bases available for `install --base`
+  start                     Start the engine and wait until Docker is ready
+  stop                      Stop the engine
+  uninstall --yes           Delete the docklet distro with all containers,
+                            images and volumes (other distros are untouched)
 
-Options:
-  -h, --help          Show this help
-  -V, --version       Print the Docklet version
+Agent skill:
+  skills status             Show whether the Docklet agent skill is registered
+  skills install            Register or update the skill (Claude Code, Codex)
+  skills uninstall          Remove the skill
+
+Other:
+  version, -V, --version    Print the Docklet version
+  help, -h, --help          Show this help
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match args.as_slice() {
+    let result = match args.as_slice() {
         [] | ["help" | "-h" | "--help"] => {
             print!("{HELP}");
-            ExitCode::SUCCESS
+            Ok(())
         }
         ["version" | "-V" | "--version"] => {
             println!("docklet {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+            Ok(())
         }
+        ["bases"] => {
+            for (index, base) in engine::bases().iter().enumerate() {
+                println!("{base}{}", if index == 0 { " (default)" } else { "" });
+            }
+            Ok(())
+        }
+        ["status"] => status(),
+        ["install", options @ ..] => install(options),
+        ["start"] => with_engine(|engine| {
+            engine.start()?;
+            println!("Engine is running.");
+            Ok(())
+        }),
+        ["stop"] => with_engine(|engine| {
+            engine.stop()?;
+            println!("Engine is stopped.");
+            Ok(())
+        }),
+        ["uninstall", "--yes"] => with_engine(|engine| {
+            engine.uninstall()?;
+            println!("The docklet distro is removed.");
+            Ok(())
+        }),
+        ["uninstall"] => Err(Failure::Usage(
+            "`uninstall` deletes every container, image and volume in the docklet distro; \
+             pass --yes to confirm"
+                .to_string(),
+        )),
         ["skills", action] => run_skills(action),
-        _ => {
-            eprintln!("docklet: unknown command `{}`\n", args.join(" "));
+        _ => Err(Failure::Usage(format!(
+            "unknown command `{}`",
+            args.join(" ")
+        ))),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure::Usage(message)) => {
+            eprintln!("docklet: {message}\n");
             eprint!("{HELP}");
             ExitCode::from(2)
+        }
+        Err(Failure::Runtime(message)) => {
+            eprintln!("docklet: {message}");
+            ExitCode::FAILURE
         }
     }
 }
 
-fn run_skills(action: &str) -> ExitCode {
-    let Some(home) = home_dir() else {
-        eprintln!("docklet: cannot find the user's home directory");
-        return ExitCode::FAILURE;
+enum Failure {
+    /// The command line was wrong; exit code 2 and the help text.
+    Usage(String),
+    /// The command was understood but failed; exit code 1.
+    Runtime(String),
+}
+
+impl From<std::io::Error> for Failure {
+    fn from(err: std::io::Error) -> Self {
+        Self::Runtime(err.to_string())
+    }
+}
+
+fn with_engine(action: impl FnOnce(&Engine) -> std::io::Result<()>) -> Result<(), Failure> {
+    let engine = Engine::system()?;
+    Ok(action(&engine)?)
+}
+
+fn status() -> Result<(), Failure> {
+    let engine = Engine::system()?;
+    let line = match engine.status() {
+        EngineState::WslMissing => "wsl-missing: WSL is not installed".to_string(),
+        EngineState::NotInstalled => {
+            "not-installed: run `docklet install` to set up the engine".to_string()
+        }
+        EngineState::Stopped => "stopped".to_string(),
+        EngineState::Starting => "starting: the distro is up, Docker is not ready yet".to_string(),
+        EngineState::Running => "running".to_string(),
+        EngineState::Stopping => "stopping".to_string(),
+        EngineState::Error(reason) => format!("error: {reason}"),
     };
-    let targets = skills::default_targets(&home);
+    println!("{line}");
+    Ok(())
+}
+
+fn install(options: &[&str]) -> Result<(), Failure> {
+    let source = match options {
+        [] => RootfsSource::Base(engine::bases()[0].to_string()),
+        ["--base", base] => RootfsSource::Base(base.to_string()),
+        ["--rootfs", file] => RootfsSource::File(PathBuf::from(file)),
+        _ => {
+            return Err(Failure::Usage(
+                "usage: docklet install [--base NAME | --rootfs FILE]".to_string(),
+            ));
+        }
+    };
+    let engine = Engine::system()?;
+    engine.install(&source, &mut |step| println!("{step}"))?;
+    println!("Installed. Run `docklet start` to start the engine.");
+    Ok(())
+}
+
+fn run_skills(action: &str) -> Result<(), Failure> {
+    if !matches!(action, "status" | "install" | "uninstall") {
+        return Err(Failure::Usage(format!("unknown command `skills {action}`")));
+    }
+    let home = home_dir()
+        .ok_or_else(|| Failure::Runtime("cannot find the user's home directory".to_string()))?;
     let mut failed = false;
-    for target in &targets {
+    for target in &skills::default_targets(&home) {
         let path = target.skill_path();
         let line = match action {
             "status" => match target.status() {
@@ -72,7 +173,7 @@ fn run_skills(action: &str) -> ExitCode {
                     format!("failed: {err}")
                 }
             },
-            "uninstall" => match target.uninstall() {
+            _ => match target.uninstall() {
                 Ok(true) => "removed".to_string(),
                 Ok(false) => "not registered".to_string(),
                 Err(err) => {
@@ -80,18 +181,15 @@ fn run_skills(action: &str) -> ExitCode {
                     format!("failed: {err}")
                 }
             },
-            _ => {
-                eprintln!("docklet: unknown command `skills {action}`\n");
-                eprint!("{HELP}");
-                return ExitCode::from(2);
-            }
         };
         println!("{}: {line}", target.agent);
     }
     if failed {
-        ExitCode::FAILURE
+        Err(Failure::Runtime(
+            "some skills could not be changed".to_string(),
+        ))
     } else {
-        ExitCode::SUCCESS
+        Ok(())
     }
 }
 

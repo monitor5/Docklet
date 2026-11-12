@@ -639,6 +639,7 @@ name = "docklet-cli"
 version = "0.1.0"
 dependencies = [
  "docklet-core",
+ "docklet-wsl",
 ]
 
 [[package]]
@@ -679,6 +680,7 @@ name = "docklet-wsl"
 version = "0.1.0"
 dependencies = [
  "docklet-core",
+ "sha2",
 ]
 
 [[package]]

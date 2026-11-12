@@ -15,7 +15,7 @@ Results of the technical spikes that back the decisions in the development plan.
 Question: can `windows-2025` hosted runners run dockerd inside a WSL2 distro, so
 that WSL end-to-end tests can run in CI?
 
-Method: `.github/workflows/spike-wsl.yml` imports the released docklet rootfs
+Method: a workflow (since replaced by `.github/workflows/e2e.yml`) imported the released docklet rootfs
 with `wsl --import ... --version 2` and checks each stage.
 
 Result (2026-11-12): **yes.** The runner had WSL 3.0.3.0 with kernel

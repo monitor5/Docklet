@@ -1,6 +1,6 @@
 [package]
 name = "docklet-wsl"
-description = "wsl.exe runner, distro registry lookup and keepalive (Windows only)"
+description = "wsl.exe runner and engine lifecycle: install, start, keepalive, stop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,4 @@ rust-version.workspace = true
 
 [dependencies]
 docklet-core = { workspace = true }
+sha2 = { workspace = true }
