@@ -55,12 +55,12 @@ jobs:
             else { taskkill /F /T /PID $p.Id | Out-Null; $state = "TIMEOUT after ${Seconds}s" }
             $text = (Get-Content $out -Raw -ErrorAction SilentlyContinue) + ""
             $ok = $state -eq "exit 0"
-            Report ($(if ($ok) { "notice" } else { "error" })) "$Name ($state, $($watch.ElapsedMilliseconds) ms)" $text
+            Report ($(if ($ok) { "notice" } else { "error" })) "$Name - $state - $($watch.ElapsedMilliseconds) ms" $text
             return $ok
           }
           function Report-Proxy {
             $cpu = (Get-Process docklet-proxy -ErrorAction SilentlyContinue | ForEach-Object { "cpu=$([int]$_.CPU)s ws=$([int]($_.WorkingSet64/1MB))MB" }) -join ","
-            Report "notice" "proxy trace ($cpu)" ((Get-Content "$env:RUNNER_TEMP\proxy.err" -Raw -ErrorAction SilentlyContinue) + "")
+            Report "notice" "proxy trace $cpu" ((Get-Content "$env:RUNNER_TEMP\proxy.err" -Raw -ErrorAction SilentlyContinue) + "")
           }
           '@
           Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
@@ -70,45 +70,33 @@ jobs:
           wsl --import docklet "$env:RUNNER_TEMP\docklet" "$env:RUNNER_TEMP\rootfs.tar.gz" --version 2
           curl.exe -fsSL -o "$env:RUNNER_TEMP\docker.zip" $env:DOCKER_CLI_URL
           Expand-Archive "$env:RUNNER_TEMP\docker.zip" -DestinationPath "$env:RUNNER_TEMP\cli"
-      - name: Start keepalive and proxy (${{ matrix.mode }} mode)
+      # Background processes do not survive the end of a step, so the proxy,
+      # the keepalive and every test share one step.
+      - name: Run pipe tests (${{ matrix.mode }} mode)
         run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
           Start-Process wsl -ArgumentList "-d docklet --exec /bin/sleep infinity" -WindowStyle Hidden
           wsl -d docklet --exec sh -c "for i in `$(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker info --format '{{.ServerVersion}}'"
           $proxyArgs = @("--trace")
           if ("${{ matrix.mode }}" -eq "byte") { $proxyArgs += "--byte" }
           Start-Process "target\release\docklet-proxy.exe" -ArgumentList $proxyArgs -RedirectStandardError "$env:RUNNER_TEMP\proxy.err" -WindowStyle Hidden
           Start-Sleep -Seconds 2
-      - name: 1. docker version
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
+
           $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
-          if (-not (Test-Docker "version" "$docker version --format {{.Server.Version}}" 30)) { Report-Proxy; exit 1 }
-      - name: 2. docker run hello-world
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
-          $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
-          if (-not (Test-Docker "hello-world" "$docker run --rm hello-world" 120)) { Report-Proxy; exit 1 }
-      - name: 3. docker pull alpine
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
-          $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
-          if (-not (Test-Docker "pull" "$docker pull -q alpine" 120)) { Report-Proxy; exit 1 }
-      - name: 4. half-close (echo hi | docker run -i --rm alpine cat)
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
-          $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
-          $ok = Test-Docker "half-close" "echo hi| $docker run -i --rm alpine cat" 60
-          Report-Proxy
-          if (-not $ok) { exit 1 }
-      - name: 5. Proxy is idle afterwards
-        if: always()
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
+          $failed = @()
+          if (-not (Test-Docker "1-version" "$docker version --format {{.Server.Version}}" 30)) { $failed += "version" }
+          if (-not (Test-Docker "2-hello-world" "$docker run --rm hello-world" 120)) { $failed += "hello-world" }
+          if (-not (Test-Docker "3-pull" "$docker pull -q alpine" 120)) { $failed += "pull" }
+          if (-not (Test-Docker "4-half-close" "echo hi| $docker run -i --rm alpine cat" 60)) { $failed += "half-close" }
+          if (-not (Test-Docker "5-version-again" "$docker version --format {{.Server.Version}}" 30)) { $failed += "version-again" }
+
           $before = (Get-Process docklet-proxy -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
           Start-Sleep -Seconds 10
           $after = (Get-Process docklet-proxy -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
           $relays = @(Get-Process wsl -ErrorAction SilentlyContinue).Count
           $delta = [math]::Round($after - $before, 2)
-          Report "notice" "idle check" "proxy CPU seconds used in 10s: $delta; wsl.exe processes: $relays"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Report "notice" "6-idle check" "proxy CPU seconds in 10s: $delta; wsl.exe processes: $relays; free RAM MB: $([int]($os.FreePhysicalMemory/1KB))"
           Report-Proxy
-          if ($delta -gt 1) { exit 1 }
+          if ($delta -gt 1) { $failed += "proxy-busy" }
+          if ($failed.Count -gt 0) { Report "error" "failed" ($failed -join " "); exit 1 }
