@@ -202,8 +202,16 @@ impl<R: WslRunner> Engine<R> {
 /// The keepalive must not inherit any handle from this process. It outlives
 /// the CLI, and an inherited stdout pipe would keep whoever reads the CLI's
 /// output (a script, an agent, CI) waiting forever.
-#[cfg(windows)]
 fn spawn_keepalive() -> io::Result<()> {
+    spawn_detached(&format!(
+        "wsl.exe -d {DISTRO_NAME} -u root --exec /bin/sleep infinity"
+    ))
+}
+
+/// Starts a background process that outlives the caller: no window, no
+/// inherited handles.
+#[cfg(windows)]
+pub fn spawn_detached(command_line: &str) -> io::Result<()> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION,
@@ -211,11 +219,10 @@ fn spawn_keepalive() -> io::Result<()> {
     };
     use windows::core::PWSTR;
 
-    let mut command_line: Vec<u16> =
-        format!("wsl.exe -d {DISTRO_NAME} -u root --exec /bin/sleep infinity")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+    let mut command_line: Vec<u16> = command_line
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let startup = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -244,7 +251,7 @@ fn spawn_keepalive() -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn spawn_keepalive() -> io::Result<()> {
+pub fn spawn_detached(_command_line: &str) -> io::Result<()> {
     Err(io::Error::other("the docklet engine only runs on Windows"))
 }
 /// Downloads with the `curl.exe` that ships with Windows, which keeps an HTTP

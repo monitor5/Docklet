@@ -639,6 +639,7 @@ name = "docklet-cli"
 version = "0.1.0"
 dependencies = [
  "docklet-core",
+ "docklet-proxy",
  "docklet-wsl",
 ]
 

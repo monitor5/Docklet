@@ -58,6 +58,19 @@ jobs:
             return
           }
           function Running { @(wsl --list --running --quiet 2>$null) -contains "docklet" }
+          # Runs a cmd.exe command line with a hard timeout; output goes to a file
+          # so a hung command can never block the step. Sets $script:Last.
+          function Timed([string]$Name, [string]$CommandLine, [int]$Seconds, [bool]$ExpectOk = $true) {
+            $out = "$env:RUNNER_TEMP\$Name.txt"
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process cmd -ArgumentList "/s /c `"$CommandLine > `"$out`" 2>&1`"" -PassThru -WindowStyle Hidden
+            if ($p.WaitForExit($Seconds * 1000)) { $state = "exit $($p.ExitCode)" }
+            else { taskkill /F /T /PID $p.Id | Out-Null; $state = "TIMEOUT after ${Seconds}s" }
+            $script:Last = @{ Ms = $watch.ElapsedMilliseconds; Text = ((Get-Content $out -Raw -ErrorAction SilentlyContinue) + "") }
+            $ok = ($state -eq "exit 0") -eq $ExpectOk
+            Report ($(if ($ok) { "notice" } else { "error" })) "$Name - $state - $($script:Last.Ms) ms" "[$state] $($script:Last.Text)"
+            if (-not $ok) { exit 1 }
+          }
           '@
           Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
       - name: Wait for the rootfs release
@@ -82,8 +95,8 @@ jobs:
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "install" { & $docklet install --base "${{ matrix.base }}" }
           if ((& $docklet status) -ne "stopped") { exit 1 }
-      - name: 3. start, docker info, hello-world
-        timeout-minutes: 8
+      - name: 3. start, docker info, pipe tests
+        timeout-minutes: 20
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -93,6 +106,40 @@ jobs:
           Step "docker info" { wsl -d docklet -- docker info --format "{{.ServerVersion}} {{.Driver}} cgroup{{.CgroupVersion}} {{.OperatingSystem}}" }
           Step "versions.txt" { wsl -d docklet --exec cat /usr/local/share/docklet/versions.txt }
           Step "hello-world" { wsl -d docklet --exec sh -c "docker run --rm hello-world | head -n 2" }
+          # --- M2: Windows docker CLI through the named pipe ---
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\docker.zip" https://download.docker.com/win/static/stable/x86_64/docker-29.9.3.zip
+          Expand-Archive "$env:RUNNER_TEMP\docker.zip" -DestinationPath "$env:RUNNER_TEMP\cli"
+          $env:DOCKER_HOST = "npipe:////./pipe/docklet_engine"
+          $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
+          Timed "pipe-version" "$docker version --format {{.Server.Version}}" 30
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "pipe-version" "unexpected server version"; exit 1 }
+          Timed "pipe-hello-world" "$docker run --rm hello-world" 120
+          Timed "pipe-half-close" "echo hi| $docker run -i --rm alpine cat" 90
+          if ($Last.Text.Trim() -notlike "*hi") { Report "error" "pipe-half-close" "output is not hi"; exit 1 }
+          Timed "pipe-nginx" "$docker run -d --name web -p 8080:80 nginx:alpine" 120
+          $status = 0
+          for ($i = 0; $i -lt 20 -and $status -ne 200; $i++) {
+            Start-Sleep -Seconds 1
+            $status = [int](curl.exe -s -o NUL -w "%{http_code}" --max-time 5 http://localhost:8080)
+          }
+          Report ($(if ($status -eq 200) { "notice" } else { "error" })) "published port" "GET http://localhost:8080 => $status"
+          if ($status -ne 200) { exit 1 }
+          Timed "pipe-rm" "$docker rm -f web" 60
+          # Throughput: save a large image through the pipe.
+          Timed "pipe-pull-large" "$docker pull -q python:3.13" 300
+          Timed "pipe-save" "$docker save python:3.13 -o `"$env:RUNNER_TEMP\image.tar`"" 300
+          $mb = (Get-Item "$env:RUNNER_TEMP\image.tar").Length / 1MB
+          Report "notice" "save throughput" ("{0:N0} MB in {1:N1} s = {2:N0} MB/s" -f $mb, ($Last.Ms / 1000), ($mb / ($Last.Ms / 1000)))
+          Remove-Item "$env:RUNNER_TEMP\image.tar"
+          # The proxy must be idle once the clients are gone.
+          $proxy = Get-Process docklet -ErrorAction SilentlyContinue
+          $before = ($proxy | Measure-Object CPU -Sum).Sum
+          Start-Sleep -Seconds 10
+          $after = (Get-Process docklet -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
+          $delta = [math]::Round($after - $before, 2)
+          $relays = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Where-Object { $_.CommandLine -like "*docklet-relay*" }).Count
+          Report ($(if ($delta -le 1 -and $relays -eq 0) { "notice" } else { "error" })) "proxy idle" "CPU seconds in 10 s: $delta; relay processes left: $relays; proxy memory MB: $([int](($proxy | Measure-Object WorkingSet64 -Sum).Sum / 1MB))"
+          if ($delta -gt 1 -or $relays -ne 0) { exit 1 }
           # The keepalive must hold the distro up with nothing else attached.
           Start-Sleep -Seconds 45
           if (-not (Running)) { Report "error" "keepalive" "distro stopped while the engine was started"; exit 1 }
@@ -104,6 +151,7 @@ jobs:
           Step "stop" { & $docklet stop }
           if (Running) { Report "error" "stop" "docklet still listed as running"; exit 1 }
           if ((& $docklet status) -ne "stopped") { exit 1 }
+          if (Get-Process docklet -ErrorAction SilentlyContinue) { Report "error" "stop" "pipe proxy still running"; exit 1 }
           if (Get-Process wsl -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 3 }
           Report "notice" "after stop" "wsl.exe processes: $(@(Get-Process wsl -ErrorAction SilentlyContinue).Count)"
       - name: 5. Lifetime without keepalive

@@ -20,8 +20,8 @@ Engine:
   install [--base NAME]     Download and install the docklet distro
           [--rootfs FILE]   ...or install it from a local rootfs.tar.gz
   bases                     List the Linux bases available for `install --base`
-  start                     Start the engine and wait until Docker is ready
-  stop                      Stop the engine
+  start                     Start the engine and the Docker pipe, wait until ready
+  stop                      Stop the engine and the Docker pipe
   uninstall --yes           Delete the docklet distro with all containers,
                             images and volumes (other distros are untouched)
 
@@ -57,15 +57,19 @@ fn main() -> ExitCode {
         ["install", options @ ..] => install(options),
         ["start"] => with_engine(|engine| {
             engine.start()?;
-            println!("Engine is running.");
+            proxy::ensure_running()?;
+            println!("Engine is running. Docker host: {}", proxy::DOCKER_HOST);
             Ok(())
         }),
         ["stop"] => with_engine(|engine| {
+            proxy::stop();
             engine.stop()?;
             println!("Engine is stopped.");
             Ok(())
         }),
+        ["proxy", options @ ..] => proxy::serve(options),
         ["uninstall", "--yes"] => with_engine(|engine| {
+            proxy::stop();
             engine.uninstall()?;
             println!("The docklet distro is removed.");
             Ok(())
@@ -122,7 +126,10 @@ fn status() -> Result<(), Failure> {
         }
         EngineState::Stopped => "stopped".to_string(),
         EngineState::Starting => "starting: the distro is up, Docker is not ready yet".to_string(),
-        EngineState::Running => "running".to_string(),
+        EngineState::Running if proxy::is_running() => "running".to_string(),
+        EngineState::Running => {
+            "starting: Docker is up but the pipe proxy is not; run `docklet start`".to_string()
+        }
         EngineState::Stopping => "stopping".to_string(),
         EngineState::Error(reason) => format!("error: {reason}"),
     };
@@ -199,4 +206,94 @@ fn home_dir() -> Option<PathBuf> {
         .find_map(std::env::var_os)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// The background pipe proxy (`docklet proxy`), started by `docklet start`.
+#[cfg(windows)]
+mod proxy {
+    use super::Failure;
+    use docklet_proxy::{PipeProxyConfig, RelayCommand, control};
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    pub const DOCKER_HOST: &str = docklet_proxy::ENGINE_DOCKER_HOST;
+
+    pub fn is_running() -> bool {
+        control::is_running()
+    }
+
+    /// Starts the proxy as a detached process unless one is already running.
+    pub fn ensure_running() -> io::Result<()> {
+        if is_running() {
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        docklet_wsl::spawn_detached(&format!("\"{}\" proxy", exe.display()))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if is_running() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(io::Error::other("the pipe proxy did not start"))
+    }
+
+    pub fn stop() {
+        if !control::request_stop() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// `docklet proxy [--trace] [--byte]`: runs the proxy in the foreground.
+    pub fn serve(options: &[&str]) -> Result<(), Failure> {
+        let mut config = PipeProxyConfig {
+            pipe_name: docklet_proxy::ENGINE_PIPE.to_string(),
+            message_mode: true,
+            relay: RelayCommand::wsl_relay(docklet_wsl::DISTRO),
+            trace: false,
+        };
+        for option in options {
+            match *option {
+                "--trace" => config.trace = true,
+                // Diagnostic only: without message mode clients cannot half-close.
+                "--byte" => config.message_mode = false,
+                other => return Err(Failure::Usage(format!("unknown proxy option `{other}`"))),
+            }
+        }
+        if is_running() {
+            return Err(Failure::Runtime(
+                "a pipe proxy is already running".to_string(),
+            ));
+        }
+        Ok(docklet_proxy::serve(config)?)
+    }
+}
+
+#[cfg(not(windows))]
+mod proxy {
+    use super::Failure;
+    use std::io;
+
+    pub const DOCKER_HOST: &str = docklet_proxy::ENGINE_DOCKER_HOST;
+
+    pub fn is_running() -> bool {
+        false
+    }
+
+    pub fn ensure_running() -> io::Result<()> {
+        Err(io::Error::other("the docklet engine only runs on Windows"))
+    }
+
+    pub fn stop() {}
+
+    pub fn serve(_options: &[&str]) -> Result<(), Failure> {
+        Err(Failure::Runtime(
+            "the docklet engine only runs on Windows".to_string(),
+        ))
+    }
 }
