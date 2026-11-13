@@ -30,6 +30,7 @@ it needs no window and prints plain text.
 | `docklet install [--base NAME]` | Download and install the engine distro (once) |
 | `docklet start` | Start the engine and wait until Docker is ready |
 | `docklet stop` | Stop the engine; frees its memory |
+| `docklet cli setup` | Install the Windows `docker` CLI and Compose if missing, create the `docklet` Docker context, and print the `docker.exe` path to use |
 | `docklet uninstall --yes` | Delete the engine distro and all its data. Ask the user first |
 | `docklet skills status` | Show whether this skill is registered and current |
 | `docklet skills install` | Register or update this skill for AI agents |
@@ -41,7 +42,9 @@ Typical flow: `docklet status`; if `not-installed`, `docklet install`; if
 `stopped`, `docklet start`; then use Docker.
 ## Using Docker once the engine is running
 
-Docker commands go through the `docklet` context:
+Run `docklet cli setup` once. It prints the `docker.exe` to use (the one on
+PATH if there is one, otherwise the copy Docklet installed). Docker commands go
+through the `docklet` context:
 
 ```
 docker --context docklet ps
@@ -49,3 +52,6 @@ docker --context docklet compose up -d
 ```
 
 Published ports are reachable on `http://localhost:<port>` from Windows.
+
+Limitation: bind mounts of Windows paths (`-v C:\project:/app`) do not work yet.
+Use named volumes, or paths inside the distro.

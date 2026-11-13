@@ -12,12 +12,14 @@ use docklet_core::wsl::{Wsl, WslOutput, WslRunner};
 use docklet_core::{EngineState, wsl_output};
 use sha2::{Digest, Sha256};
 
+pub mod tools;
+
 pub use docklet_core::engine::DISTRO_NAME as DISTRO;
 
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Hides the console window that would otherwise flash for each child.
-fn no_window(command: &mut Command) -> &mut Command {
+pub(crate) fn no_window(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -256,7 +258,7 @@ pub fn spawn_detached(_command_line: &str) -> io::Result<()> {
 }
 /// Downloads with the `curl.exe` that ships with Windows, which keeps an HTTP
 /// and TLS stack out of the Docklet binaries.
-fn download(url: &str, destination: &Path) -> io::Result<()> {
+pub(crate) fn download(url: &str, destination: &Path) -> io::Result<()> {
     let mut command = Command::new("curl.exe");
     command
         .args(["--fail", "--location", "--silent", "--show-error"])
@@ -277,7 +279,7 @@ fn download(url: &str, destination: &Path) -> io::Result<()> {
 }
 
 /// Checks `file` against the first token of a `sha256sum` line.
-fn verify_sha256(file: &Path, checksum_line: &str) -> io::Result<()> {
+pub(crate) fn verify_sha256(file: &Path, checksum_line: &str) -> io::Result<()> {
     let expected = checksum_line
         .split_whitespace()
         .next()

@@ -25,6 +25,10 @@ Engine:
   uninstall --yes           Delete the docklet distro with all containers,
                             images and volumes (other distros are untouched)
 
+Docker client:
+  cli setup                 Install the Windows docker CLI and Compose if missing
+                            and create the `docklet` Docker context
+
 Agent skill:
   skills status             Show whether the Docklet agent skill is registered
   skills install            Register or update the skill (Claude Code, Codex)
@@ -79,6 +83,7 @@ fn main() -> ExitCode {
              pass --yes to confirm"
                 .to_string(),
         )),
+        ["cli", "setup"] => cli_setup(),
         ["skills", action] => run_skills(action),
         _ => Err(Failure::Usage(format!(
             "unknown command `{}`",
@@ -151,6 +156,25 @@ fn install(options: &[&str]) -> Result<(), Failure> {
     let engine = Engine::system()?;
     engine.install(&source, &mut |step| println!("{step}"))?;
     println!("Installed. Run `docklet start` to start the engine.");
+    Ok(())
+}
+
+fn cli_setup() -> Result<(), Failure> {
+    let home = home_dir()
+        .ok_or_else(|| Failure::Runtime("cannot find the user's home directory".to_string()))?;
+    let setup = docklet_wsl::tools::setup(
+        &docklet_wsl::data_dir()?,
+        &home,
+        proxy::DOCKER_HOST,
+        &mut |step| println!("{step}"),
+    )?;
+    let docker = if setup.docker_on_path {
+        "docker".to_string()
+    } else {
+        format!("\"{}\"", setup.docker.display())
+    };
+    println!("Docker CLI: {}", setup.docker.display());
+    println!("Use it with: {docker} --context docklet ps");
     Ok(())
 }
 

@@ -97,3 +97,27 @@ Engine lifecycle through the CLI (`docklet install`, `start`, `stop`,
   is not localized, instead of the registry lookup the plan proposed.
 - Known cosmetic issue: `wsl.exe` prints "Failed to start the systemd user
   session for 'root'" when entering the distro. It does not affect dockerd.
+
+## M2 measurements
+
+Windows `docker` CLI 29.9.3 through `\\.\pipe\docklet_engine`, measured
+2026-11-14 on the development PC and in the E2E workflow (both bases).
+
+| Check                                                        | Development PC                 | Hosted runner |
+| ------------------------------------------------------------ | ------------------------------ | ------------- |
+| `docker --context docklet version` (Server 29.9.3)           | pass, 0.6 s                    | pass, 0.3 s   |
+| `docker run --rm hello-world`                                | pass, 0.9 s                    | pass, 1.2 s   |
+| `echo hi \| docker run -i --rm alpine cat`                   | pass                           | pass          |
+| `docker run -d -p 8080:80 nginx`, then `curl localhost:8080` | 200                            | 200           |
+| `docker save python:3.13` (412 MB)                           | 11.3 s, 37 MB/s                | pass          |
+| Proxy while idle                                             | 0 CPU s in 5 s, 8 MB, 0 relays | pass          |
+
+- The pipe's DACL is `D:P(A;;FA;;;SY)(A;;FA;;;<current user>)`: only SYSTEM and
+  the current user have access. A test from a second Windows account was not
+  run because the machine has no second account.
+- 37 MB/s for bulk transfer is the cost of going through `wsl.exe` stdio. It is
+  fine for API traffic and logs; large `docker save`/`load`/build contexts are
+  where a faster transport (hvsocket) would pay off.
+- Known gap: between accepting a connection and creating the next pipe
+  instance a client can get "pipe busy". go-winio retries, .NET `Get-Acl` does
+  not. Pre-creating a spare instance would close it.

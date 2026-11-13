@@ -107,10 +107,9 @@ jobs:
           Step "versions.txt" { wsl -d docklet --exec cat /usr/local/share/docklet/versions.txt }
           Step "hello-world" { wsl -d docklet --exec sh -c "docker run --rm hello-world | head -n 2" }
           # --- M2: Windows docker CLI through the named pipe ---
-          curl.exe -fsSL -o "$env:RUNNER_TEMP\docker.zip" https://download.docker.com/win/static/stable/x86_64/docker-29.9.3.zip
-          Expand-Archive "$env:RUNNER_TEMP\docker.zip" -DestinationPath "$env:RUNNER_TEMP\cli"
-          $env:DOCKER_HOST = "npipe:////./pipe/docklet_engine"
-          $docker = "`"$env:RUNNER_TEMP\cli\docker\docker.exe`""
+          Step "cli setup" { & $docklet cli setup }
+          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
+          $docker = "`"$dockerExe`" --context docklet"
           Timed "pipe-version" "$docker version --format {{.Server.Version}}" 30
           if ($Last.Text.Trim() -notlike "29.*") { Report "error" "pipe-version" "unexpected server version"; exit 1 }
           Timed "pipe-hello-world" "$docker run --rm hello-world" 120
