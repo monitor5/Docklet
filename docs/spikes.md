@@ -73,3 +73,27 @@ What it took to get there:
 
 Rule for running this kind of test: anything that loops over a pipe runs on a
 hosted runner with a timeout first, and only then on a developer machine.
+
+## M1 measurements
+
+Engine lifecycle through the CLI (`docklet install`, `start`, `stop`,
+`uninstall`), measured 2026-11-14.
+
+| Measurement                                  | Development PC (kernel 6.18.58.1) | Hosted runner |
+| -------------------------------------------- | --------------------------------- | ------------- |
+| `docklet install` (download, verify, import) | 28 s                              | not timed     |
+| `docklet start` until dockerd answers        | 12 s                              | about 15 s    |
+| `docklet stop`                               | 0.6 s                             | not timed     |
+| Distro lifetime **without** keepalive        | about 16 s                        | about 25 s    |
+| Distro still up 40 s after `start`           | yes                               | yes (45 s)    |
+
+- Without a process held from Windows, WSL stops the systemd distro within
+  half a minute even though dockerd is running, so the keepalive is required.
+- The keepalive must be created without inherited handles. Otherwise it keeps
+  the CLI's stdout pipe open and whatever reads `docklet start` never sees EOF.
+- Both bases (Debian 13, Ubuntu 26.04) pass the same E2E with dockerd 29.9.3,
+  overlayfs and cgroup v2. Nothing in the engine code depends on the base.
+- Distro names are read with `wsl --list --quiet`, which prints names only and
+  is not localized, instead of the registry lookup the plan proposed.
+- Known cosmetic issue: `wsl.exe` prints "Failed to start the systemd user
+  session for 'root'" when entering the distro. It does not affect dockerd.
