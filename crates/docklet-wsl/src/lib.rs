@@ -198,24 +198,55 @@ impl<R: WslRunner> Engine<R> {
 /// WSL stops a distro shortly after its last process started from Windows
 /// exits, even if daemons are running. A `sleep infinity` held by `wsl.exe`
 /// keeps it up; `wsl --terminate` ends it.
+///
+/// The keepalive must not inherit any handle from this process. It outlives
+/// the CLI, and an inherited stdout pipe would keep whoever reads the CLI's
+/// output (a script, an agent, CI) waiting forever.
+#[cfg(windows)]
 fn spawn_keepalive() -> io::Result<()> {
-    let mut command = Command::new("wsl.exe");
-    command
-        .args([
-            "-d",
-            DISTRO_NAME,
-            "-u",
-            "root",
-            "--exec",
-            "/bin/sleep",
-            "infinity",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    no_window(&mut command).spawn().map(drop)
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    use windows::core::PWSTR;
+
+    let mut command_line: Vec<u16> =
+        format!("wsl.exe -d {DISTRO_NAME} -u root --exec /bin/sleep infinity")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: the command line is a writable NUL-terminated buffer, the
+    // structs are valid for the call, and both returned handles are closed.
+    unsafe {
+        CreateProcessW(
+            None,
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false, // no handle inheritance
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            None,
+            None,
+            &startup,
+            &mut process,
+        )
+        .map_err(io::Error::other)?;
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
+    }
+    Ok(())
 }
 
+#[cfg(not(windows))]
+fn spawn_keepalive() -> io::Result<()> {
+    Err(io::Error::other("the docklet engine only runs on Windows"))
+}
 /// Downloads with the `curl.exe` that ships with Windows, which keeps an HTTP
 /// and TLS stack out of the Docklet binaries.
 fn download(url: &str, destination: &Path) -> io::Result<()> {

@@ -681,6 +681,7 @@ version = "0.1.0"
 dependencies = [
  "docklet-core",
  "sha2",
+ "windows",
 ]
 
 [[package]]

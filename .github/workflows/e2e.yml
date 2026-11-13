@@ -71,16 +71,19 @@ jobs:
           }
           exit 1
       - name: 1. status before install
+        timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "status (fresh)" { & $docklet status }
           if ((& $docklet status) -notlike "not-installed*") { exit 1 }
       - name: 2. install
+        timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "install" { & $docklet install --base "${{ matrix.base }}" }
           if ((& $docklet status) -ne "stopped") { exit 1 }
       - name: 3. start, docker info, hello-world
+        timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -95,6 +98,7 @@ jobs:
           if (-not (Running)) { Report "error" "keepalive" "distro stopped while the engine was started"; exit 1 }
           Report "notice" "keepalive" "distro still running 45 s after start"
       - name: 4. stop
+        timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "stop" { & $docklet stop }
@@ -103,6 +107,7 @@ jobs:
           if (Get-Process wsl -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 3 }
           Report "notice" "after stop" "wsl.exe processes: $(@(Get-Process wsl -ErrorAction SilentlyContinue).Count)"
       - name: 5. Lifetime without keepalive
+        timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           wsl -d docklet --exec true
@@ -111,6 +116,7 @@ jobs:
           $text = if (Running) { "still running after 180 s" } else { "stopped after about $([int]$watch.Elapsed.TotalSeconds) s" }
           Report "notice" "lifetime without keepalive" $text
       - name: 6. uninstall
+        timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "uninstall without --yes" { & $docklet uninstall } 2
