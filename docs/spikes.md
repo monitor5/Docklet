@@ -204,5 +204,46 @@ the hand-built experiment in a few points:
 - Nothing restarts dockerd if it exits; systemd would. `docklet stop` and
   `docklet start` boot the distro again.
 
-Not measured yet: the Alpine rootfs as built by `distro.yml` (the numbers above
-are from the hand-built one), `docklet start` on it, and k3d clusters on it.
+The rootfs built by `distro.yml` is 75.5 MiB (gzip), larger than the hand-built
+one because it carries the `docker` CLI and k3d. Not measured yet: k3d clusters
+on it.
+
+## Idle stop and wake on connect
+
+Question: does stopping an unused engine give the memory back, and what does
+the next Docker command pay for it?
+
+GitHub-hosted runner (2026-11-15, E2E run 43709548713, idle time set to 20 s
+for the test):
+
+| Base         | `docklet start` | Wake by `docker version` | Wake by `docklet docker version` |
+| ------------ | --------------- | ------------------------ | -------------------------------- |
+| alpine       | 5.9 s           | 2.9 s                    | 2.9 s                            |
+| debian-13    | 19.7 s          | 14.0 s                   | 14.7 s                           |
+| ubuntu-26.04 | 15.4 s          | 14.0 s                   | 13.9 s                           |
+
+`docklet-desktop.exe --proxy` (debian-13) fell asleep after about 31 s and woke
+in 16.0 s.
+
+Local PC (2026-11-15, release build, one run per base, idle time 20 s):
+
+| Measurement                                | debian-13 | alpine |
+| ------------------------------------------ | --------- | ------ |
+| `docklet start`                            | 13.6 s    | 2.1 s  |
+| Wake by `docker --context docklet version` | 13.1 s    | 3.2 s  |
+| `docker ps` on a running engine            | 0.29 s    | 0.28 s |
+| `docklet stop`                             | 1.1 s     | 0.6 s  |
+
+- The host's `vmmemWSL` process does not shrink when the distro stops: WSL
+  keeps the VM for about a minute (it showed 685 to 966 MB in that window),
+  then the process is gone. With the proxy still listening, `vmmemWSL` was at
+  0 MB 75 s after the engine fell asleep.
+- While sleeping, the only Docklet process was the proxy (8 MB working set,
+  2 MB private) and no `wsl.exe` was left.
+- The two columns are not like for like. The alpine start began while the VM
+  was still up from the import. The alpine wake started from a VM that was
+  fully gone; the debian-13 wake came seconds after falling asleep, with the
+  VM still up.
+- Not measured: a debian-13 wake from a VM that is fully gone, memory of the
+  running engine per base in this build, and the desktop window on a sleeping
+  engine.

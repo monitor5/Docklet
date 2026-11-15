@@ -10,11 +10,18 @@ Desktop required.
 
 ## What works today
 
-- **CLI** (`docklet.exe`): `status`, `bases`, `install`, `start`, `stop`,
-  `uninstall --yes`, `cli setup`, `skills status|install|uninstall`, `version`.
-  `docklet cli setup` installs the Windows `docker` CLI and Compose if missing
-  and creates the `docklet` Docker context, so `docker --context docklet ...`
-  talks to the engine.
+- **CLI** (`docklet.exe`): `up`, `status`, `wait`, `doctor`, `bases`, `install`,
+  `start`, `stop`, `uninstall --yes`, `docker <args...>`, `config get|set`,
+  `cli setup`, `skills status|install|uninstall`, `version`. `docklet up`
+  installs, starts and sets up the Docker CLI in one step; `docklet docker ...`
+  runs the Windows `docker` CLI against the engine without a path or a context.
+  Every command takes `--json` and then prints one JSON object with a stable
+  error code and the next command to run; `docklet help --json` lists the
+  commands as data.
+- **Idle stop**: an engine with no open connection and no running container
+  for 10 minutes stops by itself and shows as `sleeping`; the next Docker
+  command starts it again. `docklet config set idle-stop <minutes|off>` changes
+  or disables this. See [Idle stop](#idle-stop).
 - **Desktop app** (`docklet-desktop.exe`; written, but nobody has run it yet):
   a tray icon with Open, Start engine, Stop engine and Quit, and a window with
   an install screen, Containers, Images, Volumes and Networks views, and a log
@@ -52,15 +59,34 @@ same on each.
 | `ubuntu-26.04`        | Ubuntu 26.04, otherwise the same as `debian-13`                             |
 | `alpine`              | Alpine Linux 3.24, no init system, Docker from Alpine's packages (unpinned) |
 
-Pick `alpine` if you want the engine small and quick: a 59 MiB download instead
-of 169 MiB, about 2.6 s instead of 14 s from a cold start until Docker answers,
-and less memory (one measurement, see [docs/spikes.md](docs/spikes.md)). The
+Pick `alpine` if you want the engine small and quick: a 76 MiB download instead
+of 169 MiB, and about 3 s instead of 14 s until Docker answers after a start or
+a wake (see [docs/spikes.md](docs/spikes.md)). The
 trade-offs only concern the engine distro itself, not your containers: its
 userland is musl and busybox, there is no systemd (a boot script starts dockerd
 and nothing restarts it if it exits), Docker's version follows Alpine's
 packages rather than Docker's own repository, and the buildx and compose CLI
 plugins are not installed inside the distro. The Windows-side `docker compose`
 is unaffected.
+
+## Idle stop
+
+The WSL VM is what an engine costs: around 1 GB of host memory even with no
+container. So the pipe proxy stops the distro once nothing has used it for a
+while, and keeps listening on the pipe.
+
+- **Idle** means no open connection to the pipe and no running container. A
+  running container keeps the engine up, and so does the open Docklet window.
+- **Sleeping** is the state after that. `docklet status` prints `sleeping`,
+  with `"ready": true` in JSON. Any Docker client that connects wakes the
+  engine; that first command takes as long as an engine start. `status`,
+  `doctor` and `wait` do not wake it.
+- WSL itself keeps its VM for about another minute after the last distro stops,
+  then the memory is returned.
+- `docklet stop` and Stop in the app end the proxy too: the engine then stays
+  off until it is started.
+- `docklet config set idle-stop <minutes|off>` (default 10) applies from the
+  next `docklet start`.
 
 ## Requirements
 
