@@ -39,8 +39,12 @@ pub fn rootfs_url(base: &str) -> Option<String> {
 /// The distro counts as `Running` only when dockerd answers; a distro that is
 /// up while dockerd is still starting reports `Starting`.
 pub fn probe<R: WslRunner>(wsl: &Wsl<R>) -> EngineState {
-    let Some(version) = wsl.version() else {
-        return EngineState::WslMissing;
+    let version = match wsl.version() {
+        Ok(Some(version)) => version,
+        Ok(None) => return EngineState::WslMissing,
+        // A WSL that hangs is installed; telling the user to install it
+        // would send them the wrong way.
+        Err(err) => return EngineState::Error(err.to_string()),
     };
     if version < WslVersion::MINIMUM {
         return EngineState::Error(format!(
@@ -124,6 +128,20 @@ mod tests {
     fn missing_wsl() {
         let runner = MockRunner::new(|_| Err(io::Error::from(io::ErrorKind::NotFound)));
         assert_eq!(probe(&Wsl::new(&runner)), EngineState::WslMissing);
+    }
+
+    #[test]
+    fn a_wsl_that_hangs_is_an_error_not_missing() {
+        let runner = MockRunner::new(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "wsl --version did not finish",
+            ))
+        });
+        assert_eq!(
+            probe(&Wsl::new(&runner)),
+            EngineState::Error("wsl --version did not finish".to_string())
+        );
     }
 
     #[test]

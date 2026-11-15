@@ -251,6 +251,11 @@ input {
   color: var(--danger);
 }
 
+.banner.warning {
+  border-color: var(--border);
+  color: var(--text);
+}
+
 .banner-text {
   flex: 1;
   white-space: pre-wrap;

@@ -7,30 +7,47 @@ const EVENT_DEBOUNCE_MS = 150;
 /** Engine state, polled while the window exists and refreshed on demand. */
 export function useEngine() {
   const [status, setStatus] = useState<EngineStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Kept apart: a poll that works again clears its own error, but must not
+  // clear what a tray action reported a moment earlier.
+  const [pollError, setPollError] = useState<string | null>(null);
+  const [trayError, setTrayError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       setStatus(await api.engineStatus());
+      setPollError(null);
     } catch (err) {
-      setError(String(err));
+      setPollError(String(err));
     }
   }, []);
 
   useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, STATUS_POLL_MS);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // The next poll is armed only when this one is over, so polls cannot
+    // pile up behind a backend that is slow to answer.
+    const poll = async () => {
+      await refresh();
+      if (!stopped) timer = setTimeout(poll, STATUS_POLL_MS);
+    };
+    poll();
     const unlisten = onEngineChanged((message) => {
-      setError(message);
+      setTrayError(message);
       refresh();
     });
     return () => {
-      clearInterval(timer);
+      stopped = true;
+      clearTimeout(timer);
       unlisten.then((stop) => stop());
     };
   }, [refresh]);
 
-  return { status, error, setError, refresh };
+  const dismissError = useCallback(() => {
+    setPollError(null);
+    setTrayError(null);
+  }, []);
+
+  return { status, error: trayError ?? pollError, dismissError, refresh };
 }
 
 /**
@@ -43,6 +60,7 @@ export function useDockerList<T>(
 ) {
   const [items, setItems] = useState<T[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [watchError, setWatchError] = useState<string | null>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
@@ -61,7 +79,12 @@ export function useDockerList<T>(
       return;
     }
     reload();
-    api.watchEvents();
+    // The backend keeps the subscription alive from here on. If it could not
+    // even be asked for, say so: the list would silently stop updating.
+    api.watchEvents().then(
+      () => setWatchError(null),
+      (err) => setWatchError(String(err)),
+    );
     let timer: ReturnType<typeof setTimeout> | undefined;
     const unlisten = onDockerEvent(() => {
       clearTimeout(timer);
@@ -73,5 +96,5 @@ export function useDockerList<T>(
     };
   }, [enabled, reload]);
 
-  return { items, error, reload };
+  return { items, error: error ?? watchError, reload };
 }

@@ -26,16 +26,14 @@ export default function App() {
   const engine = useEngine();
   const notice = useNotice();
   const [tab, setTab] = useState<TabId>("containers");
+  const [mirroredDismissed, setMirroredDismissed] = useState(false);
   const { status } = engine;
 
   if (!status) {
     return (
       <main className="shell">
         <EngineMessage title="Connecting…" busy />
-        <ErrorBanner
-          message={engine.error}
-          onDismiss={() => engine.setError(null)}
-        />
+        <ErrorBanner message={engine.error} onDismiss={engine.dismissError} />
       </main>
     );
   }
@@ -50,12 +48,14 @@ export default function App() {
     });
 
   const screen = screenFor(status.state);
+  // One engine request at a time; the backend would refuse a second one.
+  const acting = notice.busy.has("start") || notice.busy.has("stop");
   const errors = (
     <ErrorBanner
       message={notice.error ?? engine.error}
       onDismiss={() => {
         notice.dismiss();
-        engine.setError(null);
+        engine.dismissError();
       }}
     />
   );
@@ -81,7 +81,7 @@ export default function App() {
           <button
             type="button"
             className="ghost push"
-            disabled={notice.busy === "stop"}
+            disabled={acting}
             onClick={() => control("stop", api.engineStop)}
           >
             Stop engine
@@ -89,6 +89,22 @@ export default function App() {
         )}
       </header>
       {errors}
+      {status.mirrored_networking && !mirroredDismissed && (
+        <div className="banner warning" role="status">
+          <span className="banner-text">
+            Your .wslconfig sets networkingMode=mirrored. Published container
+            ports rely on WSL's NAT localhost forwarding and may not be
+            reachable from Windows.
+          </span>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setMirroredDismissed(true)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {screen === "wsl_missing" && <WslMissing onRecheck={engine.refresh} />}
       {screen === "install" && (
         <InstallScreen bases={status.bases} onDone={engine.refresh} />
@@ -98,7 +114,7 @@ export default function App() {
           <button
             type="button"
             className="primary"
-            disabled={notice.busy === "start"}
+            disabled={acting}
             onClick={() => control("start", api.engineStart)}
           >
             Start engine
@@ -112,8 +128,27 @@ export default function App() {
               ? "Starting the engine…"
               : "Stopping the engine…"
           }
+          hint="If this does not finish, start the engine again to repair it, or stop it."
           busy
-        />
+        >
+          {/* Without these the window could only wait: Docker up with the
+              pipe proxy down, or a dockerd that never gets ready, both
+              show as starting for good. */}
+          <button
+            type="button"
+            disabled={acting}
+            onClick={() => control("start", api.engineStart)}
+          >
+            Start engine
+          </button>
+          <button
+            type="button"
+            disabled={acting}
+            onClick={() => control("stop", api.engineStop)}
+          >
+            Stop engine
+          </button>
+        </EngineMessage>
       )}
       {screen === "error" && (
         <EngineMessage

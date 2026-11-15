@@ -7,12 +7,14 @@
 //!
 //! Only [`Client::connect`] needs Windows; the rest builds and tests on Linux.
 
+mod backoff;
 mod client;
 mod error;
 mod image_ref;
 mod logs;
 mod pull;
 
+pub use backoff::Backoff;
 pub use bollard::models;
 pub use client::{Client, ContainerAction};
 pub use error::Error;

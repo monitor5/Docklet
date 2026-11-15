@@ -3,14 +3,5 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    {
-      "identifier": "opener:allow-open-url",
-      "allow": [
-        { "url": "http://localhost:*" },
-        { "url": "http://127.0.0.1:*" }
-      ]
-    }
-  ]
+  "permissions": ["core:default"]
 }

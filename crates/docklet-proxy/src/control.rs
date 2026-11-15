@@ -5,6 +5,7 @@
 //! and the risk of terminating an unrelated process that reused a PID.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
@@ -37,7 +38,7 @@ impl StopSignal {
                 return;
             }
             // A failed wait returns at once; never retry it in a tight loop.
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 }
@@ -71,6 +72,27 @@ pub fn request_stop() -> bool {
     unsafe {
         let _ = SetEvent(handle);
         let _ = CloseHandle(handle);
+    }
+    true
+}
+
+/// Asks the running proxy to exit and waits until it is gone, for at most
+/// five seconds. Returns whether no proxy is left, which is also the case
+/// when none was running.
+///
+/// Waiting matters to whoever starts a proxy next: the stop event stays
+/// signalled while the old proxy still holds it, so until then `is_running`
+/// is true and a new proxy would exit at once.
+pub fn stop() -> bool {
+    if !request_stop() {
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while is_running() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     true
 }

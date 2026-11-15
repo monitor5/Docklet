@@ -14,6 +14,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
+use crate::streams::LogMessage;
 use crate::supervisor;
 
 type CommandResult<T> = Result<T, String>;
@@ -41,14 +42,19 @@ pub struct EngineStatus {
     #[serde(flatten)]
     state: EngineState,
     bases: Vec<&'static str>,
+    /// The user's `.wslconfig` turns on mirrored networking, under which
+    /// published ports may not reach Windows.
+    mirrored_networking: bool,
 }
 
 #[tauri::command]
 pub async fn engine_status() -> CommandResult<EngineStatus> {
-    let state = blocking(supervisor::status).await?;
+    let (state, mirrored_networking) =
+        blocking(|| Ok((supervisor::status()?, docklet_wsl::mirrored_networking()))).await?;
     Ok(EngineStatus {
         state,
         bases: engine::bases(),
+        mirrored_networking,
     })
 }
 
@@ -134,15 +140,23 @@ pub async fn network_remove(id: String) -> CommandResult<()> {
     client()?.remove_network(&id).await.map_err(text)
 }
 
+/// Opens a published port in the browser. The URL is built here from the
+/// port number alone, so the webview cannot make the app open anything else.
+#[tauri::command]
+pub async fn open_port(port: u16) -> CommandResult<()> {
+    tauri_plugin_opener::open_url(format!("http://localhost:{port}"), None::<&str>).map_err(text)
+}
+
 /// Follows a container's logs. Lines are sent in batches at most every 50 ms
-/// so a chatty container cannot flood the UI. Returns a token for `logs_stop`.
+/// so a chatty container cannot flood the UI, and a last message says how the
+/// log ended. Returns a token for `logs_stop`.
 #[tauri::command]
 pub async fn logs_start(
     state: State<'_, AppState>,
     id: String,
-    lines: Channel<Vec<String>>,
+    output: Channel<LogMessage>,
 ) -> CommandResult<u32> {
-    Ok(state.streams.follow_logs(client()?, id, lines))
+    Ok(state.streams.follow_logs(client()?, id, output))
 }
 
 #[tauri::command]

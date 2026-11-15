@@ -10,7 +10,8 @@ mod supervisor;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::webview::PageLoadEvent;
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// Event sent to the UI when the engine was started or stopped from the tray.
 /// Its payload is the error message, or null when the request succeeded.
@@ -118,10 +119,13 @@ pub fn run_proxy_mode() -> Option<std::io::Result<()>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // Lets the frontend open a published port in the browser. What it may
-        // open is limited to localhost URLs in `capabilities/default.json`.
-        .plugin(tauri_plugin_opener::init())
         .manage(state::AppState::default())
+        // A page that reloads does not get to stop the logs it followed.
+        .on_page_load(|webview, payload| {
+            if webview.label() == MAIN_WINDOW && payload.event() == PageLoadEvent::Started {
+                webview.state::<state::AppState>().streams.stop_all_logs();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::engine_status,
             commands::engine_install,
@@ -137,6 +141,7 @@ pub fn run() {
             commands::volume_remove,
             commands::networks,
             commands::network_remove,
+            commands::open_port,
             commands::logs_start,
             commands::logs_stop,
         ])
@@ -147,13 +152,17 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building the Docklet application")
-        .run(|_app, event| {
+        .run(|app, event| match event {
             // Closing the last window requests an exit with no exit code. Keep
             // the core alive in the tray; `AppHandle::exit` (Quit) passes a code.
-            if let RunEvent::ExitRequested { api, code, .. } = event
-                && code.is_none()
-            {
-                api.prevent_exit();
-            }
+            RunEvent::ExitRequested { api, code, .. } if code.is_none() => api.prevent_exit(),
+            // The window took its WebView along without running the page's
+            // cleanup. The event subscription stays for the next window.
+            RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::Destroyed,
+                ..
+            } if label == MAIN_WINDOW => app.state::<state::AppState>().streams.stop_all_logs(),
+            _ => {}
         });
 }

@@ -13,7 +13,7 @@ export function InstallScreen({ bases, onDone }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const notice = useNotice();
   const selectId = useId();
-  const installing = notice.busy === "install";
+  const installing = notice.busy.has("install");
 
   const install = () =>
     notice.run("install", async () => {
