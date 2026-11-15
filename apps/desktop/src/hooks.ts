@@ -37,7 +37,10 @@ export function useEngine() {
  * A Docker list that reloads whenever Docker reports an event, so changes made
  * from any client show up without polling.
  */
-export function useDockerList<T>(fetcher: () => Promise<T[]>, enabled: boolean) {
+export function useDockerList<T>(
+  fetcher: () => Promise<T[]>,
+  enabled: boolean,
+) {
   const [items, setItems] = useState<T[]>([]);
   const [error, setError] = useState<string | null>(null);
   const fetcherRef = useRef(fetcher);

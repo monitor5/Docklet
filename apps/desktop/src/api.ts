@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { EngineState } from "./engine";
 
 export type EngineStatus = {
@@ -51,7 +52,14 @@ export type ContainerAction = "start" | "stop" | "restart" | "remove";
 
 export const api = {
   engineStatus: () => invoke<EngineStatus>("engine_status"),
-  engineInstall: (base?: string) => invoke<void>("engine_install", { base }),
+  engineInstall: (
+    base: string | undefined,
+    onProgress: (line: string) => void,
+  ) => {
+    const progress = new Channel<string>();
+    progress.onmessage = onProgress;
+    return invoke<void>("engine_install", { base, progress });
+  },
   engineStart: () => invoke<void>("engine_start"),
   engineStop: () => invoke<void>("engine_stop"),
   watchEvents: () => invoke<void>("events_watch"),
@@ -73,6 +81,9 @@ export const api = {
 
   networks: () => invoke<Network[]>("networks"),
   networkRemove: (id: string) => invoke<void>("network_remove", { id }),
+
+  /** The backend only allows localhost URLs. */
+  openPort: (port: number) => openUrl(`http://localhost:${port}`),
 
   /** Follows a container's logs; resolves to a function that stops it. */
   logs: async (id: string, onLines: (lines: string[]) => void) => {
