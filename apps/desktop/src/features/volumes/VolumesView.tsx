@@ -29,7 +29,7 @@ export function VolumesView() {
                 <ConfirmButton
                   label="Remove"
                   ariaLabel={`Remove ${volume.Name}`}
-                  disabled={notice.busy === volume.Name}
+                  disabled={notice.busy.has(volume.Name)}
                   onConfirm={() =>
                     notice.run(volume.Name, () => api.volumeRemove(volume.Name))
                   }

@@ -9,11 +9,15 @@ const FLUSH_FALLBACK_MS = 250;
  * Follows a container's logs into a bounded buffer. Batches go straight into
  * the buffer; the view is told at most once per frame, so a burst of batches
  * costs one render. The stream is stopped when the component unmounts.
+ *
+ * `ended` turns true when the log is over, and `error` says why if it did not
+ * simply end; without them a finished log looks like a quiet one.
  */
 export function useLogStream(id: string) {
   const [buffer] = useState(() => new LogBuffer());
   const [version, setVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [ended, setEnded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,19 +41,30 @@ export function useLogStream(id: string) {
 
     buffer.clear();
     setError(null);
+    setEnded(false);
     let stop: (() => Promise<void>) | undefined;
     api
-      .logs(id, (lines) => {
-        if (cancelled) return;
-        buffer.append(lines);
-        schedule();
-      })
+      .logs(
+        id,
+        (lines) => {
+          if (cancelled) return;
+          buffer.append(lines);
+          schedule();
+        },
+        (reason) => {
+          if (cancelled) return;
+          setEnded(true);
+          setError(reason);
+        },
+      )
       .then((stopFn) => {
         if (cancelled) stopFn().catch(() => {});
         else stop = stopFn;
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (cancelled) return;
+        setEnded(true);
+        setError(String(err));
       });
 
     return () => {
@@ -60,5 +75,5 @@ export function useLogStream(id: string) {
     };
   }, [id, buffer]);
 
-  return { buffer, version, error };
+  return { buffer, version, error, ended };
 }

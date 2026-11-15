@@ -1,6 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import type { EngineState } from "./engine";
 
 export type EngineStatus = {
@@ -8,7 +7,14 @@ export type EngineStatus = {
   /** Present when `state` is `error`. */
   reason?: string;
   bases: string[];
+  /** `.wslconfig` sets `networkingMode=mirrored`. */
+  mirrored_networking: boolean;
 };
+
+/** What a followed log sends; `ended` is its last message. */
+type LogMessage =
+  | { kind: "lines"; lines: string[] }
+  | { kind: "ended"; error: string | null };
 
 /** Docker API models, with the Docker API's own field names. */
 export type Port = {
@@ -82,19 +88,33 @@ export const api = {
   networks: () => invoke<Network[]>("networks"),
   networkRemove: (id: string) => invoke<void>("network_remove", { id }),
 
-  /** The backend only allows localhost URLs. */
-  openPort: (port: number) => openUrl(`http://localhost:${port}`),
+  /** Opens `http://localhost:<port>` in the browser; the backend builds the URL. */
+  openPort: (port: number) => invoke<void>("open_port", { port }),
 
-  /** Follows a container's logs; resolves to a function that stops it. */
-  logs: async (id: string, onLines: (lines: string[]) => void) => {
-    const lines = new Channel<string[]>();
-    lines.onmessage = onLines;
-    const token = await invoke<number>("logs_start", { id, lines });
+  /**
+   * Follows a container's logs; resolves to a function that stops it.
+   * `onEnd` is called once when the log is over, with the error that ended
+   * it or null when it simply ended (the container stopped or was removed).
+   */
+  logs: async (
+    id: string,
+    onLines: (lines: string[]) => void,
+    onEnd: (error: string | null) => void,
+  ) => {
+    const output = new Channel<LogMessage>();
+    output.onmessage = (message) => {
+      if (message.kind === "lines") onLines(message.lines);
+      else onEnd(message.error);
+    };
+    const token = await invoke<number>("logs_start", { id, output });
     return () => invoke<void>("logs_stop", { token });
   },
 };
 
-/** Docker reported a change of the given kind, or the stream ended. */
+/**
+ * Docker reported a change of the given kind, or the event stream ended
+ * (`disconnected`) or is being opened again (`reconnecting`).
+ */
 export function onDockerEvent(
   handler: (kind: string) => void,
 ): Promise<UnlistenFn> {

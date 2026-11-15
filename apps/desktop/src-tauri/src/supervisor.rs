@@ -94,6 +94,20 @@ pub fn status() -> io::Result<EngineState> {
     })
 }
 
+/// True when a Docker API connection would be answered: the pipe proxy is up
+/// and the distro runs. Blocks on `wsl.exe`.
+///
+/// Asked before the event stream is reopened, because trying is not harmless:
+/// the proxy starts `wsl.exe -d docklet` for every connection, and that boots
+/// a distro the user stopped from outside (`wsl --shutdown`).
+pub fn reachable() -> bool {
+    control::is_running()
+        && Engine::system().is_ok_and(|engine| {
+            let running = engine.wsl().running();
+            running.is_ok_and(|names| names.iter().any(|name| name == docklet_wsl::DISTRO))
+        })
+}
+
 /// Installs the distro from the published rootfs for `base`, or for the
 /// default base. `progress` receives one line per step. Blocks.
 pub fn install(
@@ -147,7 +161,9 @@ fn start_engine() -> io::Result<()> {
 }
 
 fn stop_engine() -> io::Result<()> {
-    control::request_stop();
+    // Waits for the proxy to exit, so a start right after this stop does not
+    // mistake the leaving proxy for a running one.
+    control::stop();
     Engine::system()?.stop()
 }
 

@@ -136,12 +136,21 @@ fn move_file(from: &Path, to: &Path) -> io::Result<()> {
     if fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    if let Err(err) = fs::copy(from, to) {
-        // Never leave a partial copy where Docker would load it.
-        let _ = fs::remove_file(to);
-        return Err(err);
+    copy_then_rename(from, to)
+}
+
+/// Copies `from` next to `to` under a partial name and renames it into place,
+/// so `to` only ever exists complete. A copy that is cut short, even by the
+/// process being killed, leaves a file that Docker does not load and that the
+/// next run overwrites.
+fn copy_then_rename(from: &Path, to: &Path) -> io::Result<()> {
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    let partial = to.with_file_name(format!(".{name}.partial"));
+    let moved = fs::copy(from, &partial).and_then(|_| fs::rename(&partial, to));
+    if moved.is_err() {
+        let _ = fs::remove_file(&partial);
     }
-    Ok(())
+    moved
 }
 
 /// Runs a command silently; an unsuccessful exit becomes an error carrying
@@ -172,6 +181,34 @@ mod tests {
         move_file(&from, &to).unwrap();
         assert!(!from.exists());
         assert_eq!(fs::read(&to).unwrap(), b"verified");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_copy_fallback_leaves_only_the_complete_file() {
+        let dir = std::env::temp_dir().join(format!("docklet-tools-copy-{}", std::process::id()));
+        let plugins = dir.join("cli-plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let from = dir.join("staged.exe");
+        let to = plugins.join("docker-compose.exe");
+        fs::write(&from, b"verified").unwrap();
+        copy_then_rename(&from, &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"verified");
+        let left: Vec<_> = fs::read_dir(&plugins)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["docker-compose.exe"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("docklet-tools-fail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let to = dir.join("docker-compose.exe");
+        assert!(copy_then_rename(&dir.join("missing.exe"), &to).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 }

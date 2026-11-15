@@ -72,6 +72,15 @@ fn main() -> ExitCode {
             println!("Engine is stopped.");
             Ok(())
         }),
+        // Not in the help text: `start` and `stop` are the user's commands.
+        ["proxy", "stop"] => {
+            if proxy::stop() {
+                println!("The pipe proxy is stopped.");
+                Ok(())
+            } else {
+                Err(Failure::Runtime("the pipe proxy did not exit".to_string()))
+            }
+        }
         ["proxy", options @ ..] => proxy::serve(options),
         ["uninstall", "--yes"] => with_engine(|engine| {
             proxy::stop();
@@ -275,14 +284,9 @@ mod proxy {
         Err(io::Error::other("the pipe proxy did not start"))
     }
 
-    pub fn stop() {
-        if !control::request_stop() {
-            return;
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while is_running() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    /// Stops the proxy and waits for it to exit. True when none is left.
+    pub fn stop() -> bool {
+        control::stop()
     }
 
     /// `docklet proxy [--trace] [--byte]`: runs the proxy in the foreground.
@@ -325,7 +329,9 @@ mod proxy {
         Err(io::Error::other("the docklet engine only runs on Windows"))
     }
 
-    pub fn stop() {}
+    pub fn stop() -> bool {
+        true
+    }
 
     pub fn serve(_options: &[&str]) -> Result<(), Failure> {
         Err(Failure::Runtime(

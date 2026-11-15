@@ -22,16 +22,16 @@ pub struct LineSplitter {
 impl LineSplitter {
     /// Feeds one chunk and appends every line it completes to `lines`,
     /// without the line ending.
-    pub fn push(&mut self, chunk: &[u8], lines: &mut Vec<String>) {
+    pub fn push(&mut self, chunk: &[u8], lines: &mut impl Extend<String>) {
         let mut rest = chunk;
         while let Some(end) = rest.iter().position(|&byte| byte == b'\n') {
             self.partial.extend_from_slice(&rest[..end]);
-            lines.push(self.take_line());
+            lines.extend([self.take_line()]);
             rest = &rest[end + 1..];
         }
         self.partial.extend_from_slice(rest);
         if self.partial.len() >= MAX_LINE_BYTES {
-            lines.push(self.take_line());
+            lines.extend([self.take_line()]);
         }
     }
 
@@ -49,9 +49,65 @@ impl LineSplitter {
     }
 }
 
+/// Most lines and bytes in one batch. A receiver such as the webview queues
+/// whatever it is sent, so without a limit a container that prints as fast as
+/// it can (`yes`) would queue data faster than anything can show it.
+const MAX_BATCH_LINES: usize = 5_000;
+const MAX_BATCH_BYTES: usize = 1024 * 1024;
+
+/// The lines that wait for the next batch. Once a line does not fit, it and
+/// every line after it are counted instead of kept.
+#[derive(Debug, Default)]
+struct Batch {
+    lines: Vec<String>,
+    bytes: usize,
+    skipped: usize,
+}
+
+impl Batch {
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.skipped == 0
+    }
+
+    /// Empties the batch. The lines that did not fit are replaced by one
+    /// line that says how many there were.
+    fn take(&mut self) -> Vec<String> {
+        let Self {
+            mut lines, skipped, ..
+        } = std::mem::take(self);
+        if skipped > 0 {
+            lines.push(skipped_line(skipped));
+        }
+        lines
+    }
+}
+
+impl Extend<String> for Batch {
+    fn extend<I: IntoIterator<Item = String>>(&mut self, lines: I) {
+        for line in lines {
+            let fits = self.skipped == 0
+                && self.lines.len() < MAX_BATCH_LINES
+                && self.bytes + line.len() <= MAX_BATCH_BYTES;
+            if fits {
+                self.bytes += line.len();
+                self.lines.push(line);
+            } else {
+                self.skipped += 1;
+            }
+        }
+    }
+}
+
+fn skipped_line(count: usize) -> String {
+    let lines = if count == 1 { "line" } else { "lines" };
+    format!("... {count} {lines} skipped ...")
+}
+
 /// Reads `chunks` to its end and hands the lines to `sink` in batches, at
 /// most one batch per `period`, so a chatty container cannot flood the
-/// receiver. Stops early when `sink` breaks.
+/// receiver. A batch is limited in lines and bytes; what does not fit is
+/// dropped and replaced by one line that says so. Stops early when `sink`
+/// breaks.
 ///
 /// A stream error ends the reading too; the lines read before it are still
 /// delivered, then the error is returned.
@@ -66,7 +122,7 @@ where
 {
     let mut chunks = pin!(chunks);
     let mut splitter = LineSplitter::default();
-    let mut batch = Vec::new();
+    let mut batch = Batch::default();
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let outcome = loop {
@@ -77,7 +133,7 @@ where
                 None => break Ok(()),
             },
             _ = tick.tick() => {
-                if !batch.is_empty() && sink(std::mem::take(&mut batch)).is_break() {
+                if !batch.is_empty() && sink(batch.take()).is_break() {
                     return Ok(());
                 }
             }
@@ -85,7 +141,7 @@ where
     };
     batch.extend(splitter.finish());
     if !batch.is_empty() {
-        let _ = sink(batch);
+        let _ = sink(batch.take());
     }
     outcome
 }
@@ -166,6 +222,76 @@ mod tests {
         assert_eq!(lines[0].len(), MAX_LINE_BYTES);
         splitter.push(b"tail\n", &mut lines);
         assert_eq!(lines[1], "tail");
+    }
+
+    fn numbered(count: usize) -> impl Iterator<Item = String> {
+        (0..count).map(|number| number.to_string())
+    }
+
+    #[test]
+    fn a_batch_within_the_limits_is_kept_whole() {
+        let mut batch = Batch::default();
+        assert!(batch.is_empty());
+        batch.extend(numbered(MAX_BATCH_LINES));
+        let lines = batch.take();
+        assert_eq!(lines.len(), MAX_BATCH_LINES);
+        assert_eq!(lines.last().unwrap(), &(MAX_BATCH_LINES - 1).to_string());
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn lines_beyond_the_line_limit_become_one_line() {
+        let mut batch = Batch::default();
+        batch.extend(numbered(MAX_BATCH_LINES + 3));
+        let lines = batch.take();
+        assert_eq!(lines.len(), MAX_BATCH_LINES + 1);
+        assert_eq!(
+            lines[MAX_BATCH_LINES - 1],
+            (MAX_BATCH_LINES - 1).to_string()
+        );
+        assert_eq!(lines[MAX_BATCH_LINES], "... 3 lines skipped ...");
+    }
+
+    #[test]
+    fn lines_beyond_the_byte_limit_become_one_line() {
+        let long = "x".repeat(MAX_LINE_BYTES);
+        let fitting = MAX_BATCH_BYTES / MAX_LINE_BYTES;
+        let mut batch = Batch::default();
+        batch.extend(std::iter::repeat_n(long, fitting + 1));
+        // A short line after a skipped one is skipped too, so the kept lines
+        // are a prefix of what was read.
+        batch.extend(["short".to_string()]);
+        let lines = batch.take();
+        assert_eq!(lines.len(), fitting + 1);
+        assert_eq!(lines[fitting], "... 2 lines skipped ...");
+    }
+
+    #[test]
+    fn the_limits_start_over_with_each_batch() {
+        let mut batch = Batch::default();
+        batch.extend(numbered(MAX_BATCH_LINES + 1));
+        assert_eq!(batch.take().last().unwrap(), "... 1 line skipped ...");
+        batch.extend(["next".to_string()]);
+        assert_eq!(batch.take(), ["next"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_reaches_the_sink_capped() {
+        let flood = "y\n".repeat(MAX_BATCH_LINES * 2);
+        let chunks = stream::iter([Ok::<_, ()>(flood)]);
+        let mut seen = Vec::new();
+        let outcome = batch_lines(chunks, PERIOD, |batch| {
+            seen.push(batch);
+            ControlFlow::Continue(())
+        })
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), MAX_BATCH_LINES + 1);
+        assert_eq!(
+            seen[0][MAX_BATCH_LINES],
+            format!("... {MAX_BATCH_LINES} lines skipped ...")
+        );
     }
 
     /// Runs `batch_lines` over an in-memory stream and returns its outcome

@@ -14,7 +14,7 @@ export function ImagesView() {
   const [name, setName] = useState("");
   const [lines, setLines] = useState<string[]>([]);
   const inputId = useId();
-  const pulling = notice.busy === "pull";
+  const pulling = notice.busy.has("pull");
 
   const pull = () => {
     const target = name.trim();
@@ -74,7 +74,7 @@ export function ImagesView() {
             <ImageRow
               key={image.Id}
               image={image}
-              busy={notice.busy === `rm:${image.Id}`}
+              busy={notice.busy.has(`rm:${image.Id}`)}
               onRemove={() =>
                 notice.run(`rm:${image.Id}`, () => api.imageRemove(image.Id))
               }

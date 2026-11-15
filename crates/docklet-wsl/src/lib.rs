@@ -4,7 +4,8 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use docklet_core::engine::{self, DISTRO_NAME};
@@ -29,7 +30,29 @@ pub(crate) fn no_window(command: &mut Command) -> &mut Command {
     command
 }
 
+/// Longest a query may take: `--version`, the `--list` forms and `docker info`
+/// inside the distro. They answer in well under a second on a healthy WSL.
+const QUERY_DEADLINE: Duration = Duration::from_secs(30);
+/// `--terminate` and `--unregister` wait for the distro to shut down.
+const TEARDOWN_DEADLINE: Duration = Duration::from_secs(3 * 60);
+/// `--import` unpacks the whole rootfs: 28 s on a fast machine, minutes on a
+/// slow disk.
+const IMPORT_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// How long one `wsl.exe` call may run before it is given up and killed.
+fn deadline_for(args: &[&str]) -> Duration {
+    match args.first().copied() {
+        Some("--import") => IMPORT_DEADLINE,
+        Some("--terminate" | "--unregister") => TEARDOWN_DEADLINE,
+        _ => QUERY_DEADLINE,
+    }
+}
+
 /// Runs the installed `wsl.exe`.
+///
+/// Every call has a deadline (see `deadline_for`). A `wsl.exe` that hangs,
+/// which happens while the WSL service is wedged or updating, is killed and
+/// reported as an error, so callers that poll cannot pile up behind it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemRunner;
 
@@ -41,13 +64,78 @@ impl WslRunner for SystemRunner {
             // UTF-8 output where supported; `wsl_output::decode` handles the rest.
             .env("WSL_UTF8", "1")
             .stdin(Stdio::null());
-        let output = no_window(&mut command).output()?;
+        let limit = deadline_for(args);
+        let output = output_within(no_window(&mut command), limit).map_err(|err| {
+            if err.kind() != io::ErrorKind::TimedOut {
+                return err;
+            }
+            let timed_out = format!(
+                "`wsl {}` did not finish within {} s and was stopped",
+                args.join(" "),
+                limit.as_secs()
+            );
+            io::Error::new(io::ErrorKind::TimedOut, timed_out)
+        })?;
         Ok(WslOutput {
             success: output.status.success(),
             stdout: wsl_output::decode(&output.stdout),
             stderr: wsl_output::decode(&output.stderr),
         })
     }
+}
+
+/// Like `Command::output`, but a child that is still running after `limit` is
+/// killed and the call fails with `ErrorKind::TimedOut`.
+fn output_within(command: &mut Command, limit: Duration) -> io::Result<Output> {
+    /// Longest pause between two looks at the child.
+    const MAX_PAUSE: Duration = Duration::from_millis(200);
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Both pipes are read while waiting: a child that fills one would
+    // otherwise block on it and never exit.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + limit;
+    // Short at first so a quick query is answered quickly, longer for a call
+    // that takes its time. Every round sleeps; the wait never spins.
+    let mut pause = Duration::from_millis(5);
+    let status = loop {
+        let failure = match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => None,
+            Ok(None) => Some(io::Error::from(io::ErrorKind::TimedOut)),
+            Err(err) => Some(err),
+        };
+        if let Some(failure) = failure {
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers are left to end on their own, when the pipes
+            // close. Joining them here could wait on a process that the
+            // child started and that still holds a pipe open.
+            return Err(failure);
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(MAX_PAUSE);
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Reads a child's pipe to its end on another thread.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
 }
 
 /// Where the rootfs for a new install comes from.
@@ -333,6 +421,78 @@ mod tests {
         let path = std::env::temp_dir().join(format!("docklet-wsl-{tag}-{}", std::process::id()));
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn queries_get_the_short_deadline() {
+        assert_eq!(deadline_for(&["--version"]), QUERY_DEADLINE);
+        assert_eq!(deadline_for(&["--list", "--quiet"]), QUERY_DEADLINE);
+        assert_eq!(
+            deadline_for(&["--list", "--running", "--quiet"]),
+            QUERY_DEADLINE
+        );
+        let docker_info = ["-d", "docklet", "-u", "root", "--exec", "docker", "info"];
+        assert_eq!(deadline_for(&docker_info), QUERY_DEADLINE);
+        assert_eq!(deadline_for(&[]), QUERY_DEADLINE);
+    }
+
+    #[test]
+    fn slow_calls_get_the_time_they_need() {
+        let import = ["--import", "docklet", "C:\\d", "C:\\r.tar.gz"];
+        assert_eq!(deadline_for(&import), IMPORT_DEADLINE);
+        assert_eq!(deadline_for(&["--terminate", "docklet"]), TEARDOWN_DEADLINE);
+        assert_eq!(
+            deadline_for(&["--unregister", "docklet"]),
+            TEARDOWN_DEADLINE
+        );
+        // An import took 28 s on a fast machine; a query must never wait
+        // that long, and an import must be allowed far more.
+        assert!(QUERY_DEADLINE < TEARDOWN_DEADLINE);
+        assert!(TEARDOWN_DEADLINE < IMPORT_DEADLINE);
+        assert!(IMPORT_DEADLINE >= Duration::from_secs(10 * 60));
+    }
+
+    /// A program that runs for about 30 s and then ends on its own, which
+    /// also bounds this test if the kill were to fail.
+    fn slow_command() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new(system_program("ping.exe"));
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[test]
+    #[ignore = "runner only"]
+    fn a_child_past_its_deadline_is_killed() {
+        let started = Instant::now();
+        let mut command = slow_command();
+        command.stdin(Stdio::null());
+        let err = output_within(&mut command, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    #[ignore = "runner only"]
+    fn a_child_within_its_deadline_returns_its_output() {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new(system_program("cmd.exe"));
+            command.args(["/d", "/c", "echo", "docklet"]);
+            command
+        } else {
+            let mut command = Command::new("echo");
+            command.arg("docklet");
+            command
+        };
+        command.stdin(Stdio::null());
+        let output = output_within(&mut command, Duration::from_secs(30)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "docklet");
     }
 
     #[test]

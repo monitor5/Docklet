@@ -33,7 +33,7 @@ export function NetworksView() {
                   <ConfirmButton
                     label="Remove"
                     ariaLabel={`Remove ${name}`}
-                    disabled={notice.busy === id || !network.Id}
+                    disabled={notice.busy.has(id) || !network.Id}
                     onConfirm={() =>
                       notice.run(id, () =>
                         api.networkRemove(network.Id as string),

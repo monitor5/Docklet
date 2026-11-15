@@ -17,14 +17,20 @@ export function ContainersView() {
 
   const rowProps = (container: Container) => ({
     container,
-    busy: notice.busy?.startsWith(`${container.Id}:`) ?? false,
+    busy: notice.busy.has(container.Id),
     selected: selected?.Id === container.Id,
     onSelect: () => setSelected(container),
+    onOpenPort: (port: number) =>
+      api.openPort(port).catch((err) => notice.setError(String(err))),
     onAction: (action: Parameters<typeof api.containerAction>[1]) =>
-      notice.run(`${container.Id}:${action}`, async () => {
+      notice.run(container.Id, async () => {
         await api.containerAction(container.Id, action);
-        if (action === "remove" && selected?.Id === container.Id) {
-          setSelected(null);
+        if (action === "remove") {
+          // Whatever is selected by now, not when the removal was started:
+          // the user may have opened another container's logs meanwhile.
+          setSelected((current) =>
+            current?.Id === container.Id ? null : current,
+          );
         }
       }),
   });

@@ -1,4 +1,4 @@
-import { api, type Container, type ContainerAction } from "../../api";
+import type { Container, ContainerAction } from "../../api";
 import { ConfirmButton } from "../../components/ConfirmButton";
 import { containerName, publishedPorts } from "../../format";
 import { isRunning } from "./grouping";
@@ -8,6 +8,7 @@ type Props = {
   busy: boolean;
   selected: boolean;
   onSelect: () => void;
+  onOpenPort: (port: number) => void;
   onAction: (action: ContainerAction) => void;
 };
 
@@ -16,6 +17,7 @@ export function ContainerRow({
   busy,
   selected,
   onSelect,
+  onOpenPort,
   onAction,
 }: Props) {
   const name = containerName(container);
@@ -49,7 +51,7 @@ export function ContainerRow({
             type="button"
             className="link-like"
             title={`Open http://localhost:${port}`}
-            onClick={() => api.openPort(port).catch(() => {})}
+            onClick={() => onOpenPort(port)}
           >
             :{port}
           </button>

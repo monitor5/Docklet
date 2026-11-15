@@ -16,7 +16,7 @@ type Props = {
 };
 
 export function LogView({ container, onClose }: Props) {
-  const { buffer, version, error } = useLogStream(container.Id);
+  const { buffer, version, error, ended } = useLogStream(container.Id);
   const scroller = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const [stuck, setStuck] = useState(true);
@@ -63,7 +63,13 @@ export function LogView({ container, onClose }: Props) {
     >
       <header className="logs-header">
         <strong className="ellipsis">{containerName(container)}</strong>
-        <span className="muted">{buffer.size.toLocaleString()} lines</span>
+        <span className="muted">
+          {buffer.size.toLocaleString()} lines
+          {/* Always rendered so the live region exists before the log ends. */}
+          <span role="status">
+            {ended && (error ? " · log stopped" : " · log ended")}
+          </span>
+        </span>
         {!stuck && (
           <button type="button" onClick={jumpToBottom}>
             Jump to bottom
