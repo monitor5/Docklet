@@ -39,8 +39,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep in sync with distro/bases.txt.
-        base: [debian-13, ubuntu-26.04]
+        # Keep in sync with distro/bases.txt. Nothing in this job may assume
+        # a Debian-family userland: alpine has busybox, musl and no systemd.
+        base: [debian-13, ubuntu-26.04, alpine]
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
@@ -113,9 +114,17 @@ jobs:
           Step "start" { & $docklet start }
           Report "notice" "start duration" "$($watch.ElapsedMilliseconds) ms"
           if ((& $docklet status) -ne "running") { exit 1 }
+          # OperatingSystem names the base (Debian, Ubuntu, Alpine); it is reported, not checked.
           Step "docker info" { wsl -d docklet -- docker info --format "{{.ServerVersion}} {{.Driver}} cgroup{{.CgroupVersion}} {{.OperatingSystem}}" }
           Step "versions.txt" { wsl -d docklet --exec cat /usr/local/share/docklet/versions.txt }
+          # sh and head are busybox applets on alpine.
           Step "hello-world" { wsl -d docklet --exec sh -c "docker run --rm hello-world | head -n 2" }
+          # k3d is a static binary; this proves it runs on every userland (musl included).
+          Step "k3d" { wsl -d docklet --exec k3d version }
+          # Without systemd the boot script logs through busybox syslogd.
+          if ("${{ matrix.base }}" -eq "alpine") {
+            Step "dockerd log lines" { wsl -d docklet --exec grep -c dockerd /var/log/messages }
+          }
           # --- M2: Windows docker CLI through the named pipe ---
           Step "cli setup" { & $docklet cli setup }
           $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
@@ -125,6 +134,10 @@ jobs:
           Timed "pipe-hello-world" "$docker run --rm hello-world" 120
           Timed "pipe-half-close" "echo hi| $docker run -i --rm alpine cat" 90
           if ($Last.Text.Trim() -notlike "*hi") { Report "error" "pipe-half-close" "output is not hi"; exit 1 }
+          # Resource limits need cgroup v2 controllers delegated to containers:
+          # systemd does it on the Debian family, the boot script on alpine.
+          Timed "pipe-memory-limit" "$docker run --rm --memory 64m alpine cat /sys/fs/cgroup/memory.max" 90
+          if ($Last.Text.Trim() -notlike "*67108864") { Report "error" "pipe-memory-limit" "memory.max is not 64 MiB"; exit 1 }
           Timed "pipe-nginx" "$docker run -d --name web -p 8080:80 nginx:alpine" 120
           $status = 0
           for ($i = 0; $i -lt 20 -and $status -ne 200; $i++) {

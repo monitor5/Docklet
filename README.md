@@ -29,14 +29,38 @@ Desktop required.
 
 ## How it works
 
-- **Engine**: a dedicated WSL2 distro named `docklet` (Debian 13 + docker-ce, systemd).
-  Your other distros are never touched; removing it is `wsl --unregister docklet`.
+- **Engine**: a dedicated WSL2 distro named `docklet` (by default Debian 13 +
+  docker-ce, systemd; see [Engine bases](#engine-bases)). Your other distros are
+  never touched; removing it is `wsl --unregister docklet`.
 - **Connection**: a named pipe `\\.\pipe\docklet_engine`, restricted to the current
   user, relayed into the distro's `/var/run/docker.sock`. The GUI and the Windows
   `docker` / `docker compose` CLIs use the same pipe.
 - **Kubernetes**: a single-node k3d cluster that is started and stopped on demand.
 - **App**: Tauri 2 (Rust core + WebView2). Closing the window destroys the WebView
   and leaves only the tray process.
+
+## Engine bases
+
+`docklet install --base <name>` picks the Linux base of the engine distro;
+`docklet bases` lists them. All of them run the same Docker Engine API, so
+containers, images and the Windows `docker` / `docker compose` CLIs behave the
+same on each.
+
+| Base                  | What it is                                                                  |
+| --------------------- | --------------------------------------------------------------------------- |
+| `debian-13` (default) | Debian 13, systemd, docker-ce from Docker's own repository                  |
+| `ubuntu-26.04`        | Ubuntu 26.04, otherwise the same as `debian-13`                             |
+| `alpine`              | Alpine Linux 3.24, no init system, Docker from Alpine's packages (unpinned) |
+
+Pick `alpine` if you want the engine small and quick: a 59 MiB download instead
+of 169 MiB, about 2.6 s instead of 14 s from a cold start until Docker answers,
+and less memory (one measurement, see [docs/spikes.md](docs/spikes.md)). The
+trade-offs only concern the engine distro itself, not your containers: its
+userland is musl and busybox, there is no systemd (a boot script starts dockerd
+and nothing restarts it if it exits), Docker's version follows Alpine's
+packages rather than Docker's own repository, and the buildx and compose CLI
+plugins are not installed inside the distro. The Windows-side `docker compose`
+is unaffected.
 
 ## Requirements
 
