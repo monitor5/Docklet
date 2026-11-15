@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[target.'cfg(windows)'.dependencies]
+[dependencies]
 docklet-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

@@ -74,17 +74,19 @@ export function LogView({ container, onClose }: Props) {
         </button>
       </header>
       <ErrorBanner message={error} />
-      {/* biome-ignore lint/a11y/noNoninteractiveTabindex: keyboard scrolling of the log */}
       <div
         className="log-scroll"
         ref={scroller}
         onScroll={onScroll}
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: lets the keyboard scroll the log
         tabIndex={0}
         role="log"
         aria-live="off"
         aria-label="Log output"
       >
-        <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+        <div
+          style={{ height: virtualizer.getTotalSize(), position: "relative" }}
+        >
           {virtualizer.getVirtualItems().map((item) => (
             <div
               key={item.key}

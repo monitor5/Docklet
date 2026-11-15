@@ -1,11 +1,8 @@
 //! Named pipe server that relays each Docker API connection to a child
 //! process (in production: `wsl.exe ... docklet-relay`).
 
-/// Named pipe that Docklet exposes to the GUI and the Windows `docker` CLI.
-pub const ENGINE_PIPE: &str = r"\\.\pipe\docklet_engine";
-
-/// The same pipe as a Docker host URL.
-pub const ENGINE_DOCKER_HOST: &str = "npipe:////./pipe/docklet_engine";
+// The pipe name lives in `docklet-core`, the one crate every client shares.
+pub use docklet_core::engine::{ENGINE_DOCKER_HOST, ENGINE_PIPE};
 
 #[cfg(windows)]
 pub mod control;
