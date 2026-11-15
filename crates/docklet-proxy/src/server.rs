@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::process::Command;
 
+use crate::lifecycle::{IdleStop, Lifecycle};
 use crate::security::PipeSecurity;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -67,6 +68,7 @@ pub struct PipeProxy {
     /// other still accepts; with a single instance a client arriving in that
     /// gap gets ERROR_PIPE_BUSY.
     listeners: [NamedPipeServer; 2],
+    idle: Option<IdleStop>,
 }
 
 impl PipeProxy {
@@ -79,11 +81,23 @@ impl PipeProxy {
             config: Arc::new(config),
             security,
             listeners: [first, spare],
+            idle: None,
         })
+    }
+
+    /// Stops the engine when it is unused and starts it again when a client
+    /// connects. Without this the proxy only relays, as it always did.
+    pub fn with_idle_stop(mut self, idle: IdleStop) -> Self {
+        self.idle = Some(idle);
+        self
     }
 
     /// Accepts connections until an accept fails.
     pub async fn run(mut self) -> io::Result<()> {
+        let lifecycle = self
+            .idle
+            .take()
+            .map(|idle| Lifecycle::spawn(idle, self.config.trace));
         let mut next_id = 0u64;
         loop {
             // Wait on both: a client may pick either instance, and one that
@@ -99,9 +113,25 @@ impl PipeProxy {
             let next = create_instance(&self.config, &self.security, false)?;
             let pipe = std::mem::replace(&mut self.listeners[index], next);
             let config = Arc::clone(&self.config);
+            let lifecycle = lifecycle.clone();
             let id = next_id;
             next_id += 1;
             tokio::spawn(async move {
+                // Waiting for the engine happens here, never on the accept
+                // loop. The guard counts the connection as in use until this
+                // task ends, however it ends.
+                let _in_use = match &lifecycle {
+                    Some(lifecycle) => match lifecycle.admit().await {
+                        Some(guard) => Some(guard),
+                        None => {
+                            if config.trace {
+                                eprintln!("[conn {id}] closed: the engine did not start");
+                            }
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 let outcome = relay(pipe, &config, id).await;
                 if config.trace {
                     eprintln!("[conn {id}] closed: {outcome:?}");
@@ -302,5 +332,108 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), both)
             .await
             .expect("clients did not finish within 60 s");
+    }
+
+    /// A real proxy with fake engine hooks: the first client starts the
+    /// engine, two more that connect during the start share it and are served
+    /// after it, and once nobody is connected the engine is stopped exactly
+    /// once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "runner only"]
+    async fn the_first_client_wakes_the_engine_and_an_idle_engine_stops_once() {
+        use crate::lifecycle::tests::{FakeEngine, eventually};
+        use docklet_core::idle::IdlePolicy;
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        let pipe_name = format!(r"\\.\pipe\docklet_test_idle_{}", std::process::id());
+        let config = PipeProxyConfig {
+            pipe_name: pipe_name.clone(),
+            message_mode: true,
+            relay: RelayCommand {
+                program: docklet_core::system_program("cmd.exe").into(),
+                args: ["/d", "/c", "echo", "docklet"]
+                    .iter()
+                    .map(OsString::from)
+                    .collect(),
+            },
+            trace: true,
+        };
+        let engine = Arc::new(FakeEngine {
+            start_delay: Duration::from_secs(2),
+            ..FakeEngine::default()
+        });
+        let policy =
+            IdlePolicy::new(Duration::from_secs(2)).with_check_every(Duration::from_secs(1));
+        let proxy = PipeProxy::bind(config)
+            .unwrap()
+            .with_idle_stop(IdleStop::new(policy, Arc::clone(&engine)));
+
+        let reply_of = |mut client: tokio::net::windows::named_pipe::NamedPipeClient| async move {
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).await.unwrap();
+            (
+                String::from_utf8_lossy(&reply).trim().to_string(),
+                Instant::now(),
+            )
+        };
+        let scenario = async {
+            let first = ClientOptions::new().open(&pipe_name).unwrap();
+            assert!(
+                eventually(Duration::from_secs(10), || engine
+                    .starts
+                    .load(Ordering::SeqCst)
+                    == 1)
+                .await,
+                "the first client did not start the engine"
+            );
+            // The start takes two seconds; these two arrive while it runs.
+            let second = ClientOptions::new().open(&pipe_name).unwrap();
+            let third = ClientOptions::new().open(&pipe_name).unwrap();
+            let replies = tokio::join!(reply_of(first), reply_of(second), reply_of(third));
+            let (began, ended) = engine.start_log.lock().unwrap()[0];
+            for (slot, (reply, at)) in [replies.0, replies.1, replies.2].into_iter().enumerate() {
+                assert_eq!(reply, "docklet", "client {slot}");
+                assert!(
+                    at >= ended,
+                    "client {slot} was served before the start ended"
+                );
+            }
+            assert!(ended - began >= Duration::from_secs(2));
+            assert_eq!(engine.starts.load(Ordering::SeqCst), 1, "one shared start");
+            assert_eq!(engine.stops.load(Ordering::SeqCst), 0);
+
+            assert!(
+                eventually(Duration::from_secs(15), || engine
+                    .stops
+                    .load(Ordering::SeqCst)
+                    >= 1)
+                .await,
+                "the idle engine was not stopped"
+            );
+            // Stopped stays stopped and quiet until the next client.
+            let checks = engine.checks.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            assert_eq!(
+                engine.stops.load(Ordering::SeqCst),
+                1,
+                "stopped exactly once"
+            );
+            assert_eq!(
+                engine.checks.load(Ordering::SeqCst),
+                checks,
+                "checks after the stop"
+            );
+            assert_eq!(engine.starts.load(Ordering::SeqCst), 1);
+        };
+        let both = async {
+            tokio::select! {
+                served = proxy.run() => panic!("the proxy stopped: {served:?}"),
+                () = scenario => {}
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), both)
+            .await
+            .expect("the scenario did not finish within 60 s");
     }
 }

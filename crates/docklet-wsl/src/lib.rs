@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use docklet_core::engine::{self, DISTRO_NAME};
+use docklet_core::idle::EngineHooks;
 use docklet_core::wsl::{Wsl, WslOutput, WslRunner};
 use docklet_core::{EngineState, system_program, wsl_output, wslconfig};
 use sha2::{Digest, Sha256};
@@ -285,6 +286,33 @@ impl<R: WslRunner> Engine<R> {
     }
 }
 
+/// What the pipe proxy needs to stop an idle engine and start it again when
+/// a client connects (see `docklet_core::idle`). `Engine::system()?` is all a
+/// caller has to build.
+impl<R: WslRunner + Send + Sync> EngineHooks for Engine<R> {
+    fn start_engine(&self) -> io::Result<()> {
+        self.start()
+    }
+
+    /// What `stop` does, minus the full status probe: `stop` takes a WSL that
+    /// does not answer for an engine that is not running and succeeds, and
+    /// the proxy would then believe a running distro stopped.
+    fn stop_distro(&self) -> io::Result<()> {
+        if engine::distro_running(&self.wsl)? {
+            self.wsl.terminate(DISTRO_NAME)?;
+        }
+        Ok(())
+    }
+
+    fn distro_running(&self) -> io::Result<bool> {
+        engine::distro_running(&self.wsl)
+    }
+
+    fn running_containers(&self) -> io::Result<usize> {
+        engine::running_containers(&self.wsl)
+    }
+}
+
 /// WSL stops a distro shortly after its last process started from Windows
 /// exits, even if daemons are running. A `sleep infinity` held by `wsl.exe`
 /// keeps it up; `wsl --terminate` ends it.
@@ -493,6 +521,70 @@ mod tests {
         let output = output_within(&mut command, Duration::from_secs(30)).unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "docklet");
+    }
+
+    /// `wsl.exe` scripted by a closure; records every call.
+    struct ScriptedRunner<F> {
+        answer: F,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl<F: Fn(&[&str]) -> WslOutput> WslRunner for ScriptedRunner<F> {
+        fn run(&self, args: &[&str]) -> io::Result<WslOutput> {
+            self.calls.lock().unwrap().push(args.join(" "));
+            Ok((self.answer)(args))
+        }
+    }
+
+    fn scripted(
+        answer: impl Fn(&[&str]) -> WslOutput,
+    ) -> ScriptedRunner<impl Fn(&[&str]) -> WslOutput> {
+        ScriptedRunner {
+            answer,
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn output(success: bool, stdout: &str) -> WslOutput {
+        WslOutput {
+            success,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn idle_stop_terminates_only_a_running_distro() {
+        let running = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(true, "docklet\n"),
+            ["--terminate", "docklet"] => output(true, ""),
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        let engine = Engine::new(&running, PathBuf::new());
+        engine.stop_distro().unwrap();
+        assert_eq!(
+            *running.calls.lock().unwrap(),
+            ["--list --running --quiet", "--terminate docklet"]
+        );
+
+        let stopped = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(false, ""),
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        Engine::new(&stopped, PathBuf::new()).stop_distro().unwrap();
+        assert_eq!(stopped.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn idle_check_reads_the_running_list_and_docker_ps() {
+        let runner = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(true, "Ubuntu\ndocklet\n"),
+            [.., "docker", "ps", "--quiet"] => output(true, "abc\ndef\n"),
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        let engine = Engine::new(&runner, PathBuf::new());
+        assert!(engine.distro_running().unwrap());
+        assert_eq!(engine.running_containers().unwrap(), 2);
     }
 
     #[test]
