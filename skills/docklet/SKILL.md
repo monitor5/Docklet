@@ -38,6 +38,10 @@ it needs no window and prints plain text.
 
 Exit codes: 0 success, 1 the command failed (reason on stderr), 2 wrong usage.
 
+`docklet status` and `docklet start` print a warning on stderr when
+`.wslconfig` sets `networkingMode=mirrored`: published ports may then be
+unreachable from Windows.
+
 Typical flow: `docklet status`; if `not-installed`, `docklet install`; if
 `stopped`, `docklet start`; then use Docker.
 ## Using Docker once the engine is running

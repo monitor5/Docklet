@@ -9,8 +9,18 @@ on:
     paths:
       - .github/workflows/e2e.yml
       - crates/**
+      - apps/desktop/src-tauri/**
       - distro/**
       - Cargo.lock
+      - pnpm-lock.yaml
+  pull_request:
+    paths:
+      - .github/workflows/e2e.yml
+      - crates/**
+      - apps/desktop/src-tauri/**
+      - distro/**
+      - Cargo.lock
+      - pnpm-lock.yaml
 
 permissions:
   contents: read
@@ -169,3 +179,140 @@ jobs:
           Step "uninstall without --yes" { & $docklet uninstall } 2
           Step "uninstall" { & $docklet uninstall --yes }
           if ((& $docklet status) -notlike "not-installed*") { exit 1 }
+
+  # `docklet-desktop.exe --proxy` serves the same pipe as `docklet proxy`.
+  # The CLI's own proxy is stopped first so the desktop binary takes over.
+  desktop-proxy:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      # Keep in sync with distro/bases.txt.
+      BASE: debian-13
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install JS dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile
+      # generate_context! needs the frontend bundle at compile time.
+      - name: Build frontend
+        timeout-minutes: 5
+        run: pnpm --filter "@docklet/desktop" build
+      - name: Build the CLI and the desktop app
+        timeout-minutes: 15
+        run: cargo build --release -p docklet-cli -p docklet-desktop
+      - name: Define helpers
+        run: |
+          $helper = @'
+          $docklet = "$env:GITHUB_WORKSPACE\target\release\docklet.exe"
+          $desktop = "$env:GITHUB_WORKSPACE\target\release\docklet-desktop.exe"
+          function Report([string]$Kind, [string]$Title, [string]$Text) {
+            $flat = ($Text -replace "`0", "" -replace "\s*\r?\n\s*", " | ").Trim()
+            if ($flat.Length -gt 900) { $flat = $flat.Substring($flat.Length - 900) }
+            Write-Host "::${Kind} title=$Title::$flat"
+          }
+          # Runs a command, reports its output, fails the step on a wrong exit code.
+          function Step([string]$Title, [scriptblock]$Body, [int]$ExpectedExit = 0) {
+            $output = (& $Body 2>&1 | Out-String).Trim()
+            $code = $LASTEXITCODE
+            Write-Host $output
+            $ok = $code -eq $ExpectedExit
+            Report ($(if ($ok) { "notice" } else { "error" })) "$Title - exit $code" "[exit $code] $output"
+            if (-not $ok) { exit 1 }
+            return
+          }
+          function Running { @(wsl --list --running --quiet 2>$null) -contains "docklet" }
+          # Runs a cmd.exe command line with a hard timeout; output goes to a file
+          # so a hung command can never block the step. Sets $script:Last.
+          function Timed([string]$Name, [string]$CommandLine, [int]$Seconds, [bool]$ExpectOk = $true) {
+            $out = "$env:RUNNER_TEMP\$Name.txt"
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process cmd -ArgumentList "/s /c `"$CommandLine > `"$out`" 2>&1`"" -PassThru -WindowStyle Hidden
+            if ($p.WaitForExit($Seconds * 1000)) { $state = "exit $($p.ExitCode)" }
+            else { taskkill /F /T /PID $p.Id | Out-Null; $state = "TIMEOUT after ${Seconds}s" }
+            $script:Last = @{ Ms = $watch.ElapsedMilliseconds; Text = ((Get-Content $out -Raw -ErrorAction SilentlyContinue) + "") }
+            $ok = ($state -eq "exit 0") -eq $ExpectOk
+            Report ($(if ($ok) { "notice" } else { "error" })) "$Name - $state - $($script:Last.Ms) ms" "[$state] $($script:Last.Text)"
+            if (-not $ok) { exit 1 }
+          }
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
+      - name: Wait for the rootfs release
+        timeout-minutes: 20
+        run: |
+          $version = (Get-Content distro/VERSION).Trim()
+          $url = "https://github.com/${{ github.repository }}/releases/download/distro-v$version/rootfs-${{ env.BASE }}.tar.gz.sha256"
+          for ($i = 0; $i -lt 60; $i++) {
+            curl.exe -fsSL -o NUL $url
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 15
+          }
+          exit 1
+      - name: 1. install, start, stop the CLI's proxy
+        timeout-minutes: 15
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "install" { & $docklet install --base "${{ env.BASE }}" }
+          Step "start" { & $docklet start }
+          if ((& $docklet status | Select-Object -First 1) -ne "running") { Report "error" "status" "not running after start"; exit 1 }
+          Step "proxy stop" { & $docklet proxy stop }
+          $line = (& $docklet status | Select-Object -First 1)
+          Report "notice" "status without proxy" "$line"
+          if ($line -notlike "starting*") { Report "error" "status without proxy" "expected a line starting with 'starting'"; exit 1 }
+          if (-not (Running)) { Report "error" "proxy stop" "the engine stopped with the proxy"; exit 1 }
+      - name: 2. desktop proxy mode
+        timeout-minutes: 10
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "cli setup" { & $docklet cli setup }
+          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
+          $docker = "`"$dockerExe`" --context docklet"
+          $app = Start-Process $desktop -ArgumentList "--proxy" -WindowStyle Hidden -PassThru
+          $ready = $false
+          for ($i = 0; $i -lt 20 -and -not $ready; $i++) {
+            if ((& $docklet status | Select-Object -First 1) -eq "running") { $ready = $true } else { Start-Sleep -Seconds 1 }
+          }
+          Report ($(if ($ready) { "notice" } else { "error" })) "desktop proxy ready" "status running within 20 s: $ready"
+          if (-not $ready) { taskkill /F /T /PID $app.Id | Out-Null; exit 1 }
+          Timed "pipe-version" "$docker version --format {{.Server.Version}}" 30
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "pipe-version" "unexpected server version"; exit 1 }
+          Timed "pipe-hello-world" "$docker run --rm hello-world" 120
+          Timed "pipe-half-close" "echo hi| $docker run -i --rm alpine cat" 90
+          if ($Last.Text.Trim() -notlike "*hi") { Report "error" "pipe-half-close" "output is not hi"; exit 1 }
+          # The proxy must be idle once the clients are gone.
+          $before = (Get-Process docklet-desktop -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
+          Start-Sleep -Seconds 10
+          $after = (Get-Process docklet-desktop -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
+          $delta = [math]::Round($after - $before, 2)
+          $relays = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Where-Object { $_.CommandLine -like "*docklet-relay*" }).Count
+          Report ($(if ($delta -le 1 -and $relays -eq 0) { "notice" } else { "error" })) "desktop proxy idle" "CPU seconds in 10 s: $delta; relay processes left: $relays"
+          if ($delta -gt 1 -or $relays -ne 0) { exit 1 }
+      - name: 3. stop
+        timeout-minutes: 8
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Step "stop" { & $docklet stop }
+          # The proxy exits on the stop event; give it a moment to unwind.
+          for ($i = 0; $i -lt 10 -and (Get-Process docklet-desktop -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
+          $left = @(Get-Process docklet-desktop -ErrorAction SilentlyContinue)
+          if ($left.Count -gt 0) {
+            Report "error" "stop" "docklet-desktop still running after stop"
+            $left | ForEach-Object { taskkill /F /T /PID $_.Id | Out-Null }
+            exit 1
+          }
+          if (Running) { Report "error" "stop" "docklet still listed as running"; exit 1 }
+          Report "notice" "after stop" "no docklet-desktop process, distro not running"
+      - name: Cleanup
+        if: always()
+        timeout-minutes: 8
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          Get-Process docklet-desktop -ErrorAction SilentlyContinue | ForEach-Object { taskkill /F /T /PID $_.Id | Out-Null }
+          Step "uninstall" { & $docklet uninstall --yes }
