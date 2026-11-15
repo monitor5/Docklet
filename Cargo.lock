@@ -837,6 +837,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "docklet-app"
+version = "0.1.0"
+dependencies = [
+ "docklet-core",
+ "docklet-engine",
+ "docklet-proxy",
+ "docklet-wsl",
+ "tokio",
+]
+
+[[package]]
 name = "docklet-cli"
 version = "0.1.0"
 dependencies = [
@@ -856,6 +867,7 @@ dependencies = [
 name = "docklet-desktop"
 version = "0.1.0"
 dependencies = [
+ "docklet-app",
  "docklet-core",
  "docklet-engine",
  "docklet-proxy",
