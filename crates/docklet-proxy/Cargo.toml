@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+docklet-core = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

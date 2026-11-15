@@ -42,7 +42,7 @@ impl RelayCommand {
             "/var/run/docker.sock",
         ];
         Self {
-            program: "wsl.exe".into(),
+            program: docklet_core::system_program("wsl.exe").into(),
             args: args.iter().map(OsString::from).collect(),
         }
     }
@@ -62,18 +62,23 @@ pub struct PipeProxyConfig {
 pub struct PipeProxy {
     config: Arc<PipeProxyConfig>,
     security: PipeSecurity,
-    listener: NamedPipeServer,
+    /// Two unconnected instances. A client can connect to an instance as
+    /// soon as it exists, so while one is being handed off and replaced the
+    /// other still accepts; with a single instance a client arriving in that
+    /// gap gets ERROR_PIPE_BUSY.
+    listeners: [NamedPipeServer; 2],
 }
 
 impl PipeProxy {
     /// Creates the pipe. Fails if another process already owns the name.
     pub fn bind(config: PipeProxyConfig) -> io::Result<Self> {
         let security = PipeSecurity::current_user_only()?;
-        let listener = create_instance(&config, &security, true)?;
+        let first = create_instance(&config, &security, true)?;
+        let spare = create_instance(&config, &security, false)?;
         Ok(Self {
             config: Arc::new(config),
             security,
-            listener,
+            listeners: [first, spare],
         })
     }
 
@@ -81,9 +86,18 @@ impl PipeProxy {
     pub async fn run(mut self) -> io::Result<()> {
         let mut next_id = 0u64;
         loop {
-            self.listener.connect().await?;
+            // Wait on both: a client may pick either instance, and one that
+            // connected to an instance nobody waits on would hang. `connect`
+            // is cancel safe, and on an instance that is already connected it
+            // returns at once.
+            let [first, spare] = &self.listeners;
+            let connected = tokio::select! {
+                result = first.connect() => result.map(|()| 0),
+                result = spare.connect() => result.map(|()| 1),
+            };
+            let index = connected?;
             let next = create_instance(&self.config, &self.security, false)?;
-            let pipe = std::mem::replace(&mut self.listener, next);
+            let pipe = std::mem::replace(&mut self.listeners[index], next);
             let config = Arc::clone(&self.config);
             let id = next_id;
             next_id += 1;
@@ -221,4 +235,72 @@ async fn relay(pipe: NamedPipeServer, config: &PipeProxyConfig, id: u64) -> io::
     let _ = child.start_kill();
     let _ = child.wait().await;
     Ok(end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    /// The accept loop runs on the test's own task, so both clients of a pair
+    /// connect before it gets to replace any instance: the second one needs
+    /// the spare, and with a single instance it got "pipe busy" every time.
+    /// Both replies arriving means the loop has replaced both instances
+    /// before the next pair. A burst larger than the number of free instances
+    /// can still race the loop, so the test does not try one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "runner only"]
+    async fn concurrent_clients_never_get_pipe_busy() {
+        let pipe_name = format!(r"\\.\pipe\docklet_test_busy_{}", std::process::id());
+        let config = PipeProxyConfig {
+            pipe_name: pipe_name.clone(),
+            message_mode: true,
+            // Answers every connection with one line and exits.
+            relay: RelayCommand {
+                program: docklet_core::system_program("cmd.exe").into(),
+                args: ["/d", "/c", "echo", "docklet"]
+                    .iter()
+                    .map(OsString::from)
+                    .collect(),
+            },
+            trace: false,
+        };
+        let proxy = PipeProxy::bind(config).unwrap();
+
+        let clients = async {
+            for round in 0..4 {
+                let mut pair = Vec::new();
+                for slot in 0..2 {
+                    match ClientOptions::new().open(&pipe_name) {
+                        Ok(client) => pair.push(client),
+                        Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                            panic!("round {round}, client {slot}: pipe busy")
+                        }
+                        Err(err) => panic!("round {round}, client {slot}: {err}"),
+                    }
+                }
+                for (slot, mut client) in pair.into_iter().enumerate() {
+                    let mut reply = Vec::new();
+                    client.read_to_end(&mut reply).await.unwrap();
+                    assert_eq!(
+                        String::from_utf8_lossy(&reply).trim(),
+                        "docklet",
+                        "round {round}, client {slot}"
+                    );
+                }
+            }
+        };
+        let both = async {
+            tokio::select! {
+                served = proxy.run() => panic!("the proxy stopped: {served:?}"),
+                () = clients => {}
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), both)
+            .await
+            .expect("clients did not finish within 60 s");
+    }
 }
