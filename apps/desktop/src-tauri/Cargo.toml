@@ -17,6 +17,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
+# Engine control and streams, shared with the native shell.
+docklet-app = { path = "../../../crates/docklet-app" }
 docklet-core = { workspace = true }
 docklet-engine = { workspace = true }
 docklet-proxy = { workspace = true }

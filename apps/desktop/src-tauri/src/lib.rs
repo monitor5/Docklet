@@ -8,6 +8,7 @@ mod state;
 mod streams;
 mod supervisor;
 
+use docklet_app::WindowState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::PageLoadEvent;
@@ -134,11 +135,11 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window_detached(app);
         }))
-        .manage(state::AppState::default())
         // A page that reloads does not get to stop the logs it followed.
         .on_page_load(|webview, payload| {
             if webview.label() == MAIN_WINDOW && payload.event() == PageLoadEvent::Started {
-                webview.state::<state::AppState>().streams.stop_all_logs();
+                let state = webview.state::<state::AppState>();
+                state.backend.streams().stop_all_logs();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -161,6 +162,9 @@ pub fn run() {
             commands::logs_stop,
         ])
         .setup(|app| {
+            // Before the tray and the window, which are what uses it. It
+            // needs the handle, to send Docker's events to the window.
+            app.manage(state::AppState::new(app.handle()));
             build_tray(app.handle())?;
             show_main_window(app.handle())?;
             Ok(())
@@ -178,7 +182,10 @@ pub fn run() {
                 label,
                 event: WindowEvent::Destroyed,
                 ..
-            } if label == MAIN_WINDOW => app.state::<state::AppState>().streams.stop_all(),
+            } if label == MAIN_WINDOW => {
+                let state = app.state::<state::AppState>();
+                state.backend.streams().set_window(WindowState::Gone);
+            }
             _ => {}
         });
 }
