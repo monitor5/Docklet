@@ -15,6 +15,7 @@ use docklet_core::{EngineState, system_program, wsl_output, wslconfig};
 use sha2::{Digest, Sha256};
 
 pub mod tools;
+pub mod usage;
 
 pub use docklet_core::engine::DISTRO_NAME as DISTRO;
 

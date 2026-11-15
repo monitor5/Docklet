@@ -9,18 +9,25 @@
 
 mod backoff;
 mod client;
+mod disk;
 mod error;
 mod image_ref;
 mod logs;
 mod pull;
+mod remove;
+mod resources;
+mod stats;
 
 pub use backoff::Backoff;
 pub use bollard::models;
 pub use client::{Client, ContainerAction};
+pub use disk::{BuildCacheDisk, ContainerDisk, DiskTotals, DiskUsage, ImageDisk, VolumeDisk};
 pub use error::Error;
 pub use image_ref::ImageRef;
 pub use logs::LineSplitter;
 pub use pull::progress_line;
+pub use remove::{PruneReport, RemoveFailure, RemoveReport, RemoveResult, ResourceKind, Selection};
+pub use stats::{ContainerUsage, CpuCounters, UsageTracker, cpu_percent};
 
 #[cfg(test)]
 mod tests {
