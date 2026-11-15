@@ -9,23 +9,29 @@ use windows::Win32::Graphics::Gdi::{
     DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, DrawTextW, GetDC, HFONT, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::Controls::{
-    PBM_SETMARQUEE, PBM_SETPOS, PBM_SETRANGE32, PBS_MARQUEE, PROGRESS_CLASSW, WC_BUTTONW, WC_EDITW,
-    WC_STATICW,
+    PBM_SETMARQUEE, PBM_SETPOS, PBM_SETRANGE32, PBS_MARQUEE, PROGRESS_CLASSW, WC_BUTTONW,
+    WC_COMBOBOXW, WC_EDITW, WC_STATICW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWL_STYLE,
-    GetWindowLongPtrW, SetWindowLongPtrW, WS_TABSTOP, WS_VSCROLL,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
+    CBS_DROPDOWNLIST, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWL_STYLE, GetWindowLongPtrW,
+    SetWindowLongPtrW, WS_TABSTOP, WS_VSCROLL,
 };
 
-use crate::boundary::{Progress, Screen};
-use crate::win::{Dpi, child, place, send, set_text, show};
+use crate::boundary::{Choice, Progress, Screen};
+use crate::win::{Dpi, child, place, send, set_text, show, wide};
 
 const SS_NOPREFIX: u32 = 0x0080;
 const SS_NOTIFY: u32 = 0x0100;
+const SS_CENTERIMAGE: u32 = 0x0200;
 
 pub struct MessageScreen {
     pub title: HWND,
     pub body: HWND,
+    pub choice_label: HWND,
+    /// A drop-down list: the base of an install.
+    pub choice: HWND,
     pub detail: HWND,
     pub progress: HWND,
     pub primary: HWND,
@@ -33,11 +39,22 @@ pub struct MessageScreen {
     screen: RefCell<Screen>,
 }
 
+/// The heights of a message screen's parts; 0 for a part that is missing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Heights {
+    pub title: i32,
+    pub body: i32,
+    pub choice: i32,
+    pub progress: i32,
+    pub buttons: i32,
+}
+
 /// The vertical stack of a message screen: where each part starts.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Stack {
     pub title: i32,
     pub body: i32,
+    pub choice: i32,
     pub progress: i32,
     pub detail: (i32, i32),
     pub buttons: i32,
@@ -45,29 +62,24 @@ pub struct Stack {
 
 /// Stacks the parts from `top` with `gap` between those that are present;
 /// the detail box takes what is left, between `min_detail` and `max_detail`.
-pub fn stack(
-    top: i32,
-    bottom: i32,
-    heights: (i32, i32, i32, i32),
-    gap: i32,
-    detail: (bool, i32, i32),
-) -> Stack {
-    let (title, body, progress, buttons) = heights;
+pub fn stack(top: i32, bottom: i32, heights: Heights, gap: i32, detail: (bool, i32, i32)) -> Stack {
     let (has_detail, min_detail, max_detail) = detail;
     let mut y = top;
     let title_y = y;
-    y += title + gap;
-    let body_y = y;
-    if body > 0 {
-        y += body + gap;
-    }
-    let progress_y = y;
-    if progress > 0 {
-        y += progress + gap;
-    }
+    y += heights.title + gap;
+    let mut part = |height: i32| {
+        let start = y;
+        if height > 0 {
+            y += height + gap;
+        }
+        start
+    };
+    let body_y = part(heights.body);
+    let choice_y = part(heights.choice);
+    let progress_y = part(heights.progress);
     let detail_y = y;
     let detail_height = if has_detail {
-        let room = bottom - y - buttons - gap;
+        let room = bottom - y - heights.buttons - gap;
         room.clamp(min_detail, max_detail.max(min_detail))
     } else {
         0
@@ -78,6 +90,7 @@ pub fn stack(
     Stack {
         title: title_y,
         body: body_y,
+        choice: choice_y,
         progress: progress_y,
         detail: (detail_y, detail_height),
         buttons: y,
@@ -85,10 +98,26 @@ pub fn stack(
 }
 
 impl MessageScreen {
-    pub fn create(parent: HWND, primary_id: usize, secondary_id: usize, detail_id: usize) -> Self {
+    pub fn create(
+        parent: HWND,
+        primary_id: usize,
+        secondary_id: usize,
+        detail_id: usize,
+        choice_id: usize,
+    ) -> Self {
         Self {
             title: child(parent, WC_STATICW, "", SS_NOPREFIX | SS_NOTIFY, 0, 0),
             body: child(parent, WC_STATICW, "", SS_NOPREFIX, 0, 0),
+            // The label comes first so screen readers name the list after it.
+            choice_label: child(parent, WC_STATICW, "", SS_CENTERIMAGE, 0, 0),
+            choice: child(
+                parent,
+                WC_COMBOBOXW,
+                "",
+                WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+                0,
+                choice_id,
+            ),
             detail: child(
                 parent,
                 WC_EDITW,
@@ -157,9 +186,47 @@ impl MessageScreen {
         ] {
             if let Some(wanted) = wanted {
                 set_text(button, &wanted.label);
+                // SAFETY: `button` is a child of the main window.
+                unsafe {
+                    let _ = EnableWindow(button, wanted.enabled);
+                }
             }
         }
+        if let Some(choice) = &screen.choice {
+            self.set_choice(old.choice.as_ref(), choice);
+        }
         self.set_progress(screen.progress, true);
+    }
+
+    /// Makes the drop-down list show `choice`. The options are only put in
+    /// again when they changed, so an open list is not closed under the
+    /// user's hand.
+    fn set_choice(&self, old: Option<&Choice>, choice: &Choice) {
+        if old.map(|old| &old.label) != Some(&choice.label) {
+            set_text(self.choice_label, &choice.label);
+            // The list is named after its label for screen readers.
+            set_text(self.choice, &choice.label);
+        }
+        if old.map(|old| &old.options) != Some(&choice.options) {
+            send(self.choice, CB_RESETCONTENT, 0, 0);
+            for option in &choice.options {
+                let text = wide(option);
+                send(self.choice, CB_ADDSTRING, 0, text.as_ptr() as isize);
+            }
+        }
+        let selected = send(self.choice, CB_GETCURSEL, 0, 0);
+        if usize::try_from(selected).ok() != Some(choice.selected) {
+            send(self.choice, CB_SETCURSEL, choice.selected, 0);
+        }
+        // SAFETY: the list is a child of the main window.
+        unsafe {
+            let _ = EnableWindow(self.choice, choice.enabled);
+        }
+    }
+
+    /// The option the drop-down list shows.
+    pub fn chosen(&self) -> Option<usize> {
+        usize::try_from(send(self.choice, CB_GETCURSEL, 0, 0)).ok()
     }
 
     fn set_progress(&self, progress: Progress, animate: bool) {
@@ -221,6 +288,8 @@ impl MessageScreen {
         let screen = self.screen.borrow();
         show(self.title, visible);
         show(self.body, visible && !screen.body.is_empty());
+        show(self.choice_label, visible && screen.choice.is_some());
+        show(self.choice, visible && screen.choice.is_some());
         show(self.detail, visible && screen.detail.is_some());
         show(
             self.progress,
@@ -250,16 +319,39 @@ impl MessageScreen {
             dpi.px(6)
         };
         let button_height = dpi.px(32);
+        let choice = if screen.choice.is_some() {
+            dpi.px(30)
+        } else {
+            0
+        };
         let top = area.top + ((area.bottom - area.top) / 6).min(dpi.px(96));
+        let heights = Heights {
+            title,
+            body,
+            choice,
+            progress,
+            buttons: button_height,
+        };
         let layout = stack(
             top,
             area.bottom - dpi.px(16),
-            (title, body, progress, button_height),
+            heights,
             dpi.px(16),
             (screen.detail.is_some(), dpi.px(60), dpi.px(220)),
         );
         place(self.title, left, layout.title, width, title);
         place(self.body, left, layout.body, width, body);
+        let label = dpi.px(48);
+        place(self.choice_label, left, layout.choice, label, choice);
+        // A drop-down list's height is that of its open list; the closed
+        // box sizes itself.
+        place(
+            self.choice,
+            left + label,
+            layout.choice,
+            dpi.px(220),
+            dpi.px(240),
+        );
         place(self.progress, left, layout.progress, width, progress);
         place(self.detail, left, layout.detail.0, width, layout.detail.1);
         let button = dpi.px(150);
@@ -311,21 +403,52 @@ mod tests {
 
     #[test]
     fn parts_stack_with_gaps_and_skip_what_is_missing() {
-        let layout = stack(100, 1000, (40, 0, 0, 32), 10, (false, 60, 200));
+        let heights = Heights {
+            title: 40,
+            buttons: 32,
+            ..Heights::default()
+        };
+        let layout = stack(100, 1000, heights, 10, (false, 60, 200));
         assert_eq!(layout.title, 100);
         assert_eq!(layout.body, 150);
         assert_eq!(layout.buttons, 150);
-        let layout = stack(100, 1000, (40, 30, 6, 32), 10, (false, 60, 200));
+        let heights = Heights {
+            body: 30,
+            progress: 6,
+            ..heights
+        };
+        let layout = stack(100, 1000, heights, 10, (false, 60, 200));
         assert_eq!(layout.progress, 190);
         assert_eq!(layout.buttons, 206);
     }
 
     #[test]
+    fn a_choice_sits_between_the_body_and_the_progress() {
+        let heights = Heights {
+            title: 40,
+            body: 30,
+            choice: 28,
+            progress: 6,
+            buttons: 32,
+        };
+        let layout = stack(100, 1000, heights, 10, (false, 60, 200));
+        assert_eq!(layout.choice, 190);
+        assert_eq!(layout.progress, 228);
+        assert_eq!(layout.buttons, 244);
+    }
+
+    #[test]
     fn the_detail_box_takes_the_room_left_within_limits() {
-        let roomy = stack(0, 1000, (40, 20, 0, 30), 10, (true, 60, 200));
+        let heights = Heights {
+            title: 40,
+            body: 20,
+            buttons: 30,
+            ..Heights::default()
+        };
+        let roomy = stack(0, 1000, heights, 10, (true, 60, 200));
         assert_eq!(roomy.detail, (80, 200));
         assert_eq!(roomy.buttons, 290);
-        let tight = stack(0, 150, (40, 20, 0, 30), 10, (true, 60, 200));
+        let tight = stack(0, 150, heights, 10, (true, 60, 200));
         assert_eq!(tight.detail.1, 60);
     }
 }

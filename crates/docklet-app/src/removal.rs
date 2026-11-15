@@ -11,7 +11,8 @@ use crate::table::Row;
 /// Names listed after a reason before the rest is counted.
 const NAMES_SHOWN: usize = 3;
 
-fn noun(kind: ResourceKind, count: usize) -> &'static str {
+/// What `count` things of `kind` are called: `container` or `containers`.
+pub fn noun(kind: ResourceKind, count: usize) -> &'static str {
     match (kind, count == 1) {
         (ResourceKind::Container, true) => "container",
         (ResourceKind::Container, false) => "containers",
@@ -105,7 +106,7 @@ impl RemovalPlan {
     }
 
     /// What `id` is called in a sentence.
-    fn name_of<'a>(&'a self, id: &'a str) -> &'a str {
+    pub fn name_of<'a>(&'a self, id: &'a str) -> &'a str {
         let item = self.items.iter().find(|item| item.id == id);
         item.map_or(id, |item| item.name.as_str())
     }

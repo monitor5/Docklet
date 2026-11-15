@@ -18,6 +18,14 @@ name = "docklet-native"
 path = "src/main.rs"
 
 [dependencies]
+# The application behind the window: models, controller and the engine.
+docklet-app = { path = "../../crates/docklet-app" }
+# `--proxy`: the pipe proxy this executable serves, as the CLI does.
+docklet-core = { workspace = true }
+docklet-proxy = { workspace = true }
+docklet-wsl = { workspace = true }
+# The Docker models the demo's made-up lists are built from.
+docklet-engine = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

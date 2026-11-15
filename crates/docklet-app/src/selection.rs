@@ -3,8 +3,9 @@
 use std::collections::HashSet;
 
 /// How much of what is visible is selected, for a "select all" box.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Coverage {
+    #[default]
     None,
     Some,
     All,

@@ -32,8 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::columns::{ButtonRow, Rect, distribute};
-use super::table_state::{CheckState, Sort};
-use crate::boundary::{Align, Table};
+use crate::boundary::{Align, Coverage, SortMark, Table};
 use crate::theme::Theme;
 use crate::win::{Dpi, child, client_rect, send, send_ptr};
 
@@ -53,6 +52,7 @@ pub struct Hit {
 #[derive(Default, PartialEq)]
 struct Built {
     columns: Vec<crate::boundary::Column>,
+    /// The labels of the actions that have a button.
     actions: Vec<String>,
     dpi: u32,
 }
@@ -149,6 +149,7 @@ impl TableView {
             actions: table
                 .actions
                 .iter()
+                .filter(|action| action.button)
                 .map(|action| action.label.clone())
                 .collect(),
             dpi: dpi.0,
@@ -275,7 +276,7 @@ impl TableView {
     }
 
     /// Sets the select-all checkbox and the sort arrows in the header.
-    pub fn update_header(&self, check: CheckState, sort: Option<Sort>) {
+    pub fn update_header(&self, check: Coverage, sort: Option<SortMark>) {
         let count = self.built.borrow().columns.len();
         for index in 0..count {
             let mut item = HDITEMW {
@@ -293,7 +294,7 @@ impl TableView {
             }
             if index == 0 {
                 fmt |= HDF_CHECKBOX.0;
-                if check == CheckState::All {
+                if check == Coverage::All {
                     fmt |= HDF_CHECKED.0;
                 }
             }
@@ -394,9 +395,13 @@ impl TableView {
         }
     }
 
-    /// The state bits for a checkbox.
-    pub fn check_state(checked: bool) -> u32 {
-        state_image(if checked { 2 } else { 1 })
+    /// The state bits for a line's box: ticked, empty, or no box at all.
+    pub fn check_state(check: Option<bool>) -> u32 {
+        state_image(match check {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        })
     }
 }
 
@@ -425,8 +430,13 @@ mod tests {
 
     #[test]
     fn checkbox_states_are_state_images_one_and_two() {
-        assert_eq!(TableView::check_state(false), 0x1000);
-        assert_eq!(TableView::check_state(true), 0x2000);
-        assert_eq!(TableView::check_state(true) & !LVIS_STATEIMAGEMASK.0, 0);
+        assert_eq!(TableView::check_state(Some(false)), 0x1000);
+        assert_eq!(TableView::check_state(Some(true)), 0x2000);
+        assert_eq!(
+            TableView::check_state(Some(true)) & !LVIS_STATEIMAGEMASK.0,
+            0
+        );
+        // No state image: the line has no box.
+        assert_eq!(TableView::check_state(None), 0);
     }
 }

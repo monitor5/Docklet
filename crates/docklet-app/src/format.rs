@@ -1,6 +1,9 @@
 //! Display text for Docker's values.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::iter::Peekable;
+use std::str::Chars;
 
 use docklet_engine::models::{
     ContainerSummary, ContainerSummaryStateEnum, ImageSummary, PortSummary, PortSummaryTypeEnum,
@@ -43,6 +46,47 @@ pub fn format_count(count: usize) -> String {
         text.push(digit);
     }
     text
+}
+
+/// Compares text with runs of ASCII digits as numbers, ignoring case, so
+/// that `web-10` sorts after `web-9`.
+pub fn natural_cmp(left: &str, right: &str) -> Ordering {
+    let mut left = left.chars().peekable();
+    let mut right = right.chars().peekable();
+    loop {
+        match (left.peek().copied(), right.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a), Some(b)) if a.is_ascii_digit() && b.is_ascii_digit() => {
+                let a = take_number(&mut left);
+                let b = take_number(&mut right);
+                // Without leading zeros, the longer run is the bigger number.
+                let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+                let order = a.len().cmp(&b.len()).then_with(|| a.cmp(b));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(a), Some(b)) => {
+                let order = a.to_lowercase().cmp(b.to_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                left.next();
+                right.next();
+            }
+        }
+    }
+}
+
+fn take_number(chars: &mut Peekable<Chars<'_>>) -> String {
+    let mut digits = String::new();
+    while let Some(&digit) = chars.peek().filter(|digit| digit.is_ascii_digit()) {
+        digits.push(digit);
+        chars.next();
+    }
+    digits
 }
 
 /// The UTC date of a Unix timestamp as `2026-11-15`.
@@ -215,6 +259,16 @@ mod tests {
             public_port: public,
             typ,
         }
+    }
+
+    #[test]
+    fn natural_order_compares_numbers_as_numbers() {
+        assert_eq!(natural_cmp("web-9", "web-10"), Ordering::Less);
+        assert_eq!(natural_cmp("Web-2", "web-02"), Ordering::Equal);
+        assert_eq!(natural_cmp("a", "B"), Ordering::Less);
+        assert_eq!(natural_cmp("x1", "x"), Ordering::Greater);
+        assert_eq!(natural_cmp("8080:80", "443:443"), Ordering::Greater);
+        assert_eq!(natural_cmp("한글-2", "한글-10"), Ordering::Less);
     }
 
     #[test]

@@ -41,6 +41,8 @@ pub struct ListModel {
     sort: Option<Sort>,
     collapsed: HashSet<String>,
     entries: Vec<Entry>,
+    /// Rows that match the filter, in a collapsed group or not.
+    matching: usize,
     selection: Selection,
     busy: HashSet<String>,
     generation: u64,
@@ -56,6 +58,7 @@ impl ListModel {
             sort: None,
             collapsed: HashSet::new(),
             entries: Vec::new(),
+            matching: 0,
             selection: Selection::default(),
             busy: HashSet::new(),
             generation: 0,
@@ -190,6 +193,17 @@ impl ListModel {
         self.table.row(id)
     }
 
+    /// The number of rows the list has, whatever the filter.
+    pub fn total(&self) -> usize {
+        self.table.rows.len()
+    }
+
+    /// The number of rows that match the filter, those of collapsed groups
+    /// included.
+    pub fn matching(&self) -> usize {
+        self.matching
+    }
+
     /// What to show in place of a list without lines.
     pub fn empty_text(&self) -> &'static str {
         if self.table.rows.is_empty() {
@@ -255,6 +269,44 @@ impl ListModel {
         self.generation += 1;
     }
 
+    /// The "select all" box was clicked: selects every row that shows, or
+    /// deselects everything when they all are already.
+    pub fn toggle_all(&mut self) {
+        if self.coverage() == Coverage::All {
+            self.clear_selection();
+        } else {
+            self.select_all();
+        }
+    }
+
+    /// Whether none, some or all of the rows that show under the group's
+    /// header are selected. `None` for a collapsed group: it shows no rows,
+    /// so there is nothing to tick.
+    pub fn group_coverage(&self, name: &str) -> Coverage {
+        self.selection.coverage(self.group_rows(name))
+    }
+
+    /// A click on a group's box: selects the rows that show under its
+    /// header, or deselects them when they all are already. Does nothing to
+    /// a collapsed group, whose rows are hidden.
+    pub fn toggle_group_selection(&mut self, name: &str) {
+        let all = self.group_coverage(name) == Coverage::All;
+        let rows: Vec<String> = self.group_rows(name).map(str::to_string).collect();
+        for id in &rows {
+            if self.selection.contains(id) == all {
+                self.selection.toggle(id);
+            }
+        }
+        self.generation += u64::from(!rows.is_empty());
+    }
+
+    /// The IDs of the group's rows that show and can be removed.
+    fn group_rows<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.shown_rows()
+            .filter(move |row| row.group.as_deref() == Some(name) && row.flags.removable)
+            .map(|row| row.id.as_str())
+    }
+
     pub fn clear_selection(&mut self) {
         self.selection.clear();
         self.generation += 1;
@@ -276,6 +328,7 @@ impl ListModel {
     fn rebuild(&mut self) {
         let rows = &self.table.rows;
         let order = self.table.order(self.sort, &self.filter);
+        self.matching = order.len();
         let mut entries = Vec::with_capacity(order.len());
         let mut next = 0;
         while let Some(&first) = order.get(next) {
@@ -477,6 +530,44 @@ mod tests {
             ]
         );
         assert_eq!(list.coverage(), Coverage::Some);
+    }
+
+    #[test]
+    fn the_select_all_box_selects_what_shows_and_then_nothing() {
+        let mut list = containers();
+        list.toggle("id-web");
+        list.toggle_all();
+        assert_eq!(list.selected_count(), 5);
+        list.toggle_all();
+        assert_eq!(list.selected_count(), 0);
+    }
+
+    #[test]
+    fn a_groups_box_selects_the_rows_under_its_header() {
+        let mut list = containers();
+        assert_eq!(list.group_coverage("shop"), Coverage::None);
+        list.toggle("id-db");
+        assert_eq!(list.group_coverage("shop"), Coverage::Some);
+        list.toggle_group_selection("shop");
+        assert_eq!(list.group_coverage("shop"), Coverage::All);
+        assert_eq!(list.selected_count(), 2);
+        list.toggle_group_selection("shop");
+        assert_eq!(list.selected_count(), 0);
+        // A collapsed group shows no rows, so its box selects none.
+        list.toggle_group("shop");
+        list.toggle_group_selection("shop");
+        assert_eq!(list.selected_count(), 0);
+        assert_eq!(list.group_coverage("shop"), Coverage::None);
+    }
+
+    #[test]
+    fn the_counts_tell_the_filter_from_the_collapsed_groups() {
+        let mut list = containers();
+        assert_eq!((list.matching(), list.total()), (5, 5));
+        list.toggle_group("shop");
+        assert_eq!((list.matching(), list.total()), (5, 5));
+        list.set_filter("running");
+        assert_eq!((list.matching(), list.total()), (3, 5));
     }
 
     #[test]

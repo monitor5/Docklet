@@ -18,14 +18,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::boundary::{
-    Banner, Confirm, Header, LogPane, Meter, Notice, Page, Table, TrayCommand, TrayState, UiEvent,
-    UiHandle, UiUpdate, WM_UI_UPDATE,
+    Banner, Confirm, Entry, Header, LogPane, Meter, Notice, Page, Table, TrayCommand, TrayState,
+    UiEvent, UiHandle, UiUpdate, WM_UI_UPDATE, WM_UI_WAKE,
 };
 use crate::shell;
 use crate::theme::{DarkApi, system_is_dark};
 use crate::tray;
 use crate::widgets::dialog;
-use crate::win::{instance, register_class};
+use crate::win::{copy_to_clipboard, instance, open_url, register_class};
 
 pub(crate) const HOST_CLASS: PCWSTR = w!("Docklet.Native.Host");
 /// Posted by a second instance: show the window.
@@ -49,6 +49,8 @@ pub(crate) struct Model {
     pub banner: Option<Banner>,
     pub tabs: Vec<String>,
     pub tables: Vec<Table>,
+    /// Per tab, the line to type above its table, if it has one.
+    pub entries: Vec<Option<Entry>>,
     pub usage: Vec<Meter>,
     pub tray: TrayState,
     pub log: Option<LogPane>,
@@ -260,6 +262,29 @@ fn apply(ctx: &Ctx, update: UiUpdate) {
                 shell.table_changed(tab);
             }
         }
+        UiUpdate::Filter { tab, text } => {
+            // Not kept: it is sent again when the window is.
+            if let Some(shell) = shell {
+                shell.set_filter(tab, &text);
+            }
+        }
+        UiUpdate::Entry { tab, entry } => {
+            // What to put in the box is for the window that is there now.
+            let text = entry.as_ref().and_then(|entry| entry.text.clone());
+            {
+                let mut model = ctx.model.borrow_mut();
+                if model.entries.len() <= tab {
+                    model.entries.resize_with(tab + 1, || None);
+                }
+                model.entries[tab] = entry.map(|entry| Entry {
+                    text: None,
+                    ..entry
+                });
+            }
+            if let Some(shell) = shell {
+                shell.entry_changed(tab, text.as_deref());
+            }
+        }
         UiUpdate::Usage(meters) => {
             ctx.model.borrow_mut().usage = meters;
             if let Some(shell) = shell {
@@ -294,10 +319,10 @@ fn apply(ctx: &Ctx, update: UiUpdate) {
             tray::set_tooltip(ctx.host, &state.tooltip);
             ctx.model.borrow_mut().tray = state;
         }
-        UiUpdate::ClearSelection { tab } => {
-            if let Some(shell) = shell {
-                shell.clear_selection(tab);
-            }
+        UiUpdate::OpenPort(port) => open_url(&docklet_app::format::port_url(port)),
+        UiUpdate::Copy(text) => {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            copy_to_clipboard(ctx.main.get().unwrap_or(ctx.host), &units);
         }
         UiUpdate::ShowWindow => shell::show(),
         UiUpdate::Quit => quit(ctx),
@@ -376,6 +401,10 @@ unsafe extern "system" fn host_proc(
     };
     match message {
         WM_UI_UPDATE => drain(ctx),
+        WM_UI_WAKE => {
+            ctx.handle.woke();
+            ctx.emit(UiEvent::Wake);
+        }
         WM_SHOW_REQUEST => shell::show(),
         WM_SHOW_DIALOG => show_dialogs(ctx),
         tray::WM_TRAY => {

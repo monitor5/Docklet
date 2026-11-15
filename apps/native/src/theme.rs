@@ -10,8 +10,8 @@ use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CreateFontIndirectW, CreateSolidBrush, DeleteObject, FF_MODERN, FIXED_PITCH,
-    FW_NORMAL, FW_SEMIBOLD, GetDC, GetTextMetricsW, HBRUSH, HFONT, LOGFONTW, ReleaseDC,
-    SelectObject, TEXTMETRICW,
+    FW_NORMAL, FW_SEMIBOLD, GGI_MARK_NONEXISTING_GLYPHS, GetDC, GetGlyphIndicesW, GetTextMetricsW,
+    HBRUSH, HFONT, LOGFONTW, ReleaseDC, SelectObject, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -206,8 +206,26 @@ pub struct Fonts {
     pub mono: HFONT,
     /// Height of a log line in pixels.
     pub mono_line: i32,
+    /// From the top of a log line down to its baseline, in pixels.
+    pub mono_ascent: i32,
     /// Width of a log character in pixels, for horizontal scrolling.
     pub mono_char: i32,
+    /// A font for Hangul, which the log font does not have, at the log
+    /// font's size. Drawn in the log font, every piece of text with Hangul
+    /// makes Windows search for a font that has it, which costs several
+    /// times the drawing. `None` if this system does not have the face:
+    /// then Windows falls back as it sees fit.
+    pub hangul: Option<HFONT>,
+}
+
+/// What Windows itself shows Hangul in since Vista, and what the lists of
+/// this window show it in through the UI font.
+const HANGUL_FACE: &str = "Malgun Gothic";
+
+fn face(logfont: &mut LOGFONTW, name: &str) {
+    for (slot, unit) in logfont.lfFaceName.iter_mut().zip(name.encode_utf16()) {
+        *slot = unit;
+    }
 }
 
 impl Fonts {
@@ -244,28 +262,49 @@ impl Fonts {
                 lfPitchAndFamily: FIXED_PITCH.0 | FF_MODERN.0,
                 ..Default::default()
             };
-            for (slot, unit) in mono_face
-                .lfFaceName
-                .iter_mut()
-                .zip("Consolas".encode_utf16())
-            {
-                *slot = unit;
-            }
+            face(&mut mono_face, "Consolas");
             let mono = CreateFontIndirectW(&mono_face);
+            let mut hangul_face = LOGFONTW {
+                lfPitchAndFamily: 0,
+                ..mono_face
+            };
+            hangul_face.lfFaceName = Default::default();
+            face(&mut hangul_face, HANGUL_FACE);
+            let hangul = CreateFontIndirectW(&hangul_face);
 
             let hdc = GetDC(Some(sample));
             let previous = SelectObject(hdc, mono.into());
             let mut text = TEXTMETRICW::default();
             let _ = GetTextMetricsW(hdc, &mut text);
+            // A face that is not installed is quietly replaced by another
+            // one, which may not have Hangul either: ask for a glyph. (The
+            // face's name cannot be compared; Windows gives it in Korean
+            // on a Korean system.)
+            SelectObject(hdc, hangul.into());
+            let syllable = [0xac00u16];
+            let mut glyph = [0u16];
+            let found = GetGlyphIndicesW(
+                hdc,
+                PCWSTR(syllable.as_ptr()),
+                1,
+                glyph.as_mut_ptr(),
+                GGI_MARK_NONEXISTING_GLYPHS,
+            );
+            let has_hangul = found == 1 && glyph[0] != 0xffff;
             SelectObject(hdc, previous);
             ReleaseDC(Some(sample), hdc);
+            if !has_hangul {
+                let _ = DeleteObject(hangul.into());
+            }
             Self {
                 ui,
                 bold,
                 title,
                 mono,
                 mono_line: (text.tmHeight + text.tmExternalLeading).max(1),
+                mono_ascent: text.tmAscent,
                 mono_char: text.tmAveCharWidth.max(1),
+                hangul: has_hangul.then_some(hangul),
             }
         }
     }
@@ -275,7 +314,8 @@ impl Drop for Fonts {
     fn drop(&mut self) {
         // SAFETY: every control was given the new fonts before these go.
         unsafe {
-            for font in [self.ui, self.bold, self.title, self.mono] {
+            let fonts = [self.ui, self.bold, self.title, self.mono];
+            for font in fonts.into_iter().chain(self.hangul) {
                 let _ = DeleteObject(font.into());
             }
         }
