@@ -1,6 +1,7 @@
 //! Platform-neutral Docklet logic. Everything here builds and tests on Linux.
 
 pub mod engine;
+pub mod idle;
 pub mod skills;
 pub mod state;
 pub mod system;

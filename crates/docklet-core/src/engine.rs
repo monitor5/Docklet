@@ -81,6 +81,30 @@ pub fn docker_ready<R: WslRunner>(wsl: &Wsl<R>) -> bool {
     .is_ok_and(|output| output.success)
 }
 
+/// True when the docklet distro is running. One `wsl.exe` call that, unlike
+/// anything run inside the distro, never boots it.
+pub fn distro_running<R: WslRunner>(wsl: &Wsl<R>) -> std::io::Result<bool> {
+    Ok(wsl.running()?.iter().any(|name| name == DISTRO_NAME))
+}
+
+/// Number of running containers, from `docker ps -q` inside the distro.
+///
+/// Boots the distro if it is not running, so check `distro_running` first.
+pub fn running_containers<R: WslRunner>(wsl: &Wsl<R>) -> std::io::Result<usize> {
+    let output = wsl.exec(DISTRO_NAME, &["docker", "ps", "--quiet"])?;
+    if !output.success {
+        return Err(std::io::Error::other(format!(
+            "docker ps failed: {}",
+            output.stderr.trim()
+        )));
+    }
+    Ok(output
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count())
+}
+
 /// Named pipe that Docklet exposes to the GUI and the Windows `docker` CLI.
 pub const ENGINE_PIPE: &str = r"\\.\pipe\docklet_engine";
 
@@ -177,6 +201,48 @@ mod tests {
     fn running() {
         let runner = machine(V3, "docklet\n", "docklet\n", true);
         assert_eq!(probe(&Wsl::new(&runner)), EngineState::Running);
+    }
+
+    #[test]
+    fn distro_running_only_counts_the_docklet_distro() {
+        let runner = machine(V3, "Ubuntu-26.04\ndocklet\n", "Ubuntu-26.04\n", true);
+        assert!(!distro_running(&Wsl::new(&runner)).unwrap());
+        let runner = machine(V3, "docklet\n", "", true);
+        assert!(!distro_running(&Wsl::new(&runner)).unwrap());
+        let runner = machine(V3, "docklet\n", "docklet\n", true);
+        assert!(distro_running(&Wsl::new(&runner)).unwrap());
+        // Only the list of running distros is asked for.
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            [["--list", "--running", "--quiet"]]
+        );
+    }
+
+    #[test]
+    fn running_containers_counts_ids() {
+        let runner = MockRunner::new(|args| match args {
+            [
+                "-d",
+                "docklet",
+                "-u",
+                "root",
+                "--exec",
+                "docker",
+                "ps",
+                "--quiet",
+            ] => ok("0123456789ab\r\nba9876543210\n\n"),
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        assert_eq!(running_containers(&Wsl::new(&runner)).unwrap(), 2);
+        let runner = MockRunner::new(|_| ok(""));
+        assert_eq!(running_containers(&Wsl::new(&runner)).unwrap(), 0);
+    }
+
+    #[test]
+    fn running_containers_fails_without_dockerd() {
+        let runner = MockRunner::new(|_| fail("Cannot connect to the Docker daemon"));
+        let err = running_containers(&Wsl::new(&runner)).unwrap_err();
+        assert!(err.to_string().contains("Cannot connect"));
     }
 
     #[test]
