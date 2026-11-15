@@ -164,3 +164,40 @@ pub async fn logs_stop(state: State<'_, AppState>, token: u32) -> CommandResult<
     state.streams.stop_logs(token);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_json(state: EngineState) -> serde_json::Value {
+        let status = EngineStatus {
+            state,
+            bases: vec!["debian-13"],
+            mirrored_networking: false,
+        };
+        serde_json::to_value(status).unwrap()
+    }
+
+    /// The names the TypeScript `EngineState` type is written against.
+    #[test]
+    fn the_window_gets_the_state_by_its_snake_case_name() {
+        let names = [
+            (EngineState::WslMissing, "wsl_missing"),
+            (EngineState::NotInstalled, "not_installed"),
+            (EngineState::Stopped, "stopped"),
+            (EngineState::Sleeping, "sleeping"),
+            (EngineState::Starting, "starting"),
+            (EngineState::Running, "running"),
+            (EngineState::Stopping, "stopping"),
+        ];
+        for (state, name) in names {
+            let json = status_json(state);
+            assert_eq!(json["state"], name);
+            assert!(json.get("reason").is_none());
+            assert_eq!(json["bases"][0], "debian-13");
+        }
+        let error = status_json(EngineState::Error("boom".to_string()));
+        assert_eq!(error["state"], "error");
+        assert_eq!(error["reason"], "boom");
+    }
+}

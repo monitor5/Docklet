@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type EngineStatus, onDockerEvent, onEngineChanged } from "./api";
-import type { EngineState } from "./engine";
+import { type EngineState, reloadsLists } from "./engine";
 import { nextPollDelay } from "./pollDelay";
 
 const EVENT_DEBOUNCE_MS = 150;
@@ -125,7 +125,10 @@ export function useDockerList<T>(
       (err) => setWatchError(String(err)),
     );
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const unlisten = onDockerEvent(() => {
+    const unlisten = onDockerEvent((kind) => {
+      // A stream that just ended may mean the engine went to sleep, and a
+      // reload would wake it; `useEngine` looks at the state instead.
+      if (!reloadsLists(kind)) return;
       clearTimeout(timer);
       timer = setTimeout(reload, EVENT_DEBOUNCE_MS);
     });

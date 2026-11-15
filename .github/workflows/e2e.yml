@@ -153,6 +153,45 @@ jobs:
           Start-Sleep -Seconds 45
           if (-not (Running)) { Report "error" "keepalive" "distro stopped while the engine was started"; exit 1 }
           Report "notice" "keepalive" "distro still running 45 s after start"
+      - name: 3b. JSON output, docklet docker, settings
+        timeout-minutes: 8
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          # With --json, stdout is one JSON object on one line; warnings go to stderr.
+          $seen = @{}
+          foreach ($name in "status", "doctor") {
+            $lines = @(& $docklet $name --json 2>$null)
+            $code = $LASTEXITCODE
+            $text = $lines -join "`n"
+            try { $json = $text | ConvertFrom-Json -ErrorAction Stop }
+            catch { Report "error" "$name --json" "not JSON: $text"; exit 1 }
+            $ok = $code -eq 0 -and $lines.Count -eq 1 -and $json.ok -eq $true -and $json.command -eq $name
+            Report ($(if ($ok) { "notice" } else { "error" })) "$name --json - exit $code" "[$($lines.Count) line(s)] $text"
+            if (-not $ok) { exit 1 }
+            $seen[$name] = $json.data
+          }
+          $status = $seen["status"]
+          # `docklet start` serves with idle stop unless the setting says off.
+          $ok = $status.state -eq "running" -and $status.ready -eq $true -and $status.proxy_running -eq $true -and $status.idle_stop -eq $true
+          Report ($(if ($ok) { "notice" } else { "error" })) "status data" "state=$($status.state) ready=$($status.ready) proxy_running=$($status.proxy_running) idle_stop=$($status.idle_stop)"
+          if (-not $ok) { exit 1 }
+          if ($seen["doctor"].healthy -ne $true) { Report "error" "doctor data" "healthy is not true"; exit 1 }
+          # docklet docker: the Docker CLI against the Docklet pipe, no --context needed.
+          Timed "docklet-docker-version" "`"$docklet`" docker version --format {{.Server.Version}}" 60
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "docklet-docker-version" "unexpected server version"; exit 1 }
+          # The idle-stop setting: default, a change, and back. The proxy that
+          # runs keeps what it started with, so this changes nothing below.
+          Step "config get" { & $docklet config get idle-stop }
+          if ((& $docklet config get idle-stop) -ne "10") { Report "error" "config get" "the default is not 10"; exit 1 }
+          Step "config set 25" { & $docklet config set idle-stop 25 }
+          if ((& $docklet config get idle-stop) -ne "25") { Report "error" "config set" "idle-stop is not 25 after setting it"; exit 1 }
+          $set = (& $docklet config set idle-stop off --json 2>$null) | ConvertFrom-Json
+          $ok = $set.ok -eq $true -and $set.data.value -eq "off" -and $null -eq $set.data.minutes -and $set.data.restart_needed -eq $true
+          Report ($(if ($ok) { "notice" } else { "error" })) "config set off --json" "value=$($set.data.value) restart_needed=$($set.data.restart_needed) applies_from=$($set.data.applies_from)"
+          if (-not $ok) { exit 1 }
+          Step "config set 0 is refused" { & $docklet config set idle-stop 0 } 2
+          Step "config set 10" { & $docklet config set idle-stop 10 }
+          if ((& $docklet config get idle-stop) -ne "10") { Report "error" "config set" "idle-stop is not back at 10"; exit 1 }
       - name: 4. stop
         timeout-minutes: 8
         run: |
@@ -163,6 +202,75 @@ jobs:
           if (Get-Process docklet -ErrorAction SilentlyContinue) { Report "error" "stop" "pipe proxy still running"; exit 1 }
           if (Get-Process wsl -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 3 }
           Report "notice" "after stop" "wsl.exe processes: $(@(Get-Process wsl -ErrorAction SilentlyContinue).Count)"
+      # An engine nobody uses stops by itself and the next Docker client
+      # starts it again. Ends stopped, as step 4 left it.
+      - name: 4b. idle stop and wake on connect
+        timeout-minutes: 15
+        env:
+          # Read by the pipe proxy that `docklet start` starts. The public
+          # setting counts minutes; a test cannot wait that long.
+          DOCKLET_IDLE_STOP_SECONDS: "20"
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
+          $docker = "`"$dockerExe`" --context docklet"
+          function StatusLine { & $docklet status | Select-Object -First 1 }
+          # Waits, without connecting to anything, until the distro has
+          # stopped; then the proxy must still be there and the state `sleeping`.
+          function WaitAsleep([string]$After) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            while ((Running) -and $watch.Elapsed.TotalSeconds -lt 180) { Start-Sleep -Seconds 2 }
+            if (Running) { Report "error" "idle stop" "distro still running 180 s after $After"; exit 1 }
+            if (-not (Get-Process docklet -ErrorAction SilentlyContinue)) { Report "error" "idle stop" "the pipe proxy is gone after $After"; exit 1 }
+            $line = StatusLine
+            Report ($(if ($line -like "sleeping*") { "notice" } else { "error" })) "asleep after $After" "about $([int]$watch.Elapsed.TotalSeconds) s; status: $line"
+            if ($line -notlike "sleeping*") { exit 1 }
+          }
+          function RequireRunning([string]$After) {
+            $line = StatusLine
+            if ($line -ne "running" -or -not (Running)) { Report "error" "wake" "after ${After}: status '$line', distro running: $(Running)"; exit 1 }
+          }
+          Step "start with a 20 s idle time" { & $docklet start }
+          RequireRunning "start"
+          WaitAsleep "start"
+          # Asleep is a usable state: ready, healthy, nothing to wait for. None
+          # of these commands is a Docker client, so none may wake the engine.
+          $status = ((& $docklet status --json 2>$null) | ConvertFrom-Json).data
+          $ok = $status.state -eq "sleeping" -and $status.ready -eq $true -and $status.proxy_running -eq $true -and $status.idle_stop -eq $true
+          Report ($(if ($ok) { "notice" } else { "error" })) "status data while asleep" "state=$($status.state) ready=$($status.ready) proxy_running=$($status.proxy_running) idle_stop=$($status.idle_stop)"
+          if (-not $ok) { exit 1 }
+          Step "doctor while asleep" { & $docklet doctor }
+          Step "wait while asleep" { & $docklet wait --timeout 5 }
+          if (Running) { Report "error" "idle stop" "status, doctor or wait woke the engine"; exit 1 }
+          # 1. Any Docker client wakes it: the plain docker CLI through the pipe.
+          Timed "wake-docker-version" "$docker version --format {{.Server.Version}}" 180
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "wake-docker-version" "unexpected server version"; exit 1 }
+          Report "notice" "wake duration (docker --context docklet version)" "$($Last.Ms) ms"
+          RequireRunning "docker version"
+          # 2. `docklet docker` passes through instead of refusing with not_running.
+          WaitAsleep "docker version"
+          Timed "wake-docklet-docker" "`"$docklet`" docker version --format {{.Server.Version}}" 180
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "wake-docklet-docker" "unexpected server version"; exit 1 }
+          Report "notice" "wake duration (docklet docker version)" "$($Last.Ms) ms"
+          RequireRunning "docklet docker"
+          # 3. `docklet start` wakes it through the proxy, so it sleeps again.
+          WaitAsleep "docklet docker"
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          $output = (& $docklet start 2>&1 | Out-String).Trim()
+          $code = $LASTEXITCODE
+          $ok = $code -eq 0 -and $output -notlike "*pipe proxy failed*"
+          Report ($(if ($ok) { "notice" } else { "error" })) "start while asleep - exit $code - $($watch.ElapsedMilliseconds) ms" $output
+          if (-not $ok) { exit 1 }
+          RequireRunning "start while asleep"
+          WaitAsleep "start while asleep"
+          # An explicit stop ends the proxy: the engine stays off, and Docker
+          # commands are refused rather than waking it.
+          Step "stop" { & $docklet stop }
+          if (Get-Process docklet -ErrorAction SilentlyContinue) { Report "error" "stop" "pipe proxy still running"; exit 1 }
+          if ((StatusLine) -ne "stopped") { Report "error" "stop" "status is not stopped"; exit 1 }
+          Timed "docker-after-stop" "`"$docklet`" docker version" 60 $false
+          if (Running) { Report "error" "stop" "a Docker command started the stopped engine"; exit 1 }
+          Report "notice" "explicit stop" "engine stays off; docklet docker refused: $($Last.Text.Trim())"
       - name: 5. Lifetime without keepalive
         timeout-minutes: 8
         run: |
@@ -294,6 +402,44 @@ jobs:
           $relays = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Where-Object { $_.CommandLine -like "*docklet-relay*" }).Count
           Report ($(if ($delta -le 1 -and $relays -eq 0) { "notice" } else { "error" })) "desktop proxy idle" "CPU seconds in 10 s: $delta; relay processes left: $relays"
           if ($delta -gt 1 -or $relays -ne 0) { exit 1 }
+      # The desktop binary's proxy stops an unused engine and wakes it, like
+      # the CLI's. Leaves the proxy up for step 3, engine running or asleep.
+      - name: 2b. desktop proxy, idle stop and wake on connect
+        timeout-minutes: 10
+        env:
+          # Read by the proxy when it starts. The public setting counts
+          # minutes; a test cannot wait that long.
+          DOCKLET_IDLE_STOP_SECONDS: "20"
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
+          $docker = "`"$dockerExe`" --context docklet"
+          # The proxy from step 2 serves with idle stop, at the default time.
+          $idle = ((& $docklet status --json 2>$null) | ConvertFrom-Json).data.idle_stop
+          Report ($(if ($idle -eq $true) { "notice" } else { "error" })) "desktop proxy mode" "idle_stop=$idle"
+          if ($idle -ne $true) { exit 1 }
+          # Replace it by one that starts with the short idle time.
+          Step "proxy stop" { & $docklet proxy stop }
+          for ($i = 0; $i -lt 10 -and (Get-Process docklet-desktop -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
+          $app = Start-Process $desktop -ArgumentList "--proxy" -WindowStyle Hidden -PassThru
+          $ready = $false
+          for ($i = 0; $i -lt 20 -and -not $ready; $i++) {
+            if ((& $docklet status | Select-Object -First 1) -eq "running") { $ready = $true } else { Start-Sleep -Seconds 1 }
+          }
+          if (-not $ready) { Report "error" "desktop proxy ready" "status not running within 20 s"; taskkill /F /T /PID $app.Id | Out-Null; exit 1 }
+          # Nothing connects from here on: the distro must stop while the proxy stays.
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          while ((Running) -and $watch.Elapsed.TotalSeconds -lt 180) { Start-Sleep -Seconds 2 }
+          if (Running) { Report "error" "desktop idle stop" "distro still running after 180 s"; exit 1 }
+          if (-not (Get-Process docklet-desktop -ErrorAction SilentlyContinue)) { Report "error" "desktop idle stop" "the proxy is gone"; exit 1 }
+          $line = (& $docklet status | Select-Object -First 1)
+          Report ($(if ($line -like "sleeping*") { "notice" } else { "error" })) "desktop idle stop" "asleep after about $([int]$watch.Elapsed.TotalSeconds) s; status: $line"
+          if ($line -notlike "sleeping*") { exit 1 }
+          Timed "desktop-wake-version" "$docker version --format {{.Server.Version}}" 180
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "desktop-wake-version" "unexpected server version"; exit 1 }
+          Report "notice" "desktop wake duration" "$($Last.Ms) ms"
+          $line = (& $docklet status | Select-Object -First 1)
+          if ($line -ne "running") { Report "error" "desktop wake" "status after the wake: $line"; exit 1 }
       - name: 3. stop
         timeout-minutes: 8
         run: |

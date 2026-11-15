@@ -4,7 +4,9 @@
 //! Optionally the proxy also owns the engine's lifetime: it stops the distro
 //! when nothing uses it and starts it again when a client connects (see
 //! `IdleStop`). The engine calls come from the caller as `EngineHooks`;
-//! `docklet_wsl::Engine` implements them.
+//! `docklet_wsl::Engine` implements them. `serve_configured` is what the
+//! front ends call: it reads the user's idle-stop setting and serves
+//! accordingly.
 
 // The pipe name lives in `docklet-core`, the one crate every client shares.
 pub use docklet_core::engine::{ENGINE_DOCKER_HOST, ENGINE_PIPE};
@@ -14,6 +16,7 @@ pub use docklet_core::idle::{EngineHooks, IdlePolicy};
 pub mod control;
 #[cfg(windows)]
 mod lifecycle;
+mod ping;
 #[cfg(windows)]
 mod security;
 #[cfg(windows)]
@@ -21,6 +24,7 @@ mod server;
 
 #[cfg(windows)]
 pub use lifecycle::IdleStop;
+pub use ping::{PING_TIMEOUT, ping};
 #[cfg(windows)]
 pub use server::{PipeProxy, PipeProxyConfig, RelayCommand};
 
@@ -42,8 +46,45 @@ pub fn serve_with_idle_stop(config: PipeProxyConfig, idle: IdleStop) -> std::io:
     serve_with(config, Some(idle))
 }
 
+/// Serves the way the user's settings say: with idle stop after the time set
+/// in `data_dir`'s settings file, or as a plain relay when that is `off`.
+/// `hooks` are only used with idle stop.
+///
+/// The settings are read once, here. A proxy that is already running keeps
+/// what it started with.
+#[cfg(windows)]
+pub fn serve_configured(
+    config: PipeProxyConfig,
+    data_dir: &std::path::Path,
+    hooks: impl EngineHooks + 'static,
+) -> std::io::Result<()> {
+    use docklet_core::settings;
+
+    // A settings file that cannot be read must not keep Docker from working;
+    // the defaults are what a missing file means as well.
+    let settings = settings::load(data_dir)
+        .map(|(settings, _)| settings)
+        .unwrap_or_default();
+    let seconds = std::env::var(settings::IDLE_SECONDS_ENV).ok();
+    match settings::idle_policy(settings.idle_stop, seconds.as_deref()) {
+        Some(policy) => {
+            if config.trace {
+                eprintln!("[engine] idle stop after {:?}", policy.idle_after());
+            }
+            serve_with_idle_stop(config, IdleStop::new(policy, hooks))
+        }
+        None => serve(config),
+    }
+}
+
 #[cfg(windows)]
 fn serve_with(config: PipeProxyConfig, idle: Option<IdleStop>) -> std::io::Result<()> {
+    // Created before the stop event and held until the process exits, so a
+    // proxy that counts as running is never taken for a plain one.
+    let _idle_stop = match &idle {
+        Some(_) => Some(control::IdleStopMarker::create()?),
+        None => None,
+    };
     let stop = control::StopSignal::create()?;
     // Exiting the process is the whole shutdown: relays are children of
     // wsl.exe processes that end when the distro is terminated.

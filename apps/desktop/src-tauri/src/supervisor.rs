@@ -9,7 +9,7 @@ use std::io;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use docklet_core::{EngineState, engine};
+use docklet_core::{EngineState, ProxyMode, engine};
 use docklet_proxy::control;
 use docklet_wsl::{Engine, RootfsSource};
 use tauri::{AppHandle, Manager};
@@ -85,21 +85,23 @@ impl Drop for InFlight<'_> {
 /// The engine state as the UI should see it. Blocks on `wsl.exe`.
 ///
 /// The engine counts as running only when the pipe proxy is up, because that
-/// is what the UI itself talks to.
+/// is what the UI itself talks to. A stopped distro behind an idle-stop proxy
+/// is `Sleeping`: any Docker client would wake it, so the UI must not be one
+/// until the user asks. Telling the proxies apart costs no `wsl.exe` call.
 pub fn status() -> io::Result<EngineState> {
     let state = Engine::system()?.status();
-    Ok(match state {
-        EngineState::Running if !control::is_running() => EngineState::Starting,
-        other => other,
-    })
+    Ok(state.seen_with(control::mode()))
 }
 
-/// True when a Docker API connection would be answered: the pipe proxy is up
-/// and the distro runs. Blocks on `wsl.exe`.
+/// True when a Docker API connection would be answered without starting
+/// anything: the pipe proxy is up and the distro runs. Blocks on `wsl.exe`.
 ///
-/// Asked before the event stream is reopened, because trying is not harmless:
-/// the proxy starts `wsl.exe -d docklet` for every connection, and that boots
-/// a distro the user stopped from outside (`wsl --shutdown`).
+/// Asked before the event stream is reopened, because trying is not harmless.
+/// A plain proxy starts `wsl.exe -d docklet` for every connection, and that
+/// boots a distro the user stopped from outside (`wsl --shutdown`). An
+/// idle-stop proxy starts a sleeping engine for every connection, and the
+/// window would keep an engine awake that nobody uses. A sleeping engine is
+/// therefore not reachable in this sense, whichever proxy runs.
 pub fn reachable() -> bool {
     control::is_running()
         && Engine::system().is_ok_and(|engine| {
@@ -123,7 +125,7 @@ pub fn install(
 }
 
 /// Starts the distro, dockerd and the pipe proxy, then subscribes to Docker's
-/// events. Blocks until the engine answers.
+/// events. Wakes the engine if it sleeps. Blocks until the engine answers.
 pub fn start(app: &AppHandle) -> io::Result<()> {
     let state = app.state::<AppState>();
     state.supervisor.run(Transition::Starting, start_engine)?;
@@ -143,6 +145,18 @@ pub fn stop(app: &AppHandle) -> io::Result<()> {
 }
 
 fn start_engine() -> io::Result<()> {
+    // An idle-stop proxy owns the engine's lifetime, so it is asked for the
+    // engine the way a Docker client asks: with a request through the pipe.
+    // It starts the distro if it has to. Started behind its back, the distro
+    // would be up with the proxy still believing it stopped, and nothing
+    // would stop it again.
+    if control::mode() == ProxyMode::IdleStop
+        && docklet_proxy::ping(docklet_proxy::PING_TIMEOUT).is_ok()
+    {
+        return Ok(());
+    }
+    // No such proxy, or it could not bring the engine up: starting it here
+    // reports why not.
     Engine::system()?.start()?;
     if control::is_running() {
         return Ok(());

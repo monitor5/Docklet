@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use docklet_core::settings::{self, IdleStop};
+
 use crate::failure::{ErrorCode, Failure};
 
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(120);
@@ -33,6 +35,9 @@ pub enum Command {
     Docker(Vec<OsString>),
     CliSetup,
     Skills(SkillsAction),
+    /// One setting, or all of them when no key is given.
+    ConfigGet(Option<ConfigKey>),
+    ConfigSet(ConfigChange),
     /// Hidden: `start` and `stop` are the user's commands.
     ProxyStop,
     /// Hidden: runs the pipe proxy in the foreground.
@@ -55,6 +60,41 @@ pub enum SkillsAction {
     Status,
     Install,
     Uninstall,
+}
+
+/// A setting `docklet config` knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKey {
+    IdleStop,
+}
+
+impl ConfigKey {
+    pub const ALL: [Self; 1] = [Self::IdleStop];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IdleStop => settings::IDLE_STOP_KEY,
+        }
+    }
+
+    fn parse(name: &str) -> Result<Self, Failure> {
+        Self::ALL
+            .into_iter()
+            .find(|key| key.name() == name)
+            .ok_or_else(|| {
+                let known: Vec<&str> = Self::ALL.iter().map(|key| key.name()).collect();
+                Failure::usage(format!(
+                    "unknown setting `{name}`; the settings are: {}",
+                    known.join(", ")
+                ))
+            })
+    }
+}
+
+/// A setting together with the value it is to get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigChange {
+    IdleStop(IdleStop),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +157,8 @@ pub fn parse(args: Vec<OsString>) -> Invocation {
             "skills uninstall",
             Ok(Command::Skills(SkillsAction::Uninstall)),
         ),
+        ["config", "get", options @ ..] => ("config get", config_get(options)),
+        ["config", "set", options @ ..] => ("config set", config_set(options)),
         ["up", options @ ..] => ("up", up(options)),
         ["wait", options @ ..] => ("wait", wait(options)),
         ["doctor"] => ("doctor", Ok(Command::Doctor)),
@@ -172,6 +214,32 @@ fn wait(options: &[&str]) -> Result<Command, Failure> {
     timeout
         .map(|timeout| Command::Wait { timeout })
         .ok_or_else(|| Failure::usage("usage: docklet wait [--timeout SECONDS]"))
+}
+
+fn config_get(options: &[&str]) -> Result<Command, Failure> {
+    match options {
+        [] => Ok(Command::ConfigGet(None)),
+        [key] => Ok(Command::ConfigGet(Some(ConfigKey::parse(key)?))),
+        _ => Err(Failure::usage("usage: docklet config get [<key>]")),
+    }
+}
+
+fn config_set(options: &[&str]) -> Result<Command, Failure> {
+    let [key, value] = options else {
+        return Err(Failure::usage("usage: docklet config set <key> <value>"));
+    };
+    let change = match ConfigKey::parse(key)? {
+        ConfigKey::IdleStop => IdleStop::parse(value)
+            .map(ConfigChange::IdleStop)
+            .ok_or_else(|| {
+                Failure::usage(format!(
+                    "{} takes a number of minutes from 1 to {}, or `off`; got `{value}`",
+                    settings::IDLE_STOP_KEY,
+                    IdleStop::MAX_MINUTES
+                ))
+            })?,
+    };
+    Ok(Command::ConfigSet(change))
 }
 
 fn proxy(options: &[&str]) -> Result<Command, Failure> {
@@ -338,6 +406,98 @@ mod tests {
             "unknown command `skills remove`"
         );
         assert_eq!(failure("skills").message, "unknown command `skills`");
+    }
+
+    #[test]
+    fn config_get_takes_an_optional_key() {
+        assert_eq!(command("config get"), Command::ConfigGet(None));
+        assert_eq!(
+            command("config get idle-stop"),
+            Command::ConfigGet(Some(ConfigKey::IdleStop))
+        );
+        assert_eq!(parse_line("config get idle-stop").name, Some("config get"));
+        let unknown = failure("config get memory");
+        assert_eq!(unknown.code, ErrorCode::Usage);
+        assert_eq!(
+            unknown.message,
+            "unknown setting `memory`; the settings are: idle-stop"
+        );
+        assert_eq!(
+            failure("config get idle-stop now").message,
+            "usage: docklet config get [<key>]"
+        );
+    }
+
+    #[test]
+    fn config_set_takes_minutes_or_off() {
+        assert_eq!(
+            command("config set idle-stop 5"),
+            Command::ConfigSet(ConfigChange::IdleStop(IdleStop::After(5)))
+        );
+        assert_eq!(
+            command("config set idle-stop off"),
+            Command::ConfigSet(ConfigChange::IdleStop(IdleStop::Off))
+        );
+        assert_eq!(
+            command("config set idle-stop 10080"),
+            Command::ConfigSet(ConfigChange::IdleStop(IdleStop::After(10080)))
+        );
+        assert_eq!(
+            parse_line("config set idle-stop 5").name,
+            Some("config set")
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_values_that_are_not_minutes() {
+        // Seconds are not offered: the shortest idle time is a minute.
+        for value in ["0", "10081", "-5", "1.5", "30s", "5m", "on", "never"] {
+            let line = format!("config set idle-stop {value}");
+            let failure = failure(&line);
+            assert_eq!(failure.code, ErrorCode::Usage, "{line}");
+            assert_eq!(
+                failure.message,
+                format!(
+                    "idle-stop takes a number of minutes from 1 to 10080, or `off`; got `{value}`"
+                )
+            );
+            assert_eq!(parse_line(&line).name, Some("config set"));
+        }
+    }
+
+    #[test]
+    fn config_set_needs_a_known_key_and_one_value() {
+        for line in [
+            "config set",
+            "config set idle-stop",
+            "config set idle-stop 5 6",
+        ] {
+            let failure = failure(line);
+            assert_eq!(failure.code, ErrorCode::Usage, "{line}");
+            assert_eq!(failure.message, "usage: docklet config set <key> <value>");
+        }
+        assert_eq!(
+            failure("config set memory 4G").message,
+            "unknown setting `memory`; the settings are: idle-stop"
+        );
+        // `config` alone names no command.
+        let bare = parse_line("config");
+        assert_eq!(bare.name, None);
+        assert_eq!(
+            bare.command.unwrap_err().message,
+            "unknown command `config`"
+        );
+        assert_eq!(
+            failure("config unset idle-stop").message,
+            "unknown command `config unset idle-stop`"
+        );
+    }
+
+    #[test]
+    fn every_setting_has_a_name_that_parses_back() {
+        for key in ConfigKey::ALL {
+            assert_eq!(ConfigKey::parse(key.name()), Ok(key));
+        }
     }
 
     #[test]
@@ -553,8 +713,10 @@ mod tests {
     #[test]
     fn every_command_in_the_catalogue_parses() {
         for entry in COMMANDS {
+            // With their required arguments, where they have some.
             let line = match entry.name {
                 "uninstall" => "uninstall --yes".to_string(),
+                "config set" => "config set idle-stop 5".to_string(),
                 name => name.to_string(),
             };
             let invocation = parse_line(&line);

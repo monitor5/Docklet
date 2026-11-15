@@ -21,13 +21,22 @@ use crate::proxy;
 /// The engine is never started from here. A Docker command that quietly
 /// boots a WSL distro would surprise whoever stopped it, and `wsl -d` on a
 /// stopped distro starts it without the keepalive that holds it up.
+///
+/// An engine that went to sleep is another matter: nobody stopped it, and
+/// the idle-stop proxy that put it to sleep starts it again, keepalive
+/// included, for the connection Docker makes. So a sleeping engine is not
+/// refused; the command just takes a few seconds longer. After `docklet
+/// stop` there is no proxy, and the command is refused as before.
 pub fn run(args: &[OsString]) -> Result<i32, Failure> {
     let engine = Engine::system()?;
-    if !answers(&engine)
-        && let Some(blocker) =
-            failure::blocker(&EngineFacts::gather(engine.wsl()), proxy::is_running())
-    {
-        return Err(blocker);
+    if !answers(&engine) {
+        // Read once, so the two decisions below are about the same proxy.
+        let proxy = proxy::mode();
+        if let Some(blocker) = failure::blocker(&EngineFacts::gather(engine.wsl()), proxy)
+            && failure::refuses_docker(&blocker, proxy)
+        {
+            return Err(blocker);
+        }
     }
     let cli = find(&docklet_wsl::data_dir()?).ok_or_else(|| {
         Failure::new(

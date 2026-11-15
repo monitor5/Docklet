@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 
 use docklet_core::docker_client::{self, ContextState};
 use docklet_core::doctor::{self, Check, EngineFacts, Facts, Level};
+use docklet_core::settings::{self, IdleStop};
 use docklet_core::skills::{self, InstallOutcome, SkillStatus};
-use docklet_core::{disk, engine};
+use docklet_core::{ProxyMode, disk, engine};
 use docklet_wsl::tools::{self, CONTEXT_NAME, CliSetup};
 use docklet_wsl::{DISTRO, Engine, RootfsSource};
 
-use crate::args::{Command, InstallSource, SkillsAction};
+use crate::args::{Command, ConfigChange, ConfigKey, InstallSource, SkillsAction};
 use crate::failure::{self, ErrorCode, Failure, Op};
 use crate::json::{Json, Object};
 use crate::status::{self, StatusFacts, StatusView};
@@ -68,6 +69,8 @@ pub fn run(ui: &Ui, command: Command) -> Result<Outcome, Failure> {
         Command::Docker(args) => return docker::run(&args).map(Outcome::Exit),
         Command::CliSetup => cli_setup(ui)?,
         Command::Skills(action) => run_skills(ui, action)?,
+        Command::ConfigGet(key) => config_get(ui, key)?,
+        Command::ConfigSet(change) => config_set(ui, change)?,
         Command::ProxyStop => {
             if !proxy::stop() {
                 return Err(Failure::failed("the pipe proxy did not exit"));
@@ -115,7 +118,7 @@ fn bases(ui: &Ui) -> Json {
 fn status(ui: &Ui) -> Result<Json, Failure> {
     let engine = Engine::system()?;
     if !ui.json {
-        let view = StatusView::of(&engine.status(), proxy::is_running());
+        let view = StatusView::of(&engine.status(), proxy::mode());
         println!("{}", view.line());
         warn_if_mirrored_networking();
         return Ok(Json::Null);
@@ -123,13 +126,13 @@ fn status(ui: &Ui) -> Result<Json, Failure> {
     // The same `wsl.exe` queries as `engine.status()`, kept apart so the
     // WSL version can be reported with the state.
     let facts = EngineFacts::gather(engine.wsl());
-    let proxy_running = proxy::is_running();
-    let view = StatusView::of(&facts.state(), proxy_running);
+    let proxy = proxy::mode();
+    let view = StatusView::of(&facts.state(), proxy);
     let mirrored_networking = warn_if_mirrored_networking();
     Ok(status::status_data(
         &view,
         &StatusFacts {
-            proxy_running,
+            proxy,
             wsl_version: facts.wsl_version(),
             mirrored_networking,
             context_name: CONTEXT_NAME,
@@ -207,20 +210,62 @@ fn install_distro(ui: &Ui, engine: &Engine, source: &RootfsSource) -> Result<(),
 fn start(ui: &Ui) -> Result<Json, Failure> {
     let engine = Engine::system()?;
     warn_if_mirrored_networking();
-    let failed = |err| engine_failure(ui, &engine, Op::Start, err);
-    engine.start().map_err(failed)?;
-    proxy::ensure_running().map_err(failed)?;
+    start_engine(ui, &engine)?;
+    proxy::ensure_running().map_err(|err| engine_failure(ui, &engine, Op::Start, err))?;
     ui.say(&running_line());
     Ok(running_data().into())
 }
 
+/// Starts the engine and waits until Docker answers. Wakes it if it sleeps.
+///
+/// An idle-stop proxy owns the engine's lifetime, so with one running the
+/// engine is asked for the way a Docker client asks: with a request through
+/// the pipe. The proxy starts the distro if it has to, and its idle time
+/// starts over. Started behind the proxy's back, the distro would be up with
+/// the proxy still believing it stopped, and nothing would stop it again.
+fn start_engine(ui: &Ui, engine: &Engine) -> Result<(), Failure> {
+    let through_proxy = (proxy::mode() == ProxyMode::IdleStop).then(proxy::ping);
+    if let Some(Ok(())) = through_proxy {
+        return Ok(());
+    }
+    // No such proxy, or it could not bring the engine up. Starting it here
+    // says why not, in the words this command has always used.
+    engine
+        .start()
+        .map_err(|err| engine_failure(ui, engine, Op::Start, err))?;
+    if let Some(Err(err)) = through_proxy {
+        eprintln!(
+            "docklet: warning: the engine is running, but a request through the pipe proxy \
+             failed: {err}"
+        );
+    }
+    Ok(())
+}
+
 fn running_line() -> String {
-    format!("Engine is running. Docker host: {}", proxy::DOCKER_HOST)
+    usable_line(false)
 }
 
 fn running_data() -> Object {
+    usable_data(false)
+}
+
+/// What `wait` and `up` say about an engine Docker commands work with:
+/// running, or asleep behind a proxy that wakes it.
+fn usable_line(asleep: bool) -> String {
+    if asleep {
+        format!(
+            "Engine is asleep and starts with the next Docker command. Docker host: {}",
+            proxy::DOCKER_HOST
+        )
+    } else {
+        format!("Engine is running. Docker host: {}", proxy::DOCKER_HOST)
+    }
+}
+
+fn usable_data(asleep: bool) -> Object {
     Object::new()
-        .set("state", "running")
+        .set("state", if asleep { "sleeping" } else { "running" })
         .set("docker_host", proxy::DOCKER_HOST)
         .set("pipe", docklet_proxy::ENGINE_PIPE)
 }
@@ -254,7 +299,8 @@ fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
     warn_if_mirrored_networking();
     let facts = EngineFacts::gather(engine.wsl());
     let mut changed: Vec<&str> = Vec::new();
-    match failure::blocker(&facts, true) {
+    // What stands in the way of the engine itself; the proxy comes later.
+    match failure::blocker(&facts, ProxyMode::Plain) {
         Some(blocker) if blocker.code == ErrorCode::NotInstalled => {
             let base = base.unwrap_or_else(|| engine::bases()[0].to_string());
             install_distro(ui, &engine, &RootfsSource::Base(base))?;
@@ -270,13 +316,16 @@ fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
             }
         }
     }
-    let failed = |err| engine_failure(ui, &engine, Op::Start, err);
-    if facts.dockerd != Some(true) {
-        engine.start().map_err(failed)?;
+    // An engine that sleeps behind an idle-stop proxy is usable as it is:
+    // the first Docker command wakes it. `up` leaves it asleep rather than
+    // start a distro that may not be needed yet.
+    let asleep = facts.asleep_behind(proxy::mode());
+    if !asleep && facts.dockerd != Some(true) {
+        start_engine(ui, &engine)?;
         changed.push("started_engine");
     }
     if !proxy::is_running() {
-        proxy::ensure_running().map_err(failed)?;
+        proxy::ensure_running().map_err(|err| engine_failure(ui, &engine, Op::Start, err))?;
         changed.push("started_proxy");
     }
     let setup = docker_setup(ui, &home).map_err(|err| {
@@ -285,10 +334,10 @@ fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
         ))
     })?;
     changed.extend(setup_changes(&setup));
-    ui.say(&running_line());
+    ui.say(&usable_line(asleep));
     ui.say(&format!("Docker CLI: {}", setup.docker.display()));
     ui.say("Run Docker with: docklet docker ps");
-    Ok(setup_data(running_data(), &setup, changed).into())
+    Ok(setup_data(usable_data(asleep), &setup, changed).into())
 }
 
 fn docker_setup(ui: &Ui, home: &Path) -> io::Result<CliSetup> {
@@ -334,6 +383,74 @@ fn cli_setup(ui: &Ui) -> Result<Json, Failure> {
     Ok(setup_data(object, &setup, setup_changes(&setup)).into())
 }
 
+fn config_get(ui: &Ui, key: Option<ConfigKey>) -> Result<Json, Failure> {
+    let data_dir = docklet_wsl::data_dir()?;
+    let (settings, problems) = settings::load(&data_dir)?;
+    // A line that was not understood left its setting at the default; say
+    // so rather than show the default as if it had been chosen.
+    for problem in &problems {
+        eprintln!(
+            "docklet: warning: {}: {problem}",
+            settings::path(&data_dir).display()
+        );
+    }
+    let idle_stop = settings.idle_stop;
+    match key {
+        Some(ConfigKey::IdleStop) => {
+            ui.say(&idle_stop.to_string());
+            Ok(idle_stop_data(idle_stop).into())
+        }
+        None => {
+            ui.say(&format!("{} = {idle_stop}", settings::IDLE_STOP_KEY));
+            let all: Vec<Json> = vec![idle_stop_data(idle_stop).into()];
+            Ok(Object::new().set("settings", all).into())
+        }
+    }
+}
+
+fn config_set(ui: &Ui, change: ConfigChange) -> Result<Json, Failure> {
+    let ConfigChange::IdleStop(idle_stop) = change;
+    settings::save_idle_stop(&docklet_wsl::data_dir()?, idle_stop)?;
+    // A proxy reads the setting once, when it starts.
+    let restart_needed = proxy::is_running();
+    for line in config_set_lines(idle_stop, restart_needed) {
+        ui.say(&line);
+    }
+    Ok(idle_stop_data(idle_stop)
+        .set("applies_from", "next_start")
+        .set("restart_needed", restart_needed)
+        .into())
+}
+
+/// One setting as `--json` reports it: the value as `config set` takes it,
+/// and the minutes as a number, `null` for `off`.
+fn idle_stop_data(idle_stop: IdleStop) -> Object {
+    Object::new()
+        .set("key", settings::IDLE_STOP_KEY)
+        .set("value", idle_stop.to_string())
+        .set("minutes", idle_stop.minutes().map(u64::from))
+}
+
+/// What `config set idle-stop` prints: what the value means, and when it
+/// takes effect.
+fn config_set_lines(idle_stop: IdleStop, proxy_running: bool) -> Vec<String> {
+    let meaning = match idle_stop {
+        IdleStop::Off => "idle-stop = off: the engine runs until `docklet stop`.".to_string(),
+        IdleStop::After(minutes) => format!(
+            "idle-stop = {minutes}: an engine nothing used for {minutes} {} is stopped, \
+             and starts again when Docker is used.",
+            if minutes == 1 { "minute" } else { "minutes" }
+        ),
+    };
+    let applies = if proxy_running {
+        "The change applies from the next `docklet start`. The engine that is running now \
+         keeps the old setting until `docklet stop`."
+    } else {
+        "The change applies from the next `docklet start`."
+    };
+    vec![meaning, applies.to_string()]
+}
+
 /// Pause between two looks at the engine while waiting for it.
 const WAIT_POLL: Duration = Duration::from_secs(1);
 
@@ -344,9 +461,12 @@ fn wait(ui: &Ui, timeout: Duration) -> Result<Json, Failure> {
     let started = Instant::now();
     loop {
         let facts = EngineFacts::gather(engine.wsl());
-        let Some(blocker) = failure::blocker(&facts, proxy::is_running()) else {
-            ui.say(&running_line());
-            return Ok(running_data()
+        let proxy = proxy::mode();
+        let Some(blocker) = failure::blocker(&facts, proxy) else {
+            // Usable is running, or asleep behind a proxy that wakes it.
+            let asleep = facts.asleep_behind(proxy);
+            ui.say(&usable_line(asleep));
+            return Ok(usable_data(asleep)
                 .set("waited_seconds", started.elapsed().as_secs())
                 .into());
         };
@@ -385,7 +505,7 @@ fn run_doctor(ui: &Ui) -> Result<Json, Failure> {
     let home = home_dir();
     let facts = Facts {
         engine: EngineFacts::gather(engine.wsl()),
-        proxy_running: proxy::is_running(),
+        proxy: proxy::mode(),
         docker_cli: docker::find(&data_dir).map(|cli| cli.path.display().to_string()),
         compose_plugin: home
             .as_deref()
@@ -612,7 +732,7 @@ mod tests {
                 running: None,
                 dockerd: None,
             },
-            proxy_running: false,
+            proxy: ProxyMode::Down,
             docker_cli: None,
             compose_plugin: false,
             docker_context: ContextState::Missing,
@@ -775,5 +895,69 @@ mod tests {
             running_line(),
             "Engine is running. Docker host: npipe:////./pipe/docklet_engine"
         );
+        assert_eq!(usable_line(false), running_line());
+        let running: Json = running_data().into();
+        let usable: Json = usable_data(false).into();
+        assert_eq!(running, usable);
+    }
+
+    #[test]
+    fn a_sleeping_engine_is_reported_as_usable_and_asleep() {
+        assert_eq!(
+            usable_line(true),
+            "Engine is asleep and starts with the next Docker command. \
+             Docker host: npipe:////./pipe/docklet_engine"
+        );
+        let data: Json = usable_data(true).set("waited_seconds", 0u64).into();
+        assert_eq!(
+            data.render(),
+            concat!(
+                r#"{"state":"sleeping","docker_host":"npipe:////./pipe/docklet_engine","#,
+                r#""pipe":"\\\\.\\pipe\\docklet_engine","waited_seconds":0}"#
+            )
+        );
+    }
+
+    #[test]
+    fn idle_stop_data_shape() {
+        let minutes: Json = idle_stop_data(IdleStop::After(10)).into();
+        assert_eq!(
+            minutes.render(),
+            r#"{"key":"idle-stop","value":"10","minutes":10}"#
+        );
+        let off: Json = idle_stop_data(IdleStop::Off).into();
+        assert_eq!(
+            off.render(),
+            r#"{"key":"idle-stop","value":"off","minutes":null}"#
+        );
+    }
+
+    #[test]
+    fn setting_idle_stop_says_when_the_change_applies() {
+        assert_eq!(
+            config_set_lines(IdleStop::After(5), false),
+            [
+                "idle-stop = 5: an engine nothing used for 5 minutes is stopped, \
+                 and starts again when Docker is used.",
+                "The change applies from the next `docklet start`.",
+            ]
+        );
+        let one = config_set_lines(IdleStop::After(1), false);
+        assert!(one[0].contains("for 1 minute is stopped"), "{}", one[0]);
+        // A proxy that is running keeps what it started with.
+        assert_eq!(
+            config_set_lines(IdleStop::Off, true),
+            [
+                "idle-stop = off: the engine runs until `docklet stop`.",
+                "The change applies from the next `docklet start`. The engine that is \
+                 running now keeps the old setting until `docklet stop`.",
+            ]
+        );
+        for idle_stop in [IdleStop::Off, IdleStop::After(30)] {
+            for proxy_running in [true, false] {
+                let lines = config_set_lines(idle_stop, proxy_running);
+                assert!(lines[1].contains("next `docklet start`"));
+            }
+        }
     }
 }

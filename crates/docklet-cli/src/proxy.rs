@@ -1,14 +1,23 @@
 //! The background pipe proxy (`docklet proxy`), started by `docklet start`.
 
+use std::io;
+
 #[cfg(windows)]
 mod imp {
     use crate::failure::Failure;
+    use docklet_core::ProxyMode;
     use docklet_proxy::{PipeProxyConfig, RelayCommand, control};
     use std::io;
     use std::time::{Duration, Instant};
 
     pub fn is_running() -> bool {
         control::is_running()
+    }
+
+    /// Whether a proxy runs, and whether it is one that stops an idle
+    /// engine and wakes it on connect.
+    pub fn mode() -> ProxyMode {
+        control::mode()
     }
 
     /// Starts the proxy as a detached process unless one is already running.
@@ -33,7 +42,8 @@ mod imp {
         control::stop()
     }
 
-    /// `docklet proxy [--trace] [--byte]`: runs the proxy in the foreground.
+    /// `docklet proxy [--trace] [--byte]`: runs the proxy in the foreground,
+    /// with idle stop as the user's settings say.
     pub fn serve(trace: bool, byte_mode: bool) -> Result<(), Failure> {
         let config = PipeProxyConfig {
             pipe_name: docklet_proxy::ENGINE_PIPE.to_string(),
@@ -44,17 +54,24 @@ mod imp {
         if is_running() {
             return Err(Failure::failed("a pipe proxy is already running"));
         }
-        Ok(docklet_proxy::serve(config)?)
+        let data_dir = docklet_wsl::data_dir()?;
+        let engine = docklet_wsl::Engine::system()?;
+        Ok(docklet_proxy::serve_configured(config, &data_dir, engine)?)
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
     use crate::failure::Failure;
+    use docklet_core::ProxyMode;
     use std::io;
 
     pub fn is_running() -> bool {
         false
+    }
+
+    pub fn mode() -> ProxyMode {
+        ProxyMode::Down
     }
 
     pub fn ensure_running() -> io::Result<()> {
@@ -70,6 +87,12 @@ mod imp {
     }
 }
 
-pub use imp::{ensure_running, is_running, serve, stop};
+pub use imp::{ensure_running, is_running, mode, serve, stop};
+
+/// One Docker API request through the pipe. An idle-stop proxy starts the
+/// engine for it if it is asleep. Blocks until Docker answers.
+pub fn ping() -> io::Result<()> {
+    docklet_proxy::ping(docklet_proxy::PING_TIMEOUT)
+}
 
 pub const DOCKER_HOST: &str = docklet_proxy::ENGINE_DOCKER_HOST;
