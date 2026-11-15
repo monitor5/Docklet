@@ -127,12 +127,30 @@ Windows `docker` CLI 29.9.3 through `\\.\pipe\docklet_engine`, measured
   of free instances can still see "pipe busy" for a moment. The runner-only
   test `concurrent_clients_never_get_pipe_busy` covers this; it has not run yet.
 
-## M3 notes
+## M3 measurements
 
-Still unmeasured for the M3 acceptance. Record the results here once measured.
+Release build of the `m3` branch, measured 2026-11-15 on a second PC (AMD
+8C/16T, 23 GB RAM, Windows build 26300, WSL 3.0.5) after the E2E workflow
+passed. The window was driven by UI automation and was not in the foreground.
 
-- [ ] Engine and container events reach the UI within 1 s.
-- [ ] The log view keeps up with a container writing 10,000 lines per second.
-- [ ] No `msedgewebview2.exe` process is left after the window is closed.
-- [ ] Stopping the engine from the tray stops the distro.
-- [ ] `docklet-desktop.exe --proxy` serves the Docker pipe (E2E job `desktop-proxy`).
+| Check                                                    | Result                                                                    |
+| -------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Container created with the CLI shows up in the window    | pass: listed with status "Up Less than a second"                          |
+| Log view with a container writing about 10,000 lines/s   | pass: follows the tail, buffer stays at 50,000 lines                      |
+| CPU while following that log, 10 s                       | 0.4 s desktop process, about 1.6 s WebView2, 0.3 s CLI proxy              |
+| `msedgewebview2.exe` children after closing the window   | 0; the tray process stays (7 MB private, 32 MB working set)               |
+| Relay processes after closing the window with a log open | the log's relay ends, the event stream's relay stays                      |
+| `docklet-desktop.exe --proxy` serves the Docker pipe     | pass in the E2E job `desktop-proxy` (0 CPU s idle, no relay left)         |
+| After `docklet stop` with the tray app running           | no distro, proxy or relay left; tray process uses 0 CPU s in 10 s         |
+
+Not measured yet:
+
+- [ ] Stopping and starting the engine from the tray menu. The tray was not
+      driven; the window's own Start and Stop buttons were not clicked either.
+- [ ] The log view with the window in the foreground, where rendering runs at
+      the display's frame rate.
+- `docklet stop` took about 10 s in this run, against 0.6 s in the M1
+  measurement. Three containers had just been removed; the cause was not
+  looked into.
+- The container list shows the status text from the last Docker event, so
+  "Up 13 seconds" stays on screen until something else changes.
