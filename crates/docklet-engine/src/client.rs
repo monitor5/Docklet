@@ -53,7 +53,7 @@ impl FromStr for ContainerAction {
 
 /// A client for the Docker Engine behind the Docklet pipe.
 pub struct Client {
-    docker: Docker,
+    pub(crate) docker: Docker,
 }
 
 impl Client {
