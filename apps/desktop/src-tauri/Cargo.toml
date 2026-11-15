@@ -17,7 +17,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 docklet-core = { workspace = true }
+docklet-proxy = { workspace = true }
+docklet-wsl = { workspace = true }
+futures-util = { version = "0.3", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2.12", features = ["tray-icon"] }
+tokio = { workspace = true, features = ["time", "macros"] }
