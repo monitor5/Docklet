@@ -4,10 +4,17 @@
 //! window destroys the WebView, so only the Rust core keeps running.
 
 mod commands;
+mod state;
+mod streams;
+mod supervisor;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+
+/// Event sent to the UI when the engine was started or stopped from the tray.
+/// Its payload is the error message, or null when the request succeeded.
+const ENGINE_EVENT: &str = "engine-changed";
 
 const MAIN_WINDOW: &str = "main";
 const MENU_OPEN: &str = "open";
@@ -43,17 +50,18 @@ fn show_main_window_detached(app: &AppHandle) {
 }
 
 /// Starts or stops the engine from the tray, then tells an open window to
-/// refresh. Errors surface in the window's status area on its next poll.
+/// refresh. Errors surface in the window's status area, including the one for
+/// a request that the supervisor refused because another was in flight.
 fn engine_from_tray(app: &AppHandle, start: bool) {
     let app = app.clone();
     std::thread::spawn(move || {
         let result = if start {
-            commands::start_engine_blocking().map(|()| commands::watch_events(&app))
+            supervisor::start(&app)
         } else {
-            commands::stop_engine_blocking()
+            supervisor::stop(&app)
         };
         let message = result.err().map(|err| err.to_string());
-        let _ = app.emit(commands::ENGINE_EVENT, message);
+        let _ = app.emit(ENGINE_EVENT, message);
     });
 }
 
@@ -100,7 +108,7 @@ pub fn run_proxy_mode() -> Option<std::io::Result<()>> {
         return None;
     }
     Some(docklet_proxy::serve(docklet_proxy::PipeProxyConfig {
-        pipe_name: docklet_proxy::ENGINE_PIPE.to_string(),
+        pipe_name: docklet_core::engine::ENGINE_PIPE.to_string(),
         message_mode: true,
         relay: docklet_proxy::RelayCommand::wsl_relay(docklet_wsl::DISTRO),
         trace: false,
@@ -110,7 +118,10 @@ pub fn run_proxy_mode() -> Option<std::io::Result<()>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(commands::AppState::default())
+        // Lets the frontend open a published port in the browser. What it may
+        // open is limited to localhost URLs in `capabilities/default.json`.
+        .plugin(tauri_plugin_opener::init())
+        .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::engine_status,
             commands::engine_install,
