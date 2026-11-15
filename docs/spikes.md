@@ -154,3 +154,55 @@ Not measured yet:
   looked into.
 - The container list shows the status text from the last Docker event, so
   "Up 13 seconds" stays on screen until something else changes.
+
+## Alpine base without an init system
+
+Question: does the engine distro need systemd, and what does a smaller base
+save?
+
+What Docklet needs from a rootfs (the rootfs contract) is only:
+
+- dockerd running after the distro boots, listening on `/var/run/docker.sock`;
+- `/usr/local/bin/docklet-relay`;
+- a `docker` CLI inside the distro, because the engine probes readiness with
+  `docker info` and counts running containers with `docker ps -q`.
+
+How dockerd gets started is up to the base. On the Debian-family bases
+systemd does it; nothing else in the engine relies on systemd.
+
+Method (2026-11-15): an Alpine rootfs without an init system was built by hand,
+with Docker from Alpine 3.24's packages and a WSL `[boot]` command that starts
+dockerd. Both it and the Debian 13 rootfs were measured the same way on the
+same PC: a cold WSL VM for each start, no container running. Each number is from **one run on one PC**;
+treat them as an order of magnitude, not a benchmark.
+
+| Measurement                      | Debian 13 + systemd      | Alpine, no init system |
+| -------------------------------- | ------------------------ | ---------------------- |
+| Rootfs download (gzip)           | 169 MiB                  | 59 MiB                 |
+| Installed size                   | 598 MB                   | 174 MB                 |
+| Cold start until dockerd answers | 14.1 s (`docklet start`) | 2.6 s                  |
+| Host memory of the WSL VM, idle  | 1402 MB                  | 1168 MB                |
+| Processes in the distro          | 20                       | 11                     |
+
+In the Alpine distro, Docker 29.9.3 passed `docker run hello-world`, the stdin
+half-close (`echo hi | docker run -i --rm alpine cat`), a `--memory` limit
+(cgroup v2) and a published port reached from Windows on `localhost`.
+
+Consequence: `alpine` is a third base (`docklet install --base alpine`);
+`debian-13` stays the default. Its recipe in `distro/Dockerfile` differs from
+the hand-built experiment in a few points:
+
+- `distro/apk/docklet-boot` sets `PATH` (without it dockerd cannot find
+  `docker-proxy`), enables the cgroup v2 controllers for delegation as moby's
+  docker-in-docker script does, makes `/` a shared mount as systemd does on
+  the other bases, and logs through busybox `syslogd` to `/var/log/messages`,
+  rotated at 2 MiB with two old files kept, instead of a log file that grows
+  for as long as the distro runs.
+- The `docker` CLI and k3d are installed; the buildx and compose CLI plugins
+  are not. They would only serve a `docker` CLI run inside the distro; the
+  Windows-side `docker compose` is unaffected.
+- Nothing restarts dockerd if it exits; systemd would. `docklet stop` and
+  `docklet start` boot the distro again.
+
+Not measured yet: the Alpine rootfs as built by `distro.yml` (the numbers above
+are from the hand-built one), `docklet start` on it, and k3d clusters on it.

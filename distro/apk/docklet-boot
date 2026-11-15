@@ -1,0 +1,64 @@
+#!/bin/sh
+# Starts dockerd in the Alpine-based docklet distro, which has no init system.
+# WSL runs this as root once per distro boot ([boot] command in /etc/wsl.conf)
+# with a bare environment. It returns at once; dockerd and the log daemon run
+# in their own session, detached from it.
+#
+# Logs: busybox syslogd writes /var/log/messages and rotates it at 2 MiB,
+# keeping two old files, so neither dockerd nor this script can fill the disk.
+# Read them with `wsl -d docklet -- tail -n 50 /var/log/messages`.
+#
+# Unlike systemd on the Debian-family bases, nothing restarts dockerd if it
+# exits. `docklet stop` and `docklet start` boot the distro again.
+set -u
+
+# Without a PATH dockerd cannot find containerd, runc or docker-proxy.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+log() { logger -t docklet-boot -- "$*"; }
+
+mkdir -p /var/log
+# WSL creates /dev/log as a link to systemd's journal socket. Without systemd
+# the link dangles and syslogd cannot bind its socket there.
+if [ -L /dev/log ] && [ ! -e /dev/log ]; then
+  rm -f /dev/log
+fi
+if ! pidof syslogd >/dev/null; then
+  syslogd -s 2048 -b 2
+fi
+
+# Run a second time (by hand, say)? Leave the running engine alone.
+if pidof dockerd >/dev/null; then
+  log "dockerd is already running"
+  exit 0
+fi
+
+# cgroup v2: dockerd can only give containers resource limits (--memory,
+# --cpus) once the controllers are enabled in subtree_control, and a cgroup
+# that enables them must not hold processes itself. systemd does this on the
+# other bases; this is the same step as in moby's docker-in-docker script.
+# Moving a process that has already exited fails, which is fine.
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  mkdir -p /sys/fs/cgroup/init
+  for pid in $(cat /sys/fs/cgroup/cgroup.procs); do
+    echo "$pid" 2>/dev/null >/sys/fs/cgroup/init/cgroup.procs || :
+  done
+  if ! sed -e 's/ / +/g' -e 's/^/+/' </sys/fs/cgroup/cgroup.controllers \
+    >/sys/fs/cgroup/cgroup.subtree_control; then
+    log "could not enable the cgroup controllers; container limits will not work"
+  fi
+fi
+
+# systemd makes / a shared mount on the other bases. Bind mounts with shared
+# propagation, which Kubernetes nodes run by k3d rely on, need the same.
+if ! mount --make-rshared /; then
+  log "could not make / a shared mount"
+fi
+
+# /run is a fresh tmpfs on every boot under WSL. Should it ever survive one,
+# a stale pid file whose number now belongs to another process would keep
+# dockerd (or its containerd) from starting.
+rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid
+
+log "starting dockerd"
+setsid sh -c 'dockerd 2>&1 | logger -t dockerd' </dev/null >/dev/null 2>&1 &
