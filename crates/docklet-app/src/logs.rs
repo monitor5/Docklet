@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::format::format_count;
 use crate::streams::LogMessage;
@@ -141,6 +142,89 @@ impl LogBuffer {
             (true, Some(_)) => " · log stopped",
         };
         format!("{} {lines}{ending}", format_count(count))
+    }
+}
+
+/// Lines that a log view reads while it paints, at most a page at a time.
+///
+/// Lines have absolute numbers that keep counting when old lines are
+/// dropped, so `bounds` is `(first, end)` with `end` one past the newest
+/// line. Implementations lock briefly; the view copies what it needs and
+/// lets go before it draws.
+pub trait LogSource: Send + Sync {
+    fn bounds(&self) -> (u64, u64);
+    /// Changes whenever lines are added or dropped. The view repaints only
+    /// when it has changed.
+    fn generation(&self) -> u64;
+    /// Calls `visit` with up to `count` lines from `first` on, in order,
+    /// with each line's number.
+    fn visit(&self, first: u64, count: usize, visit: &mut dyn FnMut(u64, &str));
+}
+
+/// A [`LogBuffer`] that the thread which follows the log fills and the UI
+/// thread reads, so a line never crosses the message loop. Cheap to clone;
+/// every clone is the same buffer.
+#[derive(Debug, Clone, Default)]
+pub struct SharedLog {
+    buffer: Arc<Mutex<LogBuffer>>,
+}
+
+impl SharedLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A log that keeps the newest `cap` lines.
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(LogBuffer::with_cap(cap))),
+        }
+    }
+
+    fn buffer(&self) -> MutexGuard<'_, LogBuffer> {
+        // The buffer is consistent after every statement that changes it,
+        // so it is still good after a panic elsewhere poisoned the lock.
+        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// See `LogBuffer::append`.
+    pub fn append(&self, lines: impl IntoIterator<Item = String>) {
+        self.buffer().append(lines);
+    }
+
+    /// See `LogBuffer::apply`.
+    pub fn apply(&self, message: LogMessage) {
+        self.buffer().apply(message);
+    }
+
+    /// Looks at the buffer under its lock. Keep `read` short: the thread
+    /// that follows the log waits meanwhile.
+    pub fn read<T>(&self, read: impl FnOnce(&LogBuffer) -> T) -> T {
+        read(&self.buffer())
+    }
+}
+
+impl LogSource for SharedLog {
+    fn bounds(&self) -> (u64, u64) {
+        let buffer = self.buffer();
+        let first = buffer.first_index();
+        (first, first + buffer.len() as u64)
+    }
+
+    fn generation(&self) -> u64 {
+        self.buffer().generation()
+    }
+
+    fn visit(&self, first: u64, count: usize, visit: &mut dyn FnMut(u64, &str)) {
+        let buffer = self.buffer();
+        let start = first.max(buffer.first_index());
+        let Ok(offset) = usize::try_from(start - buffer.first_index()) else {
+            return;
+        };
+        let lines = buffer.lines.iter().skip(offset).take(count);
+        for (index, line) in lines.enumerate() {
+            visit(start + index as u64, line);
+        }
     }
 }
 
@@ -297,6 +381,40 @@ mod tests {
         });
         assert_eq!(failed.error(), Some("no such container"));
         assert_eq!(failed.status(), "0 lines · log stopped");
+    }
+
+    fn visited(log: &SharedLog, first: u64, count: usize) -> Vec<(u64, String)> {
+        let mut seen = Vec::new();
+        log.visit(first, count, &mut |number, line| {
+            seen.push((number, line.to_string()));
+        });
+        seen
+    }
+
+    #[test]
+    fn a_shared_log_numbers_its_lines_for_good() {
+        let log = SharedLog::with_cap(3);
+        log.append(lines(&["a", "b", "c", "d", "e"]));
+        assert_eq!(log.bounds(), (2, 5));
+        assert_eq!(
+            visited(&log, 0, 10),
+            [(2, "c".into()), (3, "d".into()), (4, "e".into())]
+        );
+        assert_eq!(visited(&log, 3, 1), [(3, "d".into())]);
+        assert!(visited(&log, 9, 1).is_empty());
+    }
+
+    #[test]
+    fn every_clone_of_a_shared_log_is_the_same_buffer() {
+        let log = SharedLog::new();
+        let writer = log.clone();
+        let before = log.generation();
+        writer.append(lines(&["a"]));
+        writer.apply(LogMessage::Ended { error: None });
+        assert_ne!(log.generation(), before);
+        assert_eq!(log.bounds(), (0, 1));
+        assert!(log.read(LogBuffer::ended));
+        assert_eq!(log.read(LogBuffer::status), "1 line · log ended");
     }
 
     #[test]

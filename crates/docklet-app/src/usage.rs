@@ -34,6 +34,9 @@ pub enum MeterState {
     Measuring,
     /// There is no figure and waiting will not bring one; `detail` says why.
     Unknown,
+    /// There is no figure because nobody asked for it: Docker's disk usage
+    /// is only worked out on demand.
+    NotMeasured,
     /// Nothing to measure: the WSL VM is not running.
     Off,
 }
@@ -269,7 +272,7 @@ pub fn docker_data_meter(disk: &DiskReading) -> Meter {
         DiskReading::NotLoaded => {
             return Meter::new(
                 kind,
-                MeterState::Unknown,
+                MeterState::NotMeasured,
                 UNKNOWN,
                 "Not measured yet. Docker works it out when it is asked for.",
             );
@@ -356,6 +359,20 @@ impl UsageModel {
         match &self.disk {
             DiskReading::Loaded(usage) => Some(usage),
             _ => None,
+        }
+    }
+
+    /// True while Docker's disk usage is being worked out.
+    pub fn disk_is_loading(&self) -> bool {
+        self.disk == DiskReading::Loading
+    }
+
+    /// Forgets Docker's disk usage after something was removed: the figures
+    /// are from before, and they are only worked out again when asked for.
+    pub fn forget_disk(&mut self) {
+        if self.disk != DiskReading::NotLoaded {
+            self.disk = DiskReading::NotLoaded;
+            self.generation += 1;
         }
     }
 
@@ -609,7 +626,7 @@ mod tests {
     #[test]
     fn docker_data_is_unknown_until_it_is_asked_for() {
         let not_loaded = docker_data_meter(&DiskReading::NotLoaded);
-        assert_eq!(not_loaded.state, MeterState::Unknown);
+        assert_eq!(not_loaded.state, MeterState::NotMeasured);
         assert_eq!(not_loaded.value, UNKNOWN);
         let loading = docker_data_meter(&DiskReading::Loading);
         assert_eq!(loading.state, MeterState::Measuring);
@@ -678,7 +695,23 @@ mod tests {
         assert!(model.containers().is_none());
         assert!(model.disk().is_none());
         assert_eq!(model.meters()[0].state, MeterState::Off);
-        assert_eq!(model.meters()[4].state, MeterState::Unknown);
+        assert_eq!(model.meters()[4].state, MeterState::NotMeasured);
+    }
+
+    #[test]
+    fn disk_figures_from_before_a_removal_are_forgotten() {
+        let mut model = UsageModel::default();
+        model.disk_loading();
+        assert!(model.disk_is_loading());
+        model.set_disk(Ok(docker_disk()));
+        assert!(!model.disk_is_loading());
+        let before = model.generation();
+        model.forget_disk();
+        assert!(model.disk().is_none());
+        assert_eq!(model.generation(), before + 1);
+        // Nothing to forget: nothing changed.
+        model.forget_disk();
+        assert_eq!(model.generation(), before + 1);
     }
 
     #[test]

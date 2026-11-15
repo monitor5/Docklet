@@ -35,10 +35,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SIZE_MINIMIZED, SW_RESTORE, SW_SHOW, SW_SHOWMINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     ShowWindow, WA_INACTIVE, WINDOWPLACEMENT, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NOTIFY, WM_PAINT,
-    WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WS_CLIPCHILDREN,
-    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP,
+    WM_MOUSEWHEEL, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
+    WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -46,12 +46,13 @@ use crate::boundary::{Page, Tone, UiEvent};
 use crate::host::ctx;
 use crate::theme::{Fonts, Look, Theme, style_control, style_frame};
 use crate::widgets::banner::BannerBar;
+use crate::widgets::entry::EntryRow;
 use crate::widgets::filter::FilterBox;
+use crate::widgets::lines::LineKey;
 use crate::widgets::log_view::LogView;
 use crate::widgets::message::MessageScreen;
 use crate::widgets::selection_bar::SelectionBar;
 use crate::widgets::table::TableView;
-use crate::widgets::table_state::TableState;
 use crate::widgets::tabs::TabStrip;
 use crate::widgets::usage::UsageStrip;
 use crate::win::{
@@ -78,6 +79,10 @@ mod ids {
     pub const SECONDARY: usize = 111;
     pub const DETAIL: usize = 112;
     pub const USAGE: usize = 113;
+    pub const ENTRY_EDIT: usize = 114;
+    pub const ENTRY_BUTTON: usize = 115;
+    pub const COMMANDS: usize = 116;
+    pub const CHOICE: usize = 117;
 }
 
 const SS_RIGHT: u32 = 0x0002;
@@ -106,9 +111,18 @@ pub(crate) struct Shell {
     banner_rect: Cell<RECT>,
     usage: UsageStrip,
 
+    /// The line to type above the table, on tabs that have one.
+    entry: EntryRow,
+    has_entry: Cell<bool>,
     filter: FilterBox,
     bar: SelectionBar,
     table: TableView,
+    /// What each line of the list shows, to find the focused line again in
+    /// the next table.
+    keys: RefCell<Vec<LineKey>>,
+    /// A line whose box was clicked: told to screen readers when the table
+    /// that shows the change arrives.
+    announce: Cell<Option<LineKey>>,
 
     log_title: HWND,
     log_status: HWND,
@@ -119,8 +133,6 @@ pub(crate) struct Shell {
     message: MessageScreen,
 
     tab: Cell<usize>,
-    /// Filter, sort, checks and collapsed groups, per tab.
-    states: RefCell<Vec<TableState>>,
     /// The filter text is being set by code, so its change is not news.
     quiet_filter: Cell<bool>,
     log_open: Cell<bool>,
@@ -201,17 +213,26 @@ fn create() {
         banner: BannerBar::create(hwnd, ids::BANNER_DISMISS),
         banner_rect: Cell::new(RECT::default()),
         usage: UsageStrip::create(hwnd, USAGE_CLASS, ids::USAGE),
+        entry: EntryRow::create(hwnd, ids::ENTRY_EDIT, ids::ENTRY_BUTTON),
+        has_entry: Cell::new(false),
         filter: FilterBox::create(hwnd, ids::FILTER),
-        bar: SelectionBar::create(hwnd, ids::REMOVE, ids::CLEAR),
+        bar: SelectionBar::create(hwnd, ids::REMOVE, ids::CLEAR, ids::COMMANDS),
         table: TableView::create(hwnd, ids::LIST),
+        keys: RefCell::new(Vec::new()),
+        announce: Cell::new(None),
         log_title: static_text(SS_CENTERIMAGE | SS_ENDELLIPSIS),
         log_status: static_text(SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS),
         log_jump: button("Jump to end", ids::LOG_JUMP),
         log_close: button("Close", ids::LOG_CLOSE),
         log: LogView::create(hwnd, LOG_CLASS, ids::LOG),
-        message: MessageScreen::create(hwnd, ids::PRIMARY, ids::SECONDARY, ids::DETAIL),
+        message: MessageScreen::create(
+            hwnd,
+            ids::PRIMARY,
+            ids::SECONDARY,
+            ids::DETAIL,
+            ids::CHOICE,
+        ),
         tab: Cell::new(0),
-        states: RefCell::new(Vec::new()),
         quiet_filter: Cell::new(false),
         log_open: Cell::new(false),
         visible: Cell::new(false),
@@ -296,8 +317,10 @@ impl Shell {
         vec![
             self.header_button,
             self.banner.dismiss,
+            self.entry.button,
             self.bar.remove,
             self.bar.clear,
+            self.bar.commands,
             self.log_jump,
             self.log_close,
             self.message.primary,
@@ -315,6 +338,8 @@ impl Shell {
         style_control(api, self.table.list, Look::List, dark);
         style_control(api, self.table.header, Look::Header, dark);
         style_control(api, self.filter.edit, Look::Edit, dark);
+        style_control(api, self.entry.edit, Look::Edit, dark);
+        style_control(api, self.message.choice, Look::Edit, dark);
         style_control(api, self.log.hwnd, Look::Explorer, dark);
         style_control(api, self.message.detail, Look::Explorer, dark);
         for button in self.buttons() {
@@ -351,6 +376,9 @@ impl Shell {
             self.tabs.hwnd,
             self.status,
             self.banner.text,
+            self.entry.label,
+            self.entry.edit,
+            self.entry.status,
             self.filter.label,
             self.filter.edit,
             self.bar.summary,
@@ -358,6 +386,8 @@ impl Shell {
             self.log_title,
             self.log_status,
             self.message.body,
+            self.message.choice_label,
+            self.message.choice,
             self.message.detail,
         ];
         controls.extend(self.buttons());
@@ -385,7 +415,6 @@ impl Shell {
                 !model.tabs.is_empty(),
             )
         };
-        let checked = self.checked_count() > 0;
         show_window(self.tabs.hwnd, view != View::Message && has_tabs);
         show_window(self.status, true);
         show_window(self.header_button, has_header_button);
@@ -393,10 +422,11 @@ impl Shell {
         show_window(self.banner.dismiss, has_banner);
         show_window(self.usage.hwnd, has_usage);
         let tables = view == View::Tables;
+        self.entry.set_visible(tables && self.has_entry.get());
         for control in self.filter.controls() {
             show_window(control, tables);
         }
-        self.bar.set_visible(tables, checked);
+        self.bar.set_visible(tables, self.bar_buttons());
         show_window(self.table.list, tables);
         let log = view == View::Log;
         for control in [
@@ -502,7 +532,14 @@ impl Shell {
             y += px(40) + px(8);
         }
 
-        // Tables: the filter and the selection bar above the list.
+        // Tables: the line to type, if the tab has one, then the filter and
+        // the selection bar above the list. The log takes the same area and
+        // has no such line.
+        let top = y;
+        if self.has_entry.get() {
+            self.entry.layout(margin, width - margin, y, row, dpi);
+            y += row + px(8);
+        }
         let label = px(44);
         let filter_width = px(260);
         // A single-line edit does not centre its text, so it gets its own
@@ -517,14 +554,8 @@ impl Shell {
             edit_height,
         );
         let bar_left = margin + label + filter_width + px(12);
-        self.bar.layout(
-            bar_left,
-            width - margin,
-            y,
-            row,
-            dpi,
-            self.checked_count() > 0,
-        );
+        self.bar
+            .layout(bar_left, width - margin, y, row, dpi, self.bar_buttons());
         let body = y + row + px(8);
         place(
             self.table.list,
@@ -536,6 +567,8 @@ impl Shell {
         self.table.fit_columns(dpi);
 
         // Log: title, status and buttons above the view.
+        let y = top;
+        let body = y + row + px(8);
         let close = px(84);
         let jump = px(120);
         let log_status = px(260);
@@ -617,6 +650,7 @@ impl Shell {
         set_text(self.status, &header.status);
         if let Some(button) = &header.button {
             set_text(self.header_button, &button.label);
+            Shell::set_enabled(self.header_button, button.enabled);
         }
         self.apply_visibility();
         self.layout();
@@ -645,12 +679,19 @@ impl Shell {
     }
 
     fn on_command(&self, id: usize, code: u32) {
-        use windows::Win32::UI::WindowsAndMessaging::{BN_CLICKED, EN_CHANGE};
+        use windows::Win32::UI::WindowsAndMessaging::{BN_CLICKED, CBN_SELCHANGE, EN_CHANGE};
         let ctx = ctx();
         match id {
             ids::FILTER if code == EN_CHANGE => self.filter_changed(),
-            ids::REMOVE if code == BN_CLICKED => self.remove_checked(),
-            ids::CLEAR if code == BN_CLICKED => self.set_all_checked_off(),
+            ids::REMOVE if code == BN_CLICKED => self.remove_selected(),
+            ids::CLEAR if code == BN_CLICKED => self.clear_selection(),
+            ids::COMMANDS if code == BN_CLICKED => self.commands_menu(),
+            ids::ENTRY_BUTTON if code == BN_CLICKED => self.submit_entry(),
+            ids::CHOICE if code == CBN_SELCHANGE => {
+                if let Some(index) = self.message.chosen() {
+                    ctx.emit(UiEvent::ChoiceChanged { index });
+                }
+            }
             ids::LOG_JUMP if code == BN_CLICKED => self.jump_to_end(),
             ids::LOG_CLOSE if code == BN_CLICKED => self.close_log_by_user(),
             ids::HEADER_BUTTON if code == BN_CLICKED => {
@@ -675,12 +716,15 @@ impl Shell {
                     ctx.emit(UiEvent::Button { key });
                 }
             }
-            // Enter outside a button: from the filter it moves to the list,
-            // in the list it is the row's default action.
+            // Enter outside a button: in the line to type it submits, from
+            // the filter it moves to the list, in the list it is the row's
+            // default action.
             id if id == IDOK.0 as usize => {
                 // SAFETY: a plain focus query.
                 let focus = unsafe { GetFocus() };
-                if focus == self.filter.edit {
+                if focus == self.entry.edit {
+                    self.submit_entry();
+                } else if focus == self.filter.edit {
                     // SAFETY: the list is a child of this window.
                     unsafe {
                         let _ = SetFocus(Some(self.table.list));
@@ -700,8 +744,8 @@ impl Shell {
             self.close_log_by_user();
         } else if focus == self.filter.edit && !self.filter.text().is_empty() {
             self.filter.set("");
-        } else if self.checked_count() > 0 {
-            self.set_all_checked_off();
+        } else {
+            self.clear_selection();
         }
     }
 
@@ -724,11 +768,15 @@ impl Shell {
         let theme = self.theme();
         let (text, background, brush) = if control == self.banner.text {
             self.banner_colors(&theme)
-        } else if message == WM_CTLCOLOREDIT || control == self.message.detail {
+        } else if message == WM_CTLCOLOREDIT
+            || message == WM_CTLCOLORLISTBOX
+            || control == self.message.detail
+        {
             (theme.text, theme.surface, theme.surface_brush)
         } else if control == self.status
             || control == self.log_status
             || control == self.bar.summary
+            || control == self.entry.status
         {
             (theme.muted, theme.background, theme.background_brush)
         } else {
@@ -793,6 +841,7 @@ impl Shell {
         // the next WindowShown.
         let mut model = ctx.model.borrow_mut();
         model.tables = Vec::new();
+        model.entries = Vec::new();
         model.usage = Vec::new();
     }
 
@@ -914,7 +963,7 @@ unsafe extern "system" fn main_proc(
             shell.erase(HDC(wparam.0 as *mut c_void));
             return LRESULT(1);
         }
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
             return shell.on_ctl_color(
                 message,
                 HDC(wparam.0 as *mut c_void),
@@ -1035,6 +1084,11 @@ unsafe extern "system" fn usage_proc(
     };
     match message {
         WM_ERASEBKGND => LRESULT(1),
+        // A click asks what the meters mean, and why one has no figure.
+        WM_LBUTTONUP => {
+            ctx().emit(UiEvent::UsageClicked);
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             // SAFETY: the usual paint bracket for this window.

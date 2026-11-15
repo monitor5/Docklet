@@ -12,13 +12,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetClientRect, GetWindowTextLengthW, GetWindowTextW, HCURSOR, HMENU,
     IDC_ARROW, IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MoveWindow,
-    RegisterClassExW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow,
+    RegisterClassExW, SW_HIDE, SW_SHOWNA, SW_SHOWNORMAL, SendMessageW, SetWindowTextW, ShowWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDPROC, WS_CHILD,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, w};
 
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -217,6 +218,23 @@ pub fn copy_to_clipboard(owner: HWND, text: &[u16]) -> bool {
         }
         let _ = CloseClipboard();
         done
+    }
+}
+
+/// Opens `url` in the user's browser.
+pub fn open_url(url: &str) {
+    let url = wide(url);
+    // SAFETY: the strings are NUL-terminated and outlive the call, which
+    // hands the URL to the shell and returns.
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 

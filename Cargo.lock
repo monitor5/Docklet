@@ -896,6 +896,11 @@ dependencies = [
 name = "docklet-native"
 version = "0.1.0"
 dependencies = [
+ "docklet-app",
+ "docklet-core",
+ "docklet-engine",
+ "docklet-proxy",
+ "docklet-wsl",
  "windows",
 ]
 

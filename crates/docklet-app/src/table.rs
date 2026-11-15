@@ -8,7 +8,7 @@ use docklet_engine::{ContainerAction, ContainerUsage, DiskUsage, ResourceKind};
 
 use crate::format::{
     UNKNOWN, compose_project, container_name, format_bytes, format_date, format_percent,
-    image_label, is_running, published_ports, short_id, state_label,
+    image_label, is_running, natural_cmp, published_ports, short_id, state_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +154,7 @@ impl SortKey {
             (Self::Missing, _) => return Ordering::Greater,
             (_, Self::Missing) => return Ordering::Less,
             (Self::Number(a), Self::Number(b)) => a.total_cmp(b),
-            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+            (Self::Text(a), Self::Text(b)) => natural_cmp(a, b),
             (Self::Number(_), Self::Text(_)) => Ordering::Less,
             (Self::Text(_), Self::Number(_)) => Ordering::Greater,
         };
@@ -375,11 +375,10 @@ fn group_order(a: &Row, b: &Row) -> Ordering {
     }
 }
 
-/// Alphabetical whatever the case, with the exact text as tie-break.
+/// Alphabetical whatever the case and with numbers as numbers (`web-9`
+/// before `web-10`), with the exact text as tie-break.
 fn compare_names(a: &str, b: &str) -> Ordering {
-    a.to_lowercase()
-        .cmp(&b.to_lowercase())
-        .then_with(|| a.cmp(b))
+    natural_cmp(a, b).then_with(|| a.cmp(b))
 }
 
 /// The containers as a table: Compose projects first (by name), then
@@ -861,6 +860,21 @@ mod tests {
         assert_eq!(
             ordered(&table, sort(0, SortDirection::Ascending), ""),
             ["Alpha", "beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn numbers_in_names_sort_as_numbers() {
+        let names = ["web-10", "web-9", "web-1"];
+        let containers: Vec<_> = names
+            .iter()
+            .map(|name| container(name, None, true))
+            .collect();
+        let table = containers_table(&containers, None);
+        assert_eq!(self::names(&table), ["web-1", "web-9", "web-10"]);
+        assert_eq!(
+            ordered(&table, sort(0, SortDirection::Descending), ""),
+            ["web-10", "web-9", "web-1"]
         );
     }
 

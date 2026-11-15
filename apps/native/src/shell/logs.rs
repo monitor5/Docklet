@@ -1,10 +1,11 @@
 //! The log page: opening and closing the view, its frame timer, its status
 //! line, and the view's window procedure.
 //!
-//! The view repaints on a timer, at most 20 times a second however fast
-//! lines arrive, and only when the source's generation moved. The timer runs
-//! only while the log is open and the window is shown and not minimised.
+//! The view repaints on a timer, about 12 times a second however fast lines
+//! arrive, and only when the lines on screen changed. The timer runs only
+//! while the log is open and the window is shown and not minimised.
 
+use docklet_app::format::format_count;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -28,24 +29,20 @@ use crate::host::ctx;
 use crate::win::{control_down, high_word, low_word, point_of, set_text, shift_down, text_of};
 
 pub(super) const LOG_TIMER: usize = 1;
-/// The view repaints at most this often, however fast lines arrive.
-const FRAME_MS: u32 = 50;
+/// The view repaints at most this often, however fast lines arrive. Drawing
+/// a page of text is nearly all a frame costs (2.6 ms measured for a page of
+/// coloured lines with Hangul, 1.3 ms for ASCII), so the rate is what the
+/// log costs: at 80 ms a log of 10,000 lines a second stays readable as it
+/// scrolls and takes about 3% of one core.
+const FRAME_MS: u32 = 80;
 /// The status line is text in a control; it changes every this many frames.
 const STATUS_EVERY: u32 = 5;
 /// Characters one sideways step moves.
 const SHIFT_STEP: i32 = 8;
 
 /// `12345` as `12,345`.
-pub fn thousands(number: u64) -> String {
-    let digits = number.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
+fn thousands(number: u64) -> String {
+    format_count(usize::try_from(number).unwrap_or(usize::MAX))
 }
 
 /// The status line: count, follow state, lines below a paused view, and the
@@ -133,21 +130,26 @@ impl Shell {
             if wanted {
                 SetTimer(Some(self.hwnd), LOG_TIMER, FRAME_MS, None);
                 // Catch up at once on what came while hidden.
-                if self.log.poll() {
-                    self.log.sync_scrollbar();
-                    crate::win::invalidate(self.log.hwnd);
-                }
+                self.log_frame();
             } else {
                 let _ = KillTimer(Some(self.hwnd), LOG_TIMER);
             }
         }
     }
 
-    pub(super) fn on_log_timer(&self) {
-        if self.log.poll() {
-            self.log.sync_scrollbar();
+    /// Takes in what the source has that the view has not seen. Repaints
+    /// only if that changed the lines on screen: a view that does not
+    /// follow stays as it is while lines pile up below it.
+    fn log_frame(&self) {
+        let changed = self.log.poll();
+        self.log.sync_scrollbar();
+        if changed {
             crate::win::invalidate(self.log.hwnd);
         }
+    }
+
+    pub(super) fn on_log_timer(&self) {
+        self.log_frame();
         let ticks = self.ticks.get().wrapping_add(1);
         self.ticks.set(ticks);
         if ticks.is_multiple_of(STATUS_EVERY) {
@@ -380,15 +382,6 @@ pub(super) unsafe extern "system" fn log_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn thousands_are_separated() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(1000), "1,000");
-        assert_eq!(thousands(50_000), "50,000");
-        assert_eq!(thousands(1_234_567), "1,234,567");
-    }
 
     #[test]
     fn the_status_line_says_how_many_and_whether_it_follows() {

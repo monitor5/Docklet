@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::backend::Backend;
 use crate::control::{EngineHost, EngineStatus, SystemHost, Transition};
+use crate::logs::SharedLog;
 use crate::policy::{
     EVENT_DEBOUNCE, WindowState, next_poll_delay, reloads_lists, repolls_status, sampling,
     uses_docker_api,
@@ -229,7 +230,8 @@ impl App {
     /// (`Gone`).
     ///
     /// The engine state is polled only while the window is visible, and
-    /// once when it becomes visible. `Hidden` ends the usage sampling;
+    /// once when it becomes visible; what was known before that is
+    /// forgotten until the poll answers. `Hidden` ends the usage sampling;
     /// `Gone` also ends the event subscription and every followed log.
     /// Saying the same state again does nothing, so it can be called from
     /// every message that might have changed it.
@@ -242,6 +244,13 @@ impl App {
             shared.window = window;
             if window == WindowState::Gone {
                 shared.list = None;
+            }
+            if window == WindowState::Visible {
+                // Nobody looked while the window was away, and the engine
+                // may have gone to sleep since. Until the poll below has
+                // answered, nothing is asked of Docker: a request made on
+                // what was true before would wake it.
+                shared.state = None;
             }
         }
         self.inner.backend.streams().set_window(window);
@@ -414,11 +423,36 @@ impl App {
     /// messages with the returned token follow; the last one is `Ended`,
     /// unless the log is stopped from here.
     pub fn follow_logs(&self, id: String) -> u32 {
+        self.follow(id, |sink, token, message| {
+            sink.post(Message::Log { token, message });
+        })
+    }
+
+    /// Follows a container's logs into `log`, starting with its last 500
+    /// lines. The lines go into the buffer on the thread that reads them
+    /// and never through the sink: a view polls the buffer's generation.
+    /// Only the end arrives as a message, `Log` with `Ended` and the
+    /// returned token, unless the log is stopped from here.
+    pub fn follow_logs_into(&self, id: String, log: SharedLog) -> u32 {
+        self.follow(id, move |sink, token, message| match message {
+            LogMessage::Lines(lines) => log.append(lines),
+            LogMessage::Ended { .. } => {
+                log.apply(message.clone());
+                sink.post(Message::Log { token, message });
+            }
+        })
+    }
+
+    fn follow(
+        &self,
+        id: String,
+        mut deliver: impl FnMut(&dyn Sink, u32, LogMessage) + Send + 'static,
+    ) -> u32 {
         let streams = self.inner.backend.streams();
         let token = streams.log_token();
         let sink = self.inner.sink.clone();
-        let output = move |message: LogMessage| {
-            sink.post(Message::Log { token, message });
+        let mut output = move |message: LogMessage| {
+            deliver(sink.as_ref(), token, message);
             ControlFlow::Continue(())
         };
         match self.inner.client() {
@@ -814,6 +848,45 @@ mod tests {
         harness.app.reload(ResourceKind::Image);
         assert!(harness.nothing_arrives());
         assert_eq!(harness.host.calls(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn what_was_known_before_the_window_came_back_is_not_acted_on() {
+        let harness = harness(EngineState::Running, ProxyMode::Plain);
+        harness.app.refresh_status();
+        assert_eq!(harness.status(), EngineState::Running);
+        // The engine goes to sleep while nobody looks.
+        *harness.host.state.lock().unwrap() = EngineState::Stopped;
+        *harness.host.proxy.lock().unwrap() = ProxyMode::IdleStop;
+        harness.app.set_window(WindowState::Visible);
+        // Asked before the poll has answered: turned away, whatever the
+        // last poll said. Had the poll answered first, it said `Sleeping`.
+        harness.app.load_disk_usage();
+        let mut refused = false;
+        let mut asleep = false;
+        for _ in 0..2 {
+            match harness.next() {
+                Message::DiskUsage(result) => refused = result == Err(NOT_RUNNING.to_string()),
+                Message::Status(Ok(status)) => asleep = status.state == EngineState::Sleeping,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(refused && asleep);
+    }
+
+    #[test]
+    fn the_end_of_a_log_followed_into_a_buffer_is_said_in_both_places() {
+        let harness = asleep();
+        let log = SharedLog::new();
+        let token = harness.app.follow_logs_into("abc".to_string(), log.clone());
+        let error = Some(NOT_RUNNING.to_string());
+        let message = LogMessage::Ended { error };
+        assert_eq!(harness.next(), Message::Log { token, message });
+        assert!(log.read(|buffer| buffer.ended()));
+        assert_eq!(
+            log.read(|buffer| buffer.error().map(str::to_string)),
+            Some(NOT_RUNNING.to_string())
+        );
     }
 
     #[test]

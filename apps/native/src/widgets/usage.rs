@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Gdi::{
     SetDCPenColor, SetTextColor, TRANSPARENT,
 };
 
-use crate::boundary::{Meter, MeterValue};
+use crate::boundary::Meter;
 use crate::theme::{Fonts, Theme};
 use crate::win::{Dpi, child, set_text};
 
@@ -44,13 +44,17 @@ pub fn fill_width(fill: f32, width: i32) -> i32 {
     (fill * width as f32).round() as i32
 }
 
-/// The strip read aloud: "Memory 2.1 of 8 GB, CPU 12%, GPU unknown (reason)".
+/// The strip read aloud: "Memory 2.1 GB, CPU 12%, GPU Unknown (reason)".
+/// A meter without a figure says why.
 pub fn spoken(meters: &[Meter]) -> String {
     meters
         .iter()
-        .map(|meter| match &meter.value {
-            MeterValue::Known { text, .. } => format!("{} {text}", meter.label),
-            MeterValue::Unknown { reason } => format!("{} unknown ({reason})", meter.label),
+        .map(|meter| {
+            if meter.known || meter.detail.is_empty() {
+                format!("{} {}", meter.label, meter.text)
+            } else {
+                format!("{} {} ({})", meter.label, meter.text, meter.detail)
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -109,11 +113,9 @@ impl UsageStrip {
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
 
-                let (value, fill, known) = match &meter.value {
-                    MeterValue::Known { text, fill } => (text.as_str(), *fill, true),
-                    MeterValue::Unknown { reason } => (reason.as_str(), 0.0, false),
-                };
-                let mut value: Vec<u16> = value.encode_utf16().collect();
+                let known = meter.known;
+                let fill = meter.fill.unwrap_or(0.0);
+                let mut value: Vec<u16> = meter.text.encode_utf16().collect();
                 // The value takes what the label leaves, ellipsised.
                 let mut value_rect = RECT {
                     left: left + width / 3,
@@ -190,21 +192,19 @@ mod tests {
         let meters = [
             Meter {
                 label: "Memory".into(),
-                value: MeterValue::Known {
-                    text: "2.1 of 8 GB".into(),
-                    fill: 0.26,
-                },
+                text: "2.1 GB".into(),
+                fill: None,
+                known: true,
+                detail: "Memory of the WSL VM.".into(),
             },
             Meter {
                 label: "GPU".into(),
-                value: MeterValue::Unknown {
-                    reason: "no counters".into(),
-                },
+                text: "Unknown".into(),
+                fill: None,
+                known: false,
+                detail: "no counters".into(),
             },
         ];
-        assert_eq!(
-            spoken(&meters),
-            "Memory 2.1 of 8 GB, GPU unknown (no counters)"
-        );
+        assert_eq!(spoken(&meters), "Memory 2.1 GB, GPU Unknown (no counters)");
     }
 }

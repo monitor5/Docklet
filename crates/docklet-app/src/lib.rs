@@ -19,6 +19,11 @@
 //! - [`logs`]: the bounded log buffer; [`pull`]: the pull box.
 //! - [`policy`]: when the engine is polled and sampled, and when it must
 //!   not be touched.
+//! - [`view`]: the plain data a window draws and the events it reports;
+//!   [`present`] puts the models into that form.
+//! - [`controller`]: the models, the window and the engine together. A
+//!   window that sends its events there and draws what comes back is the
+//!   whole application; it keeps no state of its own about the lists.
 //!
 //! **Services**, which do the I/O off the UI thread:
 //!
@@ -50,10 +55,12 @@
 pub mod app;
 pub mod backend;
 pub mod control;
+pub mod controller;
 pub mod format;
 pub mod list;
 pub mod logs;
 pub mod policy;
+pub mod present;
 pub mod pull;
 pub mod removal;
 pub mod screen;
@@ -61,14 +68,16 @@ pub mod selection;
 pub mod streams;
 pub mod table;
 pub mod usage;
+pub mod view;
 
 pub use app::{App, List, Message, Sink};
 pub use backend::Backend;
 pub use control::{
     EngineControl, EngineHost, EngineStatus, Supervisor, SystemHost, Transition, reachable,
 };
+pub use controller::{Controller, Engine, Ui};
 pub use list::{Item, ListModel};
-pub use logs::{LOG_BUFFER_CAP, LogBuffer, strip_ansi};
+pub use logs::{LOG_BUFFER_CAP, LogBuffer, LogSource, SharedLog, strip_ansi};
 pub use policy::WindowState;
 pub use pull::PullProgress;
 pub use removal::{PruneTarget, RemovalPlan, prune_summary, removal_summary};

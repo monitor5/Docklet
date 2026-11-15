@@ -1,9 +1,14 @@
 //! The tables page: the tab strip, the filter, the list and its checkboxes,
-//! row buttons, context menu and the selection bar.
+//! row buttons, context menu, the selection bar and the line to type above
+//! a table.
+//!
+//! The page keeps no state of the lists. Which rows show, in which order and
+//! which are ticked comes with every [`Table`]; a click on a box, a header or
+//! a group is reported as an event, and the answer is the next table.
 
 use std::fmt::Write as _;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, SelectObject, SetTextColor};
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT,
@@ -19,18 +24,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DLGC_WANTALLKEYS, DestroyMenu, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CHAR, WM_GETDLGCODE, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY, WM_NOTIFY,
+    AppendMenuW, CreatePopupMenu, DLGC_WANTALLKEYS, DestroyMenu, GetWindowRect, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CHAR,
+    WM_GETDLGCODE, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY, WM_NOTIFY,
 };
 use windows::core::PCWSTR;
 
 use super::{Shell, ids};
-use crate::boundary::{ActionKind, RowFlags, SortBy, Table, UiEvent};
+use crate::boundary::{Line, RowFlags, Table, UiEvent};
 use crate::host::ctx;
-use crate::widgets::selection_bar::summary;
+use crate::widgets::lines::{self, LineKey};
+use crate::widgets::selection_bar::BarButtons;
 use crate::widgets::table::TableView;
-use crate::widgets::table_state::{Entry, EntryKey, TableState};
 use crate::win::{
     control_down, copy_to_clipboard, is_visible, point_of, shift_down, to_client, wide,
 };
@@ -64,57 +69,60 @@ impl Drop for TextSink<'_> {
     }
 }
 
-const MENU_COPY: usize = 200;
-const MENU_REMOVE_CHECKED: usize = 201;
-const MENU_CLEAR_CHECKED: usize = 202;
-const MENU_TOGGLE_GROUP: usize = 203;
-const MENU_CHECK_GROUP: usize = 204;
+/// What an item of a popup menu does when it is chosen.
+enum Chosen {
+    Nothing,
+    Event(UiEvent),
+    /// Puts this text on the clipboard.
+    Copy(String),
+}
 
-impl Shell {
-    fn ensure_state(&self, tab: usize) {
-        let mut states = self.states.borrow_mut();
-        if states.len() <= tab {
-            states.resize_with(tab + 1, TableState::default);
+struct MenuItem {
+    label: String,
+    enabled: bool,
+    chosen: Chosen,
+}
+
+impl MenuItem {
+    fn new(label: impl Into<String>, enabled: bool, chosen: Chosen) -> Self {
+        Self {
+            label: label.into(),
+            enabled,
+            chosen,
         }
     }
 
-    /// What line `index` of the current tab shows, in terms that survive
-    /// new data.
-    fn key_at(&self, index: usize) -> Option<EntryKey> {
-        let states = self.states.borrow();
-        states.get(self.tab.get())?.key_at(index).cloned()
+    fn separator() -> Self {
+        Self::new("", false, Chosen::Nothing)
     }
+}
 
-    /// The line that shows `key` now.
-    fn index_of_key(&self, key: &EntryKey) -> Option<usize> {
-        self.states.borrow().get(self.tab.get())?.index_of(key)
-    }
-
-    pub(super) fn checked_count(&self) -> usize {
-        self.states
-            .borrow()
-            .get(self.tab.get())
-            .map_or(0, TableState::checked_count)
-    }
-
-    /// Runs `read` on the current table and its state, if both exist and
-    /// the state was built from a table of this shape. A state a step behind
-    /// its table is never used to index it.
-    fn with_table<T>(&self, read: impl FnOnce(&Table, &TableState) -> T) -> Option<T> {
+impl Shell {
+    /// Runs `read` on the current tab's table, if it has arrived.
+    fn with_table<T>(&self, read: impl FnOnce(&Table) -> T) -> Option<T> {
         let model = ctx().model.borrow();
-        let states = self.states.borrow();
-        let tab = self.tab.get();
-        let (table, state) = (model.tables.get(tab)?, states.get(tab)?);
-        state.fits(table).then(|| read(table, state))
+        model.tables.get(self.tab.get()).map(read)
     }
 
-    /// Changes the current table's state, on the same terms as `with_table`.
-    fn change_table<T>(&self, change: impl FnOnce(&Table, &mut TableState) -> T) -> Option<T> {
-        let tab = self.tab.get();
-        let model = ctx().model.borrow();
-        let mut states = self.states.borrow_mut();
-        let (table, state) = (model.tables.get(tab)?, states.get_mut(tab)?);
-        state.fits(table).then(|| change(table, state))
+    /// What line `index` of the list shows, in terms that survive new data.
+    fn key_at(&self, index: usize) -> Option<LineKey> {
+        self.keys.borrow().get(index).cloned()
+    }
+
+    pub(super) fn selected_count(&self) -> usize {
+        self.with_table(|table| table.selected).unwrap_or(0)
+    }
+
+    /// Which buttons the bar shows for the current table.
+    pub(super) fn bar_buttons(&self) -> BarButtons {
+        let buttons = self.with_table(|table| BarButtons {
+            selection: table.selected > 0,
+            commands: !table.commands.is_empty(),
+        });
+        buttons.unwrap_or(BarButtons {
+            selection: false,
+            commands: false,
+        })
     }
 
     pub(crate) fn tabs_changed(&self) {
@@ -135,64 +143,61 @@ impl Shell {
         }
     }
 
-    /// Recomputes the current tab's lines from the model and shows them,
-    /// keeping the focused line and the checks of rows that are still there.
+    /// Shows the current tab's table as it is in the model now, keeping the
+    /// focus on the line it was on if that line is still there.
     pub(super) fn rebuild_table(&self) {
         let ctx = ctx();
         let tab = self.tab.get();
-        self.ensure_state(tab);
         let focus = self.table.focused().and_then(|index| self.key_at(index));
         let model = ctx.model.borrow();
         let empty = Table::default();
         let table = model.tables.get(tab).unwrap_or(&empty);
-        let (changed, count, header, sort, checked, matching) = {
-            let mut states = self.states.borrow_mut();
-            let state = &mut states[tab];
-            let changed = state.rebuild(table);
-            (
-                changed,
-                state.entries().len(),
-                state.header_state(table),
-                state.sort(),
-                state.checked_count(),
-                state.matching(),
-            )
-        };
+        let keys = lines::keys(&table.lines);
+        let count = keys.len();
+        let position = |key: &LineKey| keys.iter().position(|candidate| candidate == key);
+        let focused = focus.as_ref().and_then(position);
+        let announce = self.announce.take().as_ref().and_then(position);
         // Sending to the list comes back as notifications that read the
-        // model and the state, so neither is borrowed mutably from here on.
+        // model and the keys, so neither is borrowed mutably from here on.
+        self.keys.replace(keys);
         let dpi = self.dpi.get();
         self.table.build_columns(table, dpi, self.fonts().ui);
         self.table.set_count(count);
         // After the count: a vertical scroll bar may have come or gone.
         self.table.fit_columns(dpi);
-        match focus.and_then(|key| self.index_of_key(&key)) {
+        match focused {
             Some(index) => self.table.focus_item(index, false),
             None if count > 0 && self.table.focused().is_none_or(|focused| focused >= count) => {
                 self.table.focus_item(0, false);
             }
             None => {}
         }
-        self.table.update_header(header, sort);
-        let text = if table.columns.is_empty() {
-            "Loading…".to_string()
-        } else if table.rows.is_empty() && !table.empty_text.is_empty() {
-            table.empty_text.clone()
+        self.table.update_header(table.select_all, table.sort);
+        // Before the first table of a tab there is nothing to count.
+        let summary = if table.columns.is_empty() {
+            "Loading…"
         } else {
-            summary(checked, matching, table.rows.len(), &table.noun)
+            table.summary.as_str()
         };
-        self.bar.set(&text);
-        let ids = changed.then(|| self.states.borrow()[tab].checked_ids(table));
+        self.bar.set(summary);
         drop(model);
         self.sync_bar();
-        if let Some(ids) = ids {
-            ctx.emit(UiEvent::SelectionChanged { tab, ids });
+        if let Some(index) = announce {
+            self.table.announce_state(index);
         }
     }
 
-    /// Shows the Remove and Clear buttons exactly while rows are checked.
+    /// Shows the bar's buttons exactly while they apply.
     fn sync_bar(&self) {
-        let checked = self.checked_count() > 0;
-        if checked != is_visible(self.bar.remove) && is_visible(self.bar.summary) {
+        if !is_visible(self.bar.summary) {
+            return;
+        }
+        let wanted = self.bar_buttons();
+        let shown = BarButtons {
+            selection: is_visible(self.bar.remove),
+            commands: is_visible(self.bar.commands),
+        };
+        if wanted != shown {
             self.apply_visibility();
             self.layout();
         }
@@ -205,11 +210,10 @@ impl Shell {
             self.close_log();
         }
         self.tab.set(tab);
-        self.ensure_state(tab);
-        let filter = self.states.borrow()[tab].filter().to_string();
-        self.quiet_filter.set(true);
-        self.filter.set(&filter);
-        self.quiet_filter.set(false);
+        // The filter of the tab arrives with the answer to the event below;
+        // until then the box is empty rather than the other tab's.
+        self.set_filter(tab, "");
+        self.show_entry(None);
         self.rebuild_table();
         crate::win::send(self.table.list, LVM_ENSUREVISIBLE, 0, 0);
         self.apply_visibility();
@@ -217,112 +221,126 @@ impl Shell {
         ctx.emit(UiEvent::TabChanged { tab });
     }
 
+    /// Puts `text` into the filter box of `tab`, without reporting it as
+    /// typed.
+    pub(crate) fn set_filter(&self, tab: usize, text: &str) {
+        if tab != self.tab.get() || self.filter.text() == text {
+            return;
+        }
+        self.quiet_filter.set(true);
+        self.filter.set(text);
+        self.quiet_filter.set(false);
+    }
+
     pub(super) fn filter_changed(&self) {
         if self.quiet_filter.get() {
             return;
         }
         let text = self.filter.text();
-        let tab = self.tab.get();
-        self.ensure_state(tab);
-        self.states.borrow_mut()[tab].set_filter(&text);
-        self.rebuild_table();
-        ctx().emit(UiEvent::FilterChanged { tab, text });
-    }
-
-    /// After checks changed: repaint, header checkbox, bar, event.
-    fn checks_changed(&self) {
-        let tab = self.tab.get();
-        let Some((ids, header, sort, checked, matching, total, noun)) =
-            self.with_table(|table, state| {
-                (
-                    state.checked_ids(table),
-                    state.header_state(table),
-                    state.sort(),
-                    state.checked_count(),
-                    state.matching(),
-                    table.rows.len(),
-                    table.noun.clone(),
-                )
-            })
-        else {
-            return;
-        };
-        self.table.redraw_all();
-        self.table.update_header(header, sort);
-        self.bar.set(&summary(checked, matching, total, &noun));
-        self.sync_bar();
-        ctx().emit(UiEvent::SelectionChanged { tab, ids });
-    }
-
-    fn toggle_at(&self, index: usize, range: bool) {
-        let changed = self.change_table(|table, state| {
-            if range {
-                state.check_range(table, index)
-            } else {
-                state.toggle(table, index)
-            }
+        ctx().emit(UiEvent::FilterChanged {
+            tab: self.tab.get(),
+            text,
         });
-        if changed == Some(true) {
-            self.checks_changed();
-            self.table.announce_state(index);
-        }
     }
 
-    fn toggle_all(&self) {
-        if self.change_table(|table, state| state.toggle_all(table)) == Some(true) {
-            self.checks_changed();
-        }
-    }
-
-    pub(super) fn set_all_checked_off(&self) {
-        if self.change_table(|_, state| state.clear()) == Some(true) {
-            self.checks_changed();
-        }
-    }
-
-    pub(crate) fn clear_selection(&self, tab: usize) {
+    /// The line to type of `tab` changed. `text` replaces what is typed.
+    pub(crate) fn entry_changed(&self, tab: usize, text: Option<&str>) {
         if tab == self.tab.get() {
-            self.set_all_checked_off();
-        } else if let Some(state) = self.states.borrow_mut().get_mut(tab) {
-            state.clear();
+            self.show_entry(text);
         }
     }
 
-    pub(super) fn remove_checked(&self) {
-        let ids = self
-            .with_table(|table, state| state.checked_ids(table))
-            .unwrap_or_default();
-        if !ids.is_empty() {
-            ctx().emit(UiEvent::RemoveRequested {
+    /// Makes the entry row show the current tab's entry, or hides it.
+    fn show_entry(&self, text: Option<&str>) {
+        let entry = {
+            let model = ctx().model.borrow();
+            model.entries.get(self.tab.get()).cloned().flatten()
+        };
+        let had = self.has_entry.replace(entry.is_some());
+        if let Some(mut entry) = entry {
+            entry.text = text.map(str::to_string);
+            self.entry.set(&entry);
+        }
+        if had != self.has_entry.get() {
+            self.apply_visibility();
+            self.layout();
+        }
+    }
+
+    /// The entry's button, or Enter in its box.
+    pub(super) fn submit_entry(&self) {
+        if self.has_entry.get() {
+            ctx().emit(UiEvent::Submitted {
                 tab: self.tab.get(),
-                ids,
+                text: self.entry.text(),
             });
         }
     }
 
-    /// Delete: the checked rows, or else the focused row if it can be removed.
+    /// A click on a line's box, or Space on the line.
+    fn toggle_at(&self, index: usize, range: bool) {
+        let tab = self.tab.get();
+        let event = self.with_table(|table| match table.lines.get(index)? {
+            Line::Row(row) => row.check.map(|_| UiEvent::RowToggled {
+                tab,
+                id: row.id.clone(),
+                range,
+            }),
+            Line::Group { name, check, .. } => check.map(|_| UiEvent::GroupToggled {
+                tab,
+                name: name.clone(),
+            }),
+        });
+        if let Some(event) = event.flatten() {
+            // Told to screen readers once the table that shows it is here.
+            self.announce.set(self.key_at(index));
+            ctx().emit(event);
+        }
+    }
+
+    fn toggle_all(&self) {
+        ctx().emit(UiEvent::AllToggled {
+            tab: self.tab.get(),
+        });
+    }
+
+    pub(super) fn clear_selection(&self) {
+        if self.selected_count() > 0 {
+            ctx().emit(UiEvent::SelectionCleared {
+                tab: self.tab.get(),
+            });
+        }
+    }
+
+    pub(super) fn remove_selected(&self) {
+        if self.selected_count() > 0 {
+            ctx().emit(UiEvent::RemoveRequested {
+                tab: self.tab.get(),
+                id: None,
+            });
+        }
+    }
+
+    /// Delete: the selected rows, or else the focused row if it can be
+    /// removed.
     fn remove_key(&self) {
-        if self.checked_count() > 0 {
-            self.remove_checked();
+        if self.selected_count() > 0 {
+            self.remove_selected();
             return;
         }
-        let Some(index) = self.table.focused() else {
-            return;
-        };
-        let action = self
-            .with_table(|table, state| {
-                let Some(Entry::Row(row)) = state.entry(index) else {
-                    return None;
-                };
-                table
-                    .actions
-                    .iter()
-                    .position(|action| action.kind == ActionKind::Remove)
-                    .filter(|&action| table.rows[row].action_enabled(action))
+        let focused = self.table.focused();
+        let id = focused.and_then(|index| {
+            self.with_table(|table| {
+                let row = lines::row_at(table, index)?;
+                row.check.map(|_| row.id.clone())
             })
-            .flatten();
-        if let Some(action) = action {
-            self.run_action(index, action);
+            .flatten()
+        });
+        if let Some(id) = id {
+            ctx().emit(UiEvent::RemoveRequested {
+                tab: self.tab.get(),
+                id: Some(id),
+            });
         }
     }
 
@@ -330,25 +348,13 @@ impl Shell {
     fn run_action(&self, index: usize, action: usize) {
         let tab = self.tab.get();
         let event = self
-            .with_table(|table, state| {
-                let Some(Entry::Row(row)) = state.entry(index) else {
-                    return None;
-                };
-                let row = &table.rows[row];
+            .with_table(|table| {
+                let row = lines::row_at(table, index)?;
                 let spec = table.actions.get(action)?;
-                if !row.action_enabled(action) {
-                    return None;
-                }
-                Some(match spec.kind {
-                    ActionKind::Remove => UiEvent::RemoveRequested {
-                        tab,
-                        ids: vec![row.id.clone()],
-                    },
-                    ActionKind::Plain => UiEvent::RowAction {
-                        tab,
-                        id: row.id.clone(),
-                        action: spec.key.clone(),
-                    },
+                row.action_enabled(action).then(|| UiEvent::RowAction {
+                    tab,
+                    id: row.id.clone(),
+                    action: spec.key.clone(),
                 })
             })
             .flatten();
@@ -360,63 +366,61 @@ impl Shell {
     /// Enter or a double click: a group opens or closes, a row runs its
     /// default action.
     fn activate(&self, index: usize) {
-        let target = self.with_table(|table, state| match state.entry(index) {
-            Some(Entry::Group(group)) => Some(Err((group, !state.is_collapsed(group)))),
-            Some(Entry::Row(_)) => table.default_action.map(Ok),
-            None => None,
+        let tab = self.tab.get();
+        let target = self.with_table(|table| match table.lines.get(index)? {
+            Line::Group { name, .. } => Some(Err(name.clone())),
+            Line::Row(_) => table.default_action.map(Ok),
         });
         match target.flatten() {
             Some(Ok(action)) => self.run_action(index, action),
-            Some(Err((group, collapse))) => self.set_collapsed(group, collapse),
+            Some(Err(name)) => ctx().emit(UiEvent::GroupFolded { tab, name }),
             None => {}
         }
     }
 
-    fn set_collapsed(&self, group: u32, collapsed: bool) {
+    /// Left and Right on a group header: collapses and expands it.
+    fn fold_key(&self, index: usize, collapse: bool) -> bool {
         let tab = self.tab.get();
-        self.ensure_state(tab);
-        self.states.borrow_mut()[tab].set_collapsed(group, collapsed);
-        self.rebuild_table();
-        let index = self.states.borrow()[tab].index_of_group(group);
-        if let Some(index) = index {
-            self.table.focus_item(index, true);
+        let group = self.with_table(|table| match table.lines.get(index)? {
+            Line::Group {
+                name, collapsed, ..
+            } => Some((name.clone(), *collapsed)),
+            Line::Row(_) => None,
+        });
+        let Some((name, collapsed)) = group.flatten() else {
+            return false;
+        };
+        if collapsed != collapse {
+            ctx().emit(UiEvent::GroupFolded { tab, name });
         }
+        true
     }
 
     fn sort_column(&self, column: usize) {
-        let sortable = self
-            .with_table(|table, _| {
-                table
-                    .columns
-                    .get(column)
-                    .is_some_and(|column| column.sort != SortBy::Unsorted)
-            })
-            .unwrap_or(false);
-        if !sortable {
-            return;
-        }
-        let tab = self.tab.get();
-        let sort = self.states.borrow_mut()[tab].sort_by(column);
-        self.rebuild_table();
-        ctx().emit(UiEvent::SortChanged {
-            tab,
-            column,
-            ascending: sort.ascending,
+        let sortable = self.with_table(|table| {
+            let column = table.columns.get(column);
+            column.is_some_and(|column| column.sortable)
         });
+        if sortable == Some(true) {
+            ctx().emit(UiEvent::SortRequested {
+                tab: self.tab.get(),
+                column,
+            });
+        }
     }
 
-    fn copy_row(&self, index: usize) {
-        let text = self
-            .with_table(|table, state| match state.entry(index) {
-                Some(Entry::Row(row)) => Some(table.rows[row].cells.join("\t")),
-                Some(Entry::Group(group)) => table.groups.get(group as usize).cloned(),
-                None => None,
-            })
-            .flatten();
-        if let Some(text) = text {
-            let units: Vec<u16> = text.encode_utf16().collect();
-            copy_to_clipboard(self.hwnd, &units);
-        }
+    /// The text of line `index` for the clipboard.
+    fn row_text(&self, index: usize) -> Option<String> {
+        self.with_table(|table| match table.lines.get(index)? {
+            Line::Row(row) => Some(row.cells.join("\t")),
+            Line::Group { name, .. } => Some(name.clone()),
+        })
+        .flatten()
+    }
+
+    fn copy(&self, text: &str) {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        copy_to_clipboard(self.hwnd, &units);
     }
 
     pub(super) fn on_notify(&self, lparam: LPARAM) -> LRESULT {
@@ -472,8 +476,8 @@ impl Shell {
         let column = item.iSubItem.max(0) as usize;
         let indent = self.dpi.get().px(18);
         let actions_column = self.table.actions_column();
-        self.with_table(|table, state| {
-            let Some(entry) = state.entry(index) else {
+        self.with_table(|table| {
+            let Some(line) = table.lines.get(index) else {
                 return;
             };
             if item.mask.contains(LVIF_TEXT) && item.cchTextMax > 0 && !item.pszText.is_null() {
@@ -482,38 +486,36 @@ impl Shell {
                     std::slice::from_raw_parts_mut(item.pszText.0, item.cchTextMax as usize)
                 };
                 let mut sink = TextSink { buffer, length: 0 };
-                match entry {
-                    Entry::Row(row) if Some(column) == actions_column => {
+                match line {
+                    Line::Row(row) if Some(column) == actions_column => {
                         // Read aloud as the row's last cell; the context
                         // menu is the way to reach them from the keyboard.
-                        let row = &table.rows[row];
                         let mut first = true;
-                        for (action, spec) in table.actions.iter().enumerate() {
+                        for action in lines::button_actions(table) {
                             if row.action_enabled(action) {
-                                let _ =
-                                    write!(sink, "{}{}", if first { "" } else { ", " }, spec.label);
+                                let label = &table.actions[action].label;
+                                let _ = write!(sink, "{}{label}", if first { "" } else { ", " });
                                 first = false;
                             }
                         }
                     }
-                    Entry::Row(row) => {
-                        let text = table.rows[row].cells.get(column).map_or("", String::as_str);
+                    Line::Row(row) => {
+                        let text = row.cells.get(column).map_or("", String::as_str);
                         let _ = sink.write_str(text);
                     }
-                    Entry::Group(group) if column == 0 => {
-                        let arrow = if state.is_collapsed(group) {
-                            '▸'
-                        } else {
-                            '▾'
-                        };
-                        let title = table.groups.get(group as usize).map_or("", String::as_str);
-                        let _ = write!(sink, "{arrow} {title} ({})", state.group_size(group));
+                    Line::Group {
+                        name,
+                        count,
+                        collapsed,
+                        ..
+                    } if column == 0 => {
+                        let _ = sink.write_str(&lines::group_title(name, *count, *collapsed));
                     }
-                    Entry::Group(_) => {}
+                    Line::Group { .. } => {}
                 }
             }
             if item.mask.contains(LVIF_STATE) {
-                let check = TableView::check_state(state.is_checked(table, index));
+                let check = TableView::check_state(lines::check_of(line));
                 item.state =
                     LIST_VIEW_ITEM_STATE_FLAGS((item.state.0 & !LVIS_STATEIMAGEMASK.0) | check);
                 item.stateMask =
@@ -521,8 +523,8 @@ impl Shell {
             }
             if item.mask.contains(LVIF_INDENT) {
                 // In units of the 1-pixel small image.
-                item.iIndent = match entry {
-                    Entry::Row(row) if table.rows[row].group.is_some() => indent,
+                item.iIndent = match line {
+                    Line::Row(row) if row.grouped => indent,
                     _ => 0,
                 };
             }
@@ -548,10 +550,9 @@ impl Shell {
         let fonts = self.fonts();
         let dpi = self.dpi.get();
         let actions_column = self.table.actions_column();
-        self.with_table(|table, state| {
-            let entry = state.entry(index)?;
-            let row = match entry {
-                Entry::Group(_) => {
+        self.with_table(|table| {
+            let row = match table.lines.get(index)? {
+                Line::Group { .. } => {
                     // SAFETY: `hdc` is the list's DC for this notification; it
                     // keeps the font for the rest of the cell's drawing.
                     unsafe { SelectObject(hdc, fonts.bold.into()) };
@@ -562,16 +563,17 @@ impl Shell {
                         CDRF_NEWFONT
                     });
                 }
-                Entry::Row(row) => &table.rows[row],
+                Line::Row(row) => row,
             };
             // SAFETY: as above.
             unsafe { SelectObject(hdc, fonts.ui.into()) };
             if Some(column) == actions_column {
-                let labels: Vec<(&str, bool)> = table
-                    .actions
-                    .iter()
-                    .enumerate()
-                    .map(|(action, spec)| (spec.label.as_str(), row.action_enabled(action)))
+                let labels: Vec<(&str, bool)> = lines::button_actions(table)
+                    .into_iter()
+                    .map(|action| {
+                        let label = table.actions[action].label.as_str();
+                        (label, row.action_enabled(action))
+                    })
                     .collect();
                 let cell = self.table.cell_rect(index, column);
                 self.table.paint_buttons(hdc, cell, &labels, &theme, dpi);
@@ -597,6 +599,7 @@ impl Shell {
         .unwrap_or(CDRF_DODEFAULT)
     }
 
+    /// A click in the actions column lands on a button or between them.
     fn list_click(&self, point: POINT) {
         let Some(hit) = self.table.hit_test(point) else {
             return;
@@ -607,10 +610,14 @@ impl Shell {
         if hit.column != actions_column {
             return;
         }
-        let count = self.with_table(|table, _| table.actions.len()).unwrap_or(0);
+        let buttons = self.with_table(lines::button_actions).unwrap_or_default();
         let cell = self.table.cell_rect(hit.item, actions_column);
-        if let Some(action) = self.table.buttons().hit(cell, count, point.x, point.y) {
-            self.run_action(hit.item, action);
+        let slot = self
+            .table
+            .buttons()
+            .hit(cell, buttons.len(), point.x, point.y);
+        if let Some(action) = slot.and_then(|slot| buttons.get(slot)) {
+            self.run_action(hit.item, *action);
         }
     }
 
@@ -623,12 +630,12 @@ impl Shell {
             return -1;
         };
         let start = find.iStart.max(0) as usize;
-        self.with_table(|table, state| state.find_prefix(table, &prefix, start))
+        self.with_table(|table| lines::find_prefix(&table.lines, &prefix, start))
             .flatten()
             .map_or(-1, |index| index as isize)
     }
 
-    /// A click on a checkbox, or with Shift or Ctrl: checks instead of
+    /// A click on a checkbox, or with Shift or Ctrl: ticks instead of
     /// focusing. Returns whether the click was used.
     fn list_mouse(&self, point: POINT) -> bool {
         let Some(hit) = self.table.hit_test(point) else {
@@ -664,8 +671,8 @@ impl Shell {
             return true;
         }
         if control && key == u16::from(b'C') {
-            if let Some(index) = focused {
-                self.copy_row(index);
+            if let Some(text) = focused.and_then(|index| self.row_text(index)) {
+                self.copy(&text);
             }
             return true;
         }
@@ -674,19 +681,60 @@ impl Shell {
             return true;
         }
         if key == VK_LEFT.0 || key == VK_RIGHT.0 {
-            let group = focused.and_then(|index| {
-                self.with_table(|_, state| match state.entry(index) {
-                    Some(Entry::Group(group)) => Some(group),
-                    _ => None,
-                })
-                .flatten()
-            });
-            if let Some(group) = group {
-                self.set_collapsed(group, key == VK_LEFT.0);
-                return true;
-            }
+            return focused.is_some_and(|index| self.fold_key(index, key == VK_LEFT.0));
         }
         false
+    }
+
+    /// Shows `items` as a popup menu at `point` (screen coordinates) and
+    /// does what the chosen one stands for.
+    fn popup(&self, items: Vec<MenuItem>, point: POINT) {
+        // SAFETY: the menu is created, shown and destroyed here; the labels
+        // outlive the calls that copy them.
+        let chosen = unsafe {
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+            for (index, item) in items.iter().enumerate() {
+                if item.label.is_empty() {
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                    continue;
+                }
+                let label = wide(&item.label);
+                let flags = if item.enabled {
+                    MF_STRING
+                } else {
+                    MF_STRING | MF_GRAYED
+                };
+                // 0 means "nothing chosen", so the commands start at 1.
+                let _ = AppendMenuW(menu, flags, index + 1, PCWSTR(label.as_ptr()));
+            }
+            let chosen = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            chosen.0 as usize
+        };
+        let Some(item) = chosen
+            .checked_sub(1)
+            .and_then(|index| items.into_iter().nth(index))
+        else {
+            return;
+        };
+        // The menu's loop dispatches updates, so the row may have gone
+        // while it was open. Each event names its row; whoever receives it
+        // looks the row up again.
+        match item.chosen {
+            Chosen::Nothing => {}
+            Chosen::Event(event) => ctx().emit(event),
+            Chosen::Copy(text) => self.copy(&text),
+        }
     }
 
     /// The row's context menu: its actions (the keyboard's way to the row
@@ -718,120 +766,105 @@ impl Shell {
         unsafe {
             let _ = ClientToScreen(self.table.list, &mut point);
         }
-        let key = self.key_at(index);
-        let checked = self.checked_count();
-        struct Item {
-            id: usize,
-            label: String,
-            enabled: bool,
-        }
-        let Some(items) = self
-            .with_table(|table, state| {
-                let mut items = Vec::new();
-                match state.entry(index) {
-                    Some(Entry::Row(row)) => {
-                        let row = &table.rows[row];
-                        for (action, spec) in table.actions.iter().enumerate() {
-                            items.push(Item {
-                                id: 1 + action,
-                                label: spec.label.clone(),
-                                enabled: row.action_enabled(action),
-                            });
-                        }
+        let tab = self.tab.get();
+        let text = self.row_text(index).unwrap_or_default();
+        let items = self.with_table(|table| {
+            let mut items = Vec::new();
+            match table.lines.get(index)? {
+                Line::Row(row) => {
+                    let event = |action: &str| {
+                        Chosen::Event(UiEvent::RowAction {
+                            tab,
+                            id: row.id.clone(),
+                            action: action.to_string(),
+                        })
+                    };
+                    for (action, spec) in table.actions.iter().enumerate() {
+                        let enabled = row.action_enabled(action);
+                        items.push(MenuItem::new(&spec.label, enabled, event(&spec.key)));
                     }
-                    Some(Entry::Group(group)) => {
-                        let collapsed = state.is_collapsed(group);
-                        items.push(Item {
-                            id: MENU_TOGGLE_GROUP,
-                            label: if collapsed { "Expand" } else { "Collapse" }.into(),
-                            enabled: true,
-                        });
-                        items.push(Item {
-                            id: MENU_CHECK_GROUP,
-                            label: if state.is_checked(table, index) {
-                                "Uncheck group"
-                            } else {
-                                "Check group"
-                            }
-                            .into(),
-                            enabled: true,
-                        });
+                    let busy = row.flags.contains(RowFlags::BUSY);
+                    for extra in &row.extra {
+                        items.push(MenuItem::new(&extra.label, !busy, event(&extra.key)));
                     }
-                    None => return None,
                 }
-                items.push(Item {
-                    id: 0,
-                    label: String::new(),
-                    enabled: false,
-                });
-                items.push(Item {
-                    id: MENU_COPY,
-                    label: "Copy\tCtrl+C".into(),
-                    enabled: true,
-                });
-                if checked > 0 {
-                    items.push(Item {
-                        id: MENU_REMOVE_CHECKED,
-                        label: format!("Remove {checked} selected\tDel"),
-                        enabled: true,
-                    });
-                    items.push(Item {
-                        id: MENU_CLEAR_CHECKED,
-                        label: "Clear selection\tEsc".into(),
-                        enabled: true,
-                    });
+                Line::Group {
+                    name,
+                    collapsed,
+                    check,
+                    ..
+                } => {
+                    let label = if *collapsed { "Expand" } else { "Collapse" };
+                    let name = name.clone();
+                    let fold = UiEvent::GroupFolded {
+                        tab,
+                        name: name.clone(),
+                    };
+                    items.push(MenuItem::new(label, true, Chosen::Event(fold)));
+                    if let Some(checked) = check {
+                        let label = if *checked {
+                            "Deselect group"
+                        } else {
+                            "Select group"
+                        };
+                        let toggle = UiEvent::GroupToggled { tab, name };
+                        items.push(MenuItem::new(label, true, Chosen::Event(toggle)));
+                    }
                 }
-                Some(items)
-            })
-            .flatten()
-        else {
-            return;
-        };
-        // SAFETY: the menu is created, shown and destroyed here; the labels
-        // outlive the calls that copy them.
-        let chosen = unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
-            for item in &items {
-                if item.id == 0 {
-                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                    continue;
-                }
-                let label = wide(&item.label);
-                let flags = if item.enabled {
-                    MF_STRING
-                } else {
-                    MF_STRING | MF_GRAYED
-                };
-                let _ = AppendMenuW(menu, flags, item.id, PCWSTR(label.as_ptr()));
             }
-            let chosen = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                None,
-                self.hwnd,
-                None,
-            );
-            let _ = DestroyMenu(menu);
-            chosen.0 as usize
-        };
-        // The menu's loop dispatches updates, so the line may have moved or
-        // gone while it was open; find it again by id.
-        let Some(index) = key.and_then(|key| self.index_of_key(&key)) else {
+            items.push(MenuItem::separator());
+            items.push(MenuItem::new("Copy\tCtrl+C", true, Chosen::Copy(text)));
+            if table.selected > 0 {
+                let remove = UiEvent::RemoveRequested { tab, id: None };
+                items.push(MenuItem::new(
+                    format!("Remove {} selected\tDel", table.selected),
+                    true,
+                    Chosen::Event(remove),
+                ));
+                let clear = UiEvent::SelectionCleared { tab };
+                items.push(MenuItem::new(
+                    "Clear selection\tEsc",
+                    true,
+                    Chosen::Event(clear),
+                ));
+            }
+            Some(items)
+        });
+        if let Some(items) = items.flatten() {
+            self.popup(items, point);
+        }
+    }
+
+    /// The table's menu, under the bar's button: its prunes and the like.
+    pub(super) fn commands_menu(&self) {
+        let tab = self.tab.get();
+        let items = self.with_table(|table| {
+            let commands = table.commands.iter();
+            commands
+                .map(|command| {
+                    let event = UiEvent::Command {
+                        tab,
+                        key: command.key.clone(),
+                    };
+                    MenuItem::new(&command.label, true, Chosen::Event(event))
+                })
+                .collect::<Vec<_>>()
+        });
+        let Some(items) = items.filter(|items| !items.is_empty()) else {
             return;
         };
-        match chosen {
-            0 => {}
-            MENU_COPY => self.copy_row(index),
-            MENU_REMOVE_CHECKED => self.remove_checked(),
-            MENU_CLEAR_CHECKED => self.set_all_checked_off(),
-            MENU_TOGGLE_GROUP => self.activate(index),
-            MENU_CHECK_GROUP => self.toggle_at(index, false),
-            action => self.run_action(index, action - 1),
+        let mut rect = RECT::default();
+        // SAFETY: `rect` is a valid out pointer; the button is our child.
+        unsafe {
+            let _ = GetWindowRect(self.bar.commands, &mut rect);
         }
+        self.popup(
+            items,
+            POINT {
+                x: rect.left,
+                y: rect.bottom,
+            },
+        );
     }
 
     /// Header text colour: the dark header theme keeps black text.
