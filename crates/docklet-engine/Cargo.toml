@@ -8,4 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# No TLS and no HTTP transport: the engine is only reached over the local pipe.
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 docklet-core = { workspace = true }
+futures-util = { version = "0.3", default-features = false }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

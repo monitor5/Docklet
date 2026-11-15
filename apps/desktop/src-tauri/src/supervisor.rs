@@ -1,0 +1,209 @@
+//! Engine lifecycle: the one place that installs, starts and stops the engine.
+//!
+//! The tray and the window can ask for a start or a stop at the same moment.
+//! Every request goes through the [`Supervisor`] in the app state, which lets
+//! one transition run and turns the others away.
+
+use std::fmt;
+use std::io;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use docklet_core::{EngineState, engine};
+use docklet_proxy::control;
+use docklet_wsl::{Engine, RootfsSource};
+use tauri::{AppHandle, Manager};
+
+use crate::state::AppState;
+
+/// A change of engine state that takes a while.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    Installing,
+    Starting,
+    Stopping,
+}
+
+impl fmt::Display for Transition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Installing => "being installed",
+            Self::Starting => "starting",
+            Self::Stopping => "stopping",
+        })
+    }
+}
+
+/// Lets one engine transition run at a time.
+///
+/// A request that arrives while another transition is in flight fails at
+/// once. Queueing it instead would run a stale request much later, for
+/// example a stop that was clicked while a slow start was still going.
+#[derive(Default)]
+pub struct Supervisor {
+    in_flight: Mutex<Option<Transition>>,
+}
+
+impl Supervisor {
+    /// Runs `work` as the only transition in flight.
+    pub fn run<T>(
+        &self,
+        transition: Transition,
+        work: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _in_flight = self.begin(transition)?;
+        work()
+    }
+
+    fn begin(&self, transition: Transition) -> io::Result<InFlight<'_>> {
+        let mut in_flight = self.slot();
+        if let Some(running) = *in_flight {
+            let busy = format!("the engine is already {running}");
+            return Err(io::Error::other(busy));
+        }
+        *in_flight = Some(transition);
+        Ok(InFlight(self))
+    }
+
+    fn slot(&self) -> MutexGuard<'_, Option<Transition>> {
+        let slot = self.in_flight.lock();
+        // The slot holds a plain value, so it is still good after a panic
+        // elsewhere poisoned the lock.
+        slot.unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Marks the transition as over when dropped, also when the work panicked.
+struct InFlight<'a>(&'a Supervisor);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        *self.0.slot() = None;
+    }
+}
+
+/// The engine state as the UI should see it. Blocks on `wsl.exe`.
+///
+/// The engine counts as running only when the pipe proxy is up, because that
+/// is what the UI itself talks to.
+pub fn status() -> io::Result<EngineState> {
+    let state = Engine::system()?.status();
+    Ok(match state {
+        EngineState::Running if !control::is_running() => EngineState::Starting,
+        other => other,
+    })
+}
+
+/// Installs the distro from the published rootfs for `base`, or for the
+/// default base. `progress` receives one line per step. Blocks.
+pub fn install(
+    app: &AppHandle,
+    base: Option<String>,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<()> {
+    let state = app.state::<AppState>();
+    state.supervisor.run(Transition::Installing, || {
+        let base = base.unwrap_or_else(|| engine::bases()[0].to_string());
+        Engine::system()?.install(&RootfsSource::Base(base), progress)
+    })
+}
+
+/// Starts the distro, dockerd and the pipe proxy, then subscribes to Docker's
+/// events. Blocks until the engine answers.
+pub fn start(app: &AppHandle) -> io::Result<()> {
+    let state = app.state::<AppState>();
+    state.supervisor.run(Transition::Starting, start_engine)?;
+    state.streams.watch_events(app);
+    Ok(())
+}
+
+/// Stops the pipe proxy and the distro. Blocks.
+pub fn stop(app: &AppHandle) -> io::Result<()> {
+    let state = app.state::<AppState>();
+    state.supervisor.run(Transition::Stopping, || {
+        // The streams go first, so the UI is not told that the engine
+        // disconnected when it was asked to stop.
+        state.streams.stop_all();
+        stop_engine()
+    })
+}
+
+fn start_engine() -> io::Result<()> {
+    Engine::system()?.start()?;
+    if control::is_running() {
+        return Ok(());
+    }
+    // The proxy is this same executable in `--proxy` mode, detached so the
+    // Windows docker CLI keeps working when the GUI exits.
+    let exe = std::env::current_exe()?;
+    docklet_wsl::spawn_detached(&format!("\"{}\" --proxy", exe.display()))?;
+    for _ in 0..100 {
+        if control::is_running() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(io::Error::other("the pipe proxy did not start"))
+}
+
+fn stop_engine() -> io::Result<()> {
+    control::request_stop();
+    Engine::system()?.stop()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The error a start request gets while `in_flight` is running.
+    fn refusal(in_flight: Transition) -> String {
+        let supervisor = Supervisor::default();
+        let outcome = supervisor.run(in_flight, || {
+            let refused = supervisor.run(Transition::Starting, || Ok(()));
+            Ok(refused.unwrap_err().to_string())
+        });
+        outcome.unwrap()
+    }
+
+    #[test]
+    fn a_second_request_is_refused_while_one_is_in_flight() {
+        assert_eq!(
+            refusal(Transition::Starting),
+            "the engine is already starting"
+        );
+        assert_eq!(
+            refusal(Transition::Stopping),
+            "the engine is already stopping"
+        );
+        assert_eq!(
+            refusal(Transition::Installing),
+            "the engine is already being installed"
+        );
+    }
+
+    #[test]
+    fn the_refused_work_does_not_run() {
+        let supervisor = Supervisor::default();
+        let mut ran = false;
+        let outcome = supervisor.run(Transition::Stopping, || {
+            let refused = supervisor.run(Transition::Starting, || {
+                ran = true;
+                Ok(())
+            });
+            Ok(refused.is_err())
+        });
+        assert!(outcome.unwrap());
+        assert!(!ran);
+    }
+
+    #[test]
+    fn the_next_request_runs_once_the_first_is_over() {
+        let supervisor = Supervisor::default();
+        supervisor.run(Transition::Starting, || Ok(())).unwrap();
+        let boom = || Err::<(), _>(io::Error::other("boom"));
+        let failed = supervisor.run(Transition::Stopping, boom);
+        assert_eq!(failed.unwrap_err().to_string(), "boom");
+        let third = supervisor.run(Transition::Starting, || Ok(7));
+        assert_eq!(third.unwrap(), 7);
+    }
+}

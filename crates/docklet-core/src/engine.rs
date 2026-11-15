@@ -77,6 +77,12 @@ pub fn docker_ready<R: WslRunner>(wsl: &Wsl<R>) -> bool {
     .is_ok_and(|output| output.success)
 }
 
+/// Named pipe that Docklet exposes to the GUI and the Windows `docker` CLI.
+pub const ENGINE_PIPE: &str = r"\\.\pipe\docklet_engine";
+
+/// The same pipe as a Docker host URL.
+pub const ENGINE_DOCKER_HOST: &str = "npipe:////./pipe/docklet_engine";
+
 #[cfg(test)]
 mod tests {
     use super::*;
