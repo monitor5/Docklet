@@ -65,11 +65,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # Opens real named pipes and spawns processes, so these tests run here
+      # Open real named pipes and spawn processes, so these tests run here
       # and never on a developer PC.
       - name: Test (runner only)
         timeout-minutes: 5
-        run: cargo test -p docklet-proxy -- --ignored
+        run: cargo test -p docklet-proxy -p docklet-wsl -- --ignored
       - name: Build installer
         run: pnpm tauri build
       - uses: actions/upload-artifact@v7
