@@ -4,7 +4,28 @@ A lightweight Windows tray app that installs and manages Docker Engine in a
 dedicated WSL2 distro, with Kubernetes you can switch on and off. No Docker
 Desktop required.
 
-> Status: early development (milestone M0). Nothing here is ready for daily use yet.
+> Status: early development. Milestones M0 to M2 are done (engine lifecycle in
+> the CLI, Windows `docker` CLI through the pipe). M3 (desktop UI and tray) is in
+> review. Nothing here is ready for daily use yet.
+
+## What works today
+
+- **CLI** (`docklet.exe`): `status`, `bases`, `install`, `start`, `stop`,
+  `uninstall --yes`, `cli setup`, `skills status|install|uninstall`, `version`.
+  `docklet cli setup` installs the Windows `docker` CLI and Compose if missing
+  and creates the `docklet` Docker context, so `docker --context docklet ...`
+  talks to the engine.
+- **Desktop app** (`docklet-desktop.exe`; written, but nobody has run it yet):
+  a tray icon with Open, Start engine, Stop engine and Quit, and a window with
+  an install screen, Containers, Images, Volumes and Networks views, and a log
+  view for containers. Closing the window destroys the WebView.
+
+## What does not work yet
+
+- Bind mounts of Windows paths (`-v C:\project:/app`).
+- Kubernetes.
+- Registering the CLI on `PATH`.
+- An updater.
 
 ## How it works
 
@@ -41,10 +62,12 @@ pnpm build      # NSIS installer in target/release/bundle/nsis
 | Path                    | Contents                                                        |
 | ----------------------- | --------------------------------------------------------------- |
 | `apps/desktop`          | React UI and the Tauri shell (`src-tauri`)                      |
+| `crates/docklet-cli`    | The `docklet` command line                                      |
 | `crates/docklet-core`   | Platform-neutral logic: state machine, `wsl.exe` output parsing |
 | `crates/docklet-wsl`    | `wsl.exe` runner, registry lookup, keepalive                    |
 | `crates/docklet-proxy`  | Named pipe server and relay                                     |
-| `crates/docklet-engine` | Docker Engine client wrapper                                    |
+| `crates/docklet-engine` | Docker Engine API client (resources, events, logs, pulls)       |
+| `skills/docklet`        | Agent skill (`SKILL.md`), embedded in the CLI                   |
 | `distro`                | Root filesystem definition of the `docklet` distro              |
 | `docs/spikes.md`        | Results of technical spikes                                     |
 

@@ -31,8 +31,9 @@ Question: does a tokio message-mode named pipe let `docker.exe` (go-winio)
 half-close its side, so that `echo hi | docker run -i --rm alpine cat` prints
 `hi` and exits instead of hanging?
 
-Method: `.github/workflows/spike-pipe.yml` runs `docklet-proxy` on a hosted
-runner in message mode and, as a control, in byte mode. Every command has a
+Method: a workflow (since removed; the same checks live on in
+`.github/workflows/e2e.yml`) ran `docklet-proxy` on a hosted runner in message
+mode and, as a control, in byte mode. Every command has a
 hard timeout.
 
 Result (2026-11-12): **yes, and message mode is required.**
@@ -118,6 +119,20 @@ Windows `docker` CLI 29.9.3 through `\\.\pipe\docklet_engine`, measured
 - 37 MB/s for bulk transfer is the cost of going through `wsl.exe` stdio. It is
   fine for API traffic and logs; large `docker save`/`load`/build contexts are
   where a faster transport (hvsocket) would pay off.
-- Known gap: between accepting a connection and creating the next pipe
-  instance a client can get "pipe busy". go-winio retries, .NET `Get-Acl` does
-  not. Pre-creating a spare instance would close it.
+- Known gap, narrowed in M3: with a single pipe instance a client could get
+  "pipe busy" between the proxy accepting a connection and creating the next
+  instance. go-winio retries, .NET `Get-Acl` does not. The proxy now keeps two
+  unconnected instances (`crates/docklet-proxy/src/server.rs`) and replaces an
+  instance as soon as a client connects to it. A burst larger than the number
+  of free instances can still see "pipe busy" for a moment. The runner-only
+  test `concurrent_clients_never_get_pipe_busy` covers this; it has not run yet.
+
+## M3 notes
+
+Still unmeasured for the M3 acceptance. Record the results here once measured.
+
+- [ ] Engine and container events reach the UI within 1 s.
+- [ ] The log view keeps up with a container writing 10,000 lines per second.
+- [ ] No `msedgewebview2.exe` process is left after the window is closed.
+- [ ] Stopping the engine from the tray stops the distro.
+- [ ] `docklet-desktop.exe --proxy` serves the Docker pipe (E2E job `desktop-proxy`).
