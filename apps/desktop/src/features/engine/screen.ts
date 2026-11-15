@@ -4,11 +4,15 @@ export type EngineScreen =
   | "wsl_missing"
   | "install"
   | "stopped"
+  | "sleeping"
   | "busy"
   | "error"
   | "running";
 
-/** Which screen shows for an engine state. */
+/**
+ * Which screen shows for an engine state. Only the `running` screen has the
+ * resource lists, which are what talks to Docker.
+ */
 export function screenFor(state: EngineState): EngineScreen {
   switch (state) {
     case "wsl_missing":
@@ -17,6 +21,8 @@ export function screenFor(state: EngineState): EngineScreen {
       return "install";
     case "stopped":
       return "stopped";
+    case "sleeping":
+      return "sleeping";
     case "starting":
     case "stopping":
       return "busy";

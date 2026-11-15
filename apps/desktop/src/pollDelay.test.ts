@@ -9,7 +9,12 @@ describe("nextPollDelay", () => {
   });
 
   it("polls slowly in settled states", () => {
-    for (const state of ["running", "stopped", "not_installed"] as const) {
+    for (const state of [
+      "running",
+      "stopped",
+      "sleeping",
+      "not_installed",
+    ] as const) {
       expect(nextPollDelay({ state, visible: true, busy: false })).toBe(
         SLOW_POLL_MS,
       );

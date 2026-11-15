@@ -13,26 +13,34 @@ pub struct Arg {
     /// Placeholder of the value an option takes; `None` for a flag.
     pub value: Option<&'static str>,
     pub required: bool,
+    /// A positional argument that takes every word that follows.
+    pub variadic: bool,
     pub about: &'static str,
     /// Text for the row an argument after the first gets in the help.
     pub help: Option<&'static str>,
 }
 
 impl Arg {
+    fn is_positional(&self) -> bool {
+        !self.name.starts_with('-')
+    }
+
     fn kind(&self) -> &'static str {
-        match (self.name.starts_with('-'), self.value) {
-            (false, _) => "positional",
-            (true, Some(_)) => "option",
-            (true, None) => "flag",
+        match (self.is_positional(), self.value) {
+            (true, _) => "positional",
+            (false, Some(_)) => "option",
+            (false, None) => "flag",
         }
     }
 
-    /// As written in a usage line: `[--base NAME]`, `--yes`, `<args...>`.
+    /// As written in a usage line: `[--base NAME]`, `--yes`, `<key>`,
+    /// `<args...>`.
     fn syntax(&self) -> String {
-        let core = match (self.name.starts_with('-'), self.value) {
-            (false, _) => format!("<{}...>", self.name),
-            (true, Some(value)) => format!("{} {value}", self.name),
-            (true, None) => self.name.to_string(),
+        let core = match (self.is_positional(), self.value) {
+            (true, _) if self.variadic => format!("<{}...>", self.name),
+            (true, _) => format!("<{}>", self.name),
+            (false, Some(value)) => format!("{} {value}", self.name),
+            (false, None) => self.name.to_string(),
         };
         if self.required {
             core
@@ -56,6 +64,7 @@ pub struct Entry {
 }
 
 const ENGINE: &str = "Engine";
+const SETTINGS: &str = "Settings";
 const DOCKER: &str = "Docker client";
 const SKILL: &str = "Agent skill";
 const OTHER: &str = "Other";
@@ -64,6 +73,7 @@ const BASE: Arg = Arg {
     name: "--base",
     value: Some("NAME"),
     required: false,
+    variadic: false,
     about: "Linux base of the distro, one of `docklet bases`; the first is the default",
     help: None,
 };
@@ -100,6 +110,7 @@ pub const COMMANDS: &[Entry] = &[
                 name: "--rootfs",
                 value: Some("FILE"),
                 required: false,
+                variadic: false,
                 about: "Install from a local rootfs.tar.gz instead of downloading a base",
                 help: Some("...or install it from a local rootfs.tar.gz"),
             },
@@ -143,6 +154,7 @@ pub const COMMANDS: &[Entry] = &[
             name: "--timeout",
             value: Some("SECONDS"),
             required: false,
+            variadic: false,
             about: "How long to wait; 120 when not given",
             help: None,
         }],
@@ -167,6 +179,7 @@ pub const COMMANDS: &[Entry] = &[
             name: "--yes",
             value: None,
             required: true,
+            variadic: false,
             about: "Confirms the deletion; without it nothing is deleted",
             help: None,
         }],
@@ -178,6 +191,52 @@ pub const COMMANDS: &[Entry] = &[
         long_running: true,
     },
     Entry {
+        group: SETTINGS,
+        name: "config get",
+        aliases: &[],
+        args: &[Arg {
+            name: "key",
+            value: None,
+            required: false,
+            variadic: false,
+            about: "The setting to show, one of `settings` in this catalogue; all when not given",
+            help: None,
+        }],
+        about: &["Show the settings, or the one named"],
+        deletes_data: false,
+        long_running: false,
+    },
+    Entry {
+        group: SETTINGS,
+        name: "config set",
+        aliases: &[],
+        args: &[
+            Arg {
+                name: "key",
+                value: None,
+                required: true,
+                variadic: false,
+                about: "The setting to change, one of `settings` in this catalogue",
+                help: None,
+            },
+            Arg {
+                name: "value",
+                value: None,
+                required: true,
+                variadic: false,
+                about: "Its new value; `settings` in this catalogue says what each one takes",
+                help: None,
+            },
+        ],
+        about: &[
+            "Change a setting. idle-stop <minutes|off>: stop the",
+            "engine after that long without use (default: 10);",
+            "it starts again when Docker is used",
+        ],
+        deletes_data: false,
+        long_running: false,
+    },
+    Entry {
         group: DOCKER,
         name: "docker",
         aliases: &[],
@@ -185,6 +244,7 @@ pub const COMMANDS: &[Entry] = &[
             name: "args",
             value: None,
             required: true,
+            variadic: true,
             about: "Passed to docker.exe unchanged, with its stdin, stdout, stderr and exit code",
             help: None,
         }],
@@ -283,28 +343,39 @@ pub fn help_text() -> String {
             group = entry.group;
             text.push_str(&format!("\n{group}:\n"));
         }
-        // The first argument shares the command's row; each further one
-        // gets a row of its own, lined up under the first.
-        let mut usage = vec![match entry.args.first() {
-            Some(arg) => format!("{} {}", entry.name, arg.syntax()),
-            None => std::iter::once(entry.name)
-                .chain(entry.aliases.iter().copied())
-                .collect::<Vec<_>>()
-                .join(", "),
-        }];
-        let indent = " ".repeat(entry.name.len() + 1);
-        for arg in entry.args.iter().skip(1) {
-            usage.push(format!("{indent}{}", arg.syntax()));
-        }
         let notes = entry.args.iter().filter_map(|arg| arg.help);
         let about: Vec<&str> = entry.about.iter().copied().chain(notes).collect();
-        push_rows(&mut text, &usage, &about);
+        push_rows(&mut text, &usage_rows(entry), &about);
     }
     text.push_str("\nOptions:\n");
     for option in OPTIONS {
         push_rows(&mut text, &[option.name.to_string()], option.about);
     }
     text
+}
+
+/// The left column of a command's help: its name and arguments.
+///
+/// The first argument shares the command's row, and so do the positional
+/// ones right after it, which read as one phrase (`config set <key>
+/// <value>`). Each further option gets a row of its own, lined up under the
+/// first.
+fn usage_rows(entry: &Entry) -> Vec<String> {
+    let Some(first) = entry.args.first() else {
+        let names = std::iter::once(entry.name).chain(entry.aliases.iter().copied());
+        return vec![names.collect::<Vec<_>>().join(", ")];
+    };
+    let mut rows = vec![format!("{} {}", entry.name, first.syntax())];
+    let indent = " ".repeat(entry.name.len() + 1);
+    for arg in entry.args.iter().skip(1) {
+        if arg.is_positional() && rows.len() == 1 {
+            rows[0].push(' ');
+            rows[0].push_str(&arg.syntax());
+        } else {
+            rows.push(format!("{indent}{}", arg.syntax()));
+        }
+    }
+    rows
 }
 
 /// Writes two columns side by side, as many rows as the longer one has.
@@ -353,15 +424,46 @@ pub fn catalogue() -> Json {
                 .into()
         })
         .collect();
+    let settings: Vec<Json> = SETTINGS_LIST
+        .iter()
+        .map(|setting| {
+            Object::new()
+                .set("key", setting.key)
+                .set("values", setting.values)
+                .set("default", setting.default)
+                .set("description", setting.about)
+                .into()
+        })
+        .collect();
     Object::new()
         .set("docklet_version", env!("CARGO_PKG_VERSION"))
         .set("usage", USAGE)
         .set("options", options)
         .set("commands", commands)
+        .set("settings", settings)
         .set("exit_codes", exit_codes)
         .set("error_codes", error_codes)
         .into()
 }
+
+/// A setting of `docklet config`, as the catalogue describes it.
+pub struct Setting {
+    pub key: &'static str,
+    /// What `config set` takes for it.
+    pub values: &'static str,
+    pub default: &'static str,
+    pub about: &'static str,
+}
+
+pub const SETTINGS_LIST: &[Setting] = &[Setting {
+    key: "idle-stop",
+    values: "<minutes>|off",
+    default: "10",
+    about: "Minutes without a Docker connection or a running container after which the \
+            engine is stopped to free its memory; the next Docker command starts it again. \
+            `off` keeps it running until `docklet stop`. A change applies from the next \
+            `docklet start`",
+}];
 
 fn command(entry: &Entry) -> Json {
     let usage = std::iter::once(format!("docklet {}", entry.name))
@@ -491,9 +593,49 @@ Other:
             "  doctor                    Check the setup",
             "  docker <args...>          Run docker against the Docklet engine",
             "  --json                    Print one JSON object on stdout",
+            "\nSettings:\n  config get [<key>]        Show the settings, or the one named\n",
+            "  config set <key> <value>  Change a setting. idle-stop <minutes|off>: stop the\n",
         ] {
             assert!(help.contains(expected), "{expected:?} not in:\n{help}");
         }
+    }
+
+    #[test]
+    fn positionals_share_the_first_row_and_options_get_their_own() {
+        let rows = |name: &str| {
+            let entry = COMMANDS.iter().find(|entry| entry.name == name).unwrap();
+            usage_rows(entry)
+        };
+        assert_eq!(rows("config set"), ["config set <key> <value>"]);
+        assert_eq!(rows("config get"), ["config get [<key>]"]);
+        assert_eq!(
+            rows("install"),
+            ["install [--base NAME]", "        [--rootfs FILE]"]
+        );
+        assert_eq!(rows("version"), ["version, -V, --version"]);
+        assert_eq!(rows("status"), ["status"]);
+    }
+
+    #[test]
+    fn the_catalogue_describes_every_setting() {
+        use crate::args::ConfigKey;
+        use docklet_core::settings::IdleStop;
+
+        let keys: Vec<&str> = SETTINGS_LIST.iter().map(|setting| setting.key).collect();
+        let known: Vec<&str> = ConfigKey::ALL.iter().map(|key| key.name()).collect();
+        assert_eq!(keys, known);
+        let idle_stop = &SETTINGS_LIST[0];
+        assert_eq!(idle_stop.default, IdleStop::DEFAULT.to_string());
+        // The help names the same default.
+        assert!(help_text().contains(&format!("(default: {})", idle_stop.default)));
+        let catalogue = catalogue();
+        let listed = items(field(&catalogue, "settings"));
+        assert_eq!(listed.len(), SETTINGS_LIST.len());
+        assert!(listed[0].render().starts_with(
+            r#"{"key":"idle-stop","values":"<minutes>|off","default":"10","description":""#
+        ));
+        // What the task of this setting hinges on is said where agents read.
+        assert!(idle_stop.about.contains("next `docklet start`"));
     }
 
     #[test]
@@ -508,14 +650,8 @@ Other:
         }
         // No usage may run into the description column.
         for entry in COMMANDS {
-            let first = match entry.args.first() {
-                Some(arg) => format!("{} {}", entry.name, arg.syntax()),
-                None => entry.name.to_string(),
-            };
-            assert!(first.len() < USAGE_WIDTH, "{first}");
-            for arg in entry.args.iter().skip(1) {
-                let width = entry.name.len() + 1 + arg.syntax().len();
-                assert!(width < USAGE_WIDTH, "{} {}", entry.name, arg.syntax());
+            for row in usage_rows(entry) {
+                assert!(row.len() < USAGE_WIDTH, "{row}");
             }
         }
     }
@@ -548,6 +684,8 @@ Other:
                 "wait",
                 "doctor",
                 "uninstall",
+                "config get",
+                "config set",
                 "docker",
                 "cli setup",
                 "skills status",

@@ -5,7 +5,7 @@
 
 use crate::docker_client::ContextState;
 use crate::engine::{self, DISTRO_NAME, ENGINE_PIPE};
-use crate::state::EngineState;
+use crate::state::{EngineState, ProxyMode};
 use crate::wsl::{Wsl, WslRunner, WslVersion};
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -66,6 +66,12 @@ impl EngineFacts {
         facts
     }
 
+    /// The distro is stopped and an idle-stop proxy is listening: the engine
+    /// is asleep and the next Docker client wakes it. Nothing is wrong.
+    pub fn asleep_behind(&self, proxy: ProxyMode) -> bool {
+        proxy == ProxyMode::IdleStop && self.running == Some(Ok(false))
+    }
+
     pub fn wsl_version(&self) -> Option<WslVersion> {
         match self.wsl {
             WslFact::Found(version) => Some(version),
@@ -109,7 +115,7 @@ impl EngineFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Facts {
     pub engine: EngineFacts,
-    pub proxy_running: bool,
+    pub proxy: ProxyMode,
     /// The `docker.exe` that would be used, if there is one.
     pub docker_cli: Option<String>,
     pub compose_plugin: bool,
@@ -151,6 +157,13 @@ pub struct Check {
     pub fix: Option<&'static str>,
 }
 
+impl Facts {
+    /// See [`EngineFacts::asleep_behind`].
+    pub fn asleep(&self) -> bool {
+        self.engine.asleep_behind(self.proxy)
+    }
+}
+
 const NOT_CHECKED: &str = "not checked: an earlier check has to pass first";
 
 /// The checks, always the same ones in the same order.
@@ -177,14 +190,37 @@ pub fn report(facts: &Facts) -> Vec<Check> {
         check(
             "distro_running",
             "Distro running",
-            listed(
-                &facts.engine.running,
-                "the distro is running",
-                "the engine is stopped",
-                "docklet start",
-            ),
+            if facts.asleep() {
+                (
+                    Level::Ok,
+                    "the engine is asleep because nothing used it; the next Docker command \
+                     wakes it"
+                        .to_string(),
+                    None,
+                )
+            } else {
+                listed(
+                    &facts.engine.running,
+                    "the distro is running",
+                    "the engine is stopped",
+                    "docklet start",
+                )
+            },
         ),
-        check("dockerd", "Docker daemon", dockerd(facts.engine.dockerd)),
+        check(
+            "dockerd",
+            "Docker daemon",
+            if facts.asleep() {
+                // Asking dockerd would boot the distro behind the proxy's back.
+                (
+                    Level::Ok,
+                    "not asked while the engine is asleep".to_string(),
+                    None,
+                )
+            } else {
+                dockerd(facts.engine.dockerd)
+            },
+        ),
         check("pipe_proxy", "Pipe proxy", pipe_proxy(facts)),
         check(
             "docker_cli",
@@ -304,7 +340,13 @@ fn dockerd(fact: Option<bool>) -> Verdict {
 }
 
 fn pipe_proxy(facts: &Facts) -> Verdict {
-    if facts.proxy_running {
+    if facts.proxy == ProxyMode::IdleStop {
+        (
+            Level::Ok,
+            format!("serving {ENGINE_PIPE}; stops an unused engine and wakes it on connect"),
+            None,
+        )
+    } else if facts.proxy.is_running() {
         (Level::Ok, format!("serving {ENGINE_PIPE}"), None)
     } else if facts.engine.dockerd == Some(true) {
         (
@@ -404,7 +446,7 @@ mod tests {
     fn healthy() -> Facts {
         Facts {
             engine: healthy_engine(),
-            proxy_running: true,
+            proxy: ProxyMode::Plain,
             docker_cli: Some(r"C:\tools\docker.exe".to_string()),
             compose_plugin: true,
             docker_context: ContextState::Present,
@@ -517,7 +559,7 @@ mod tests {
     #[test]
     fn missing_wsl_is_the_one_failure_and_names_the_installer() {
         let mut facts = healthy();
-        facts.proxy_running = false;
+        facts.proxy = ProxyMode::Down;
         facts.engine = EngineFacts {
             wsl: WslFact::Missing,
             installed: None,
@@ -566,7 +608,7 @@ mod tests {
     #[test]
     fn a_missing_distro_points_at_up() {
         let mut facts = healthy();
-        facts.proxy_running = false;
+        facts.proxy = ProxyMode::Down;
         facts.engine.installed = Some(Ok(false));
         facts.engine.running = None;
         facts.engine.dockerd = None;
@@ -578,7 +620,7 @@ mod tests {
     #[test]
     fn a_stopped_engine_points_at_start() {
         let mut facts = healthy();
-        facts.proxy_running = false;
+        facts.proxy = ProxyMode::Down;
         facts.engine.running = Some(Ok(false));
         facts.engine.dockerd = None;
         let checks = report(&facts);
@@ -586,6 +628,54 @@ mod tests {
         assert_eq!(checks[2].fix, Some("docklet start"));
         assert_eq!(level_of(&checks, "dockerd"), Level::Warn);
         assert_eq!(level_of(&checks, "pipe_proxy"), Level::Warn);
+    }
+
+    #[test]
+    fn a_sleeping_engine_passes_every_check() {
+        let mut facts = healthy();
+        facts.proxy = ProxyMode::IdleStop;
+        facts.engine.running = Some(Ok(false));
+        facts.engine.dockerd = None;
+        assert!(facts.asleep());
+        let checks = report(&facts);
+        for check in &checks {
+            assert_eq!(check.level, Level::Ok, "{check:?}");
+            assert_eq!(check.fix, None, "{check:?}");
+        }
+        let detail = |id: &str| {
+            let check = checks.iter().find(|check| check.id == id).unwrap();
+            check.detail.as_str()
+        };
+        assert!(detail("distro_running").contains("asleep"));
+        assert!(detail("dockerd").contains("asleep"));
+        assert!(detail("pipe_proxy").contains("wakes it on connect"));
+    }
+
+    #[test]
+    fn only_an_idle_stop_proxy_makes_a_stopped_engine_sleep() {
+        for proxy in [ProxyMode::Down, ProxyMode::Plain] {
+            let mut facts = healthy();
+            facts.proxy = proxy;
+            facts.engine.running = Some(Ok(false));
+            facts.engine.dockerd = None;
+            assert!(!facts.asleep());
+            assert_eq!(failing(&report(&facts)), ["distro_running"], "{proxy:?}");
+        }
+        // A running engine behind an idle-stop proxy is simply running.
+        let mut awake = healthy();
+        awake.proxy = ProxyMode::IdleStop;
+        assert!(!awake.asleep());
+        let checks = report(&awake);
+        assert!(failing(&checks).is_empty());
+        assert_eq!(checks[2].detail, "the distro is running");
+        assert_eq!(checks[3].detail, "dockerd answers");
+        // A list that failed is not sleep.
+        let mut unknown = healthy();
+        unknown.proxy = ProxyMode::IdleStop;
+        unknown.engine.running = Some(Err("list hung".to_string()));
+        unknown.engine.dockerd = None;
+        assert!(!unknown.asleep());
+        assert_eq!(failing(&report(&unknown)), ["distro_running"]);
     }
 
     #[test]
@@ -612,7 +702,7 @@ mod tests {
     #[test]
     fn a_proxy_that_is_down_while_docker_is_up_fails() {
         let mut facts = healthy();
-        facts.proxy_running = false;
+        facts.proxy = ProxyMode::Down;
         let checks = report(&facts);
         assert_eq!(failing(&checks), ["pipe_proxy"]);
         assert_eq!(checks[4].fix, Some("docklet start"));

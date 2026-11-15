@@ -3,10 +3,15 @@ import type { EngineState } from "./engine";
 export const FAST_POLL_MS = 4000;
 export const SLOW_POLL_MS = 15000;
 
-/** States that only change when somebody acts, which the window hears about. */
+/**
+ * States that only change when somebody acts, which the window hears about.
+ * A sleeping engine wakes when some Docker client connects; the slow poll
+ * notices, and it only asks `wsl.exe` for its lists, which wakes nothing.
+ */
 const SETTLED: ReadonlySet<EngineState> = new Set([
   "running",
   "stopped",
+  "sleeping",
   "not_installed",
 ]);
 

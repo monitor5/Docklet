@@ -108,12 +108,21 @@ pub fn run_proxy_mode() -> Option<std::io::Result<()>> {
     if !std::env::args().any(|arg| arg == "--proxy") {
         return None;
     }
-    Some(docklet_proxy::serve(docklet_proxy::PipeProxyConfig {
+    Some(serve_proxy())
+}
+
+/// Serves the pipe like `docklet proxy` does: with idle stop, as the setting
+/// shared with the CLI says (`docklet config set idle-stop`).
+fn serve_proxy() -> std::io::Result<()> {
+    let config = docklet_proxy::PipeProxyConfig {
         pipe_name: docklet_core::engine::ENGINE_PIPE.to_string(),
         message_mode: true,
         relay: docklet_proxy::RelayCommand::wsl_relay(docklet_wsl::DISTRO),
         trace: false,
-    }))
+    };
+    let data_dir = docklet_wsl::data_dir()?;
+    let engine = docklet_wsl::Engine::system()?;
+    docklet_proxy::serve_configured(config, &data_dir, engine)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

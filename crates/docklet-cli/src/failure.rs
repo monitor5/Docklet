@@ -5,6 +5,7 @@
 //! callers; adding one means adding it to [`ErrorCode::ALL`], which the tests
 //! tie to the skill.
 
+use docklet_core::ProxyMode;
 use docklet_core::doctor::{EngineFacts, WslFact};
 use docklet_core::engine;
 use docklet_core::wsl::WslVersion;
@@ -181,8 +182,9 @@ pub fn failure_envelope(command: Option<&str>, failure: &Failure) -> Json {
 ///
 /// This is the one definition of "usable" that `docker`, `wait` and `up`
 /// share: WSL works, the distro is installed and running, dockerd answers and
-/// the pipe proxy is up.
-pub fn blocker(facts: &EngineFacts, proxy_running: bool) -> Option<Failure> {
+/// the pipe proxy is up. An engine that sleeps behind an idle-stop proxy is
+/// usable too: the first Docker command starts it.
+pub fn blocker(facts: &EngineFacts, proxy: ProxyMode) -> Option<Failure> {
     let wsl_error =
         |reason: &String| Failure::new(ErrorCode::WslError, reason.clone()).hint("docklet doctor");
     let not_running =
@@ -223,15 +225,26 @@ pub fn blocker(facts: &EngineFacts, proxy_running: bool) -> Option<Failure> {
     match &facts.running {
         Some(Ok(true)) => {}
         Some(Err(reason)) => return Some(wsl_error(reason)),
+        _ if facts.asleep_behind(proxy) => return None,
         _ => return Some(not_running("the engine is stopped")),
     }
     if facts.dockerd != Some(true) {
         return Some(not_running("the distro is up, Docker is not ready yet"));
     }
-    if !proxy_running {
+    if !proxy.is_running() {
         return Some(not_running("Docker is up but the pipe proxy is not"));
     }
     None
+}
+
+/// Whether `docklet docker` must refuse to run because of `blocker`.
+///
+/// Behind an idle-stop proxy an engine that is not running does not stop a
+/// Docker command: the proxy starts the engine for the connection, or makes
+/// it wait for a start that is already under way. Refusing would fail the
+/// second of two commands that arrive while the first one wakes the engine.
+pub fn refuses_docker(blocker: &Failure, proxy: ProxyMode) -> bool {
+    !(proxy == ProxyMode::IdleStop && blocker.code == ErrorCode::NotRunning)
 }
 
 /// The engine operation that failed, for [`classify`].
@@ -251,7 +264,9 @@ pub enum Op<'a> {
 /// match on that text, the engine is looked at again after the failure and
 /// the code follows from what is found. `message` stays the operation's own.
 pub fn classify(op: Op, message: String, facts: &EngineFacts) -> Failure {
-    let cause = blocker(facts, true);
+    // What stands in the way of the engine itself: a plain proxy is assumed
+    // so that neither a missing one nor idle stop colours the answer.
+    let cause = blocker(facts, ProxyMode::Plain);
     let cause_code = cause.as_ref().map(|cause| cause.code);
     let cause_hint = cause.and_then(|cause| cause.hint);
     let (code, hint) = match (op, cause_code) {
@@ -488,9 +503,61 @@ mod tests {
         );
     }
 
+    const DOWN: ProxyMode = ProxyMode::Down;
+    const PLAIN: ProxyMode = ProxyMode::Plain;
+    const IDLE_STOP: ProxyMode = ProxyMode::IdleStop;
+
     #[test]
     fn nothing_blocks_a_running_engine_with_its_proxy() {
-        assert_eq!(blocker(&running(), true), None);
+        assert_eq!(blocker(&running(), PLAIN), None);
+        assert_eq!(blocker(&running(), IDLE_STOP), None);
+    }
+
+    #[test]
+    fn nothing_blocks_an_engine_that_sleeps_behind_an_idle_stop_proxy() {
+        assert_eq!(blocker(&stopped(), IDLE_STOP), None);
+        // The same distro behind a plain proxy, or behind none, is stopped.
+        for proxy in [DOWN, PLAIN] {
+            let failure = blocker(&stopped(), proxy).unwrap();
+            assert_eq!(failure.code, ErrorCode::NotRunning);
+            assert_eq!(failure.message, "the engine is stopped");
+        }
+    }
+
+    #[test]
+    fn idle_stop_does_not_make_a_broken_setup_usable() {
+        let cases = [
+            (missing(), ErrorCode::WslMissing),
+            (outdated(), ErrorCode::WslOutdated),
+            (hung(), ErrorCode::WslError),
+            (not_installed(), ErrorCode::NotInstalled),
+            // The distro is up and dockerd is not: a start is under way.
+            (starting(), ErrorCode::NotRunning),
+        ];
+        for (facts, code) in cases {
+            assert_eq!(blocker(&facts, IDLE_STOP).unwrap().code, code, "{facts:?}");
+        }
+        let list_failed = Some(Err("`wsl --list --running` did not finish".to_string()));
+        let unknown = facts(current(), Some(Ok(true)), list_failed, None);
+        assert_eq!(
+            blocker(&unknown, IDLE_STOP).unwrap().code,
+            ErrorCode::WslError
+        );
+    }
+
+    #[test]
+    fn docker_runs_behind_an_idle_stop_proxy_unless_the_setup_is_broken() {
+        // A start under way: the proxy makes the connection wait for it.
+        let waking = blocker(&starting(), IDLE_STOP).unwrap();
+        assert!(!refuses_docker(&waking, IDLE_STOP));
+        // A plain proxy relays into a distro that cannot answer yet.
+        assert!(refuses_docker(&waking, PLAIN));
+        assert!(refuses_docker(&blocker(&stopped(), PLAIN).unwrap(), PLAIN));
+        assert!(refuses_docker(&blocker(&running(), DOWN).unwrap(), DOWN));
+        for broken in [missing(), outdated(), hung(), not_installed()] {
+            let blocker = blocker(&broken, IDLE_STOP).unwrap();
+            assert!(refuses_docker(&blocker, IDLE_STOP), "{broken:?}");
+        }
     }
 
     #[test]
@@ -509,7 +576,7 @@ mod tests {
         ];
         for (facts, code, hint) in cases {
             // Whether the proxy is up does not matter until Docker is.
-            for proxy in [true, false] {
+            for proxy in [PLAIN, DOWN] {
                 let failure = blocker(&facts, proxy).unwrap();
                 assert_eq!(failure.code, code, "{facts:?}");
                 assert_eq!(failure.hint, Some(hint), "{facts:?}");
@@ -520,7 +587,7 @@ mod tests {
 
     #[test]
     fn a_missing_proxy_blocks_an_engine_that_is_otherwise_up() {
-        let failure = blocker(&running(), false).unwrap();
+        let failure = blocker(&running(), DOWN).unwrap();
         assert_eq!(failure.code, ErrorCode::NotRunning);
         assert_eq!(failure.hint, Some("docklet start"));
         assert!(failure.message.contains("pipe proxy"));
@@ -529,19 +596,19 @@ mod tests {
     #[test]
     fn blocker_messages_carry_the_details() {
         assert!(
-            blocker(&outdated(), true)
+            blocker(&outdated(), PLAIN)
                 .unwrap()
                 .message
                 .contains("2.3.26")
         );
         assert!(
-            blocker(&outdated(), true)
+            blocker(&outdated(), PLAIN)
                 .unwrap()
                 .message
                 .contains("2.4.4")
         );
         assert!(
-            blocker(&hung(), true)
+            blocker(&hung(), PLAIN)
                 .unwrap()
                 .message
                 .contains("did not finish")
@@ -552,12 +619,12 @@ mod tests {
     fn a_list_that_fails_is_a_wsl_error() {
         let list_failed = Some(Err("`wsl --list --quiet` did not finish".to_string()));
         let installed_unknown = facts(current(), list_failed.clone(), None, None);
-        let failure = blocker(&installed_unknown, true).unwrap();
+        let failure = blocker(&installed_unknown, PLAIN).unwrap();
         assert_eq!(failure.code, ErrorCode::WslError);
         assert!(failure.message.contains("--list"));
         let running_unknown = facts(current(), Some(Ok(true)), list_failed, None);
         assert_eq!(
-            blocker(&running_unknown, true).unwrap().code,
+            blocker(&running_unknown, PLAIN).unwrap().code,
             ErrorCode::WslError
         );
     }

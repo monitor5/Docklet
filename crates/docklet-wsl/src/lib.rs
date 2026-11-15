@@ -240,7 +240,9 @@ impl<R: WslRunner> Engine<R> {
     pub fn start(&self) -> io::Result<()> {
         match self.status() {
             EngineState::Running => return Ok(()),
-            EngineState::Stopped | EngineState::Starting => {}
+            // A probe of the engine alone never says `Sleeping`; to this
+            // call it is a stopped distro like any other.
+            EngineState::Stopped | EngineState::Sleeping | EngineState::Starting => {}
             EngineState::NotInstalled => {
                 return Err(io::Error::other(
                     "the docklet distro is not installed; run `docklet install`",
