@@ -11,7 +11,7 @@ use docklet_engine::{Backoff, Client};
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::supervisor;
 
@@ -48,8 +48,13 @@ pub struct Streams {
 impl Streams {
     /// Subscribes to Docker's event stream and forwards each event to the UI,
     /// which refetches the affected list. The subscription is renewed when it
-    /// ends, until `stop_all`. Idempotent.
+    /// ends, until `stop_all`. Idempotent. Does nothing without a window:
+    /// nobody would listen, and nothing would stop it when the window is
+    /// already gone. The next list view asks again.
     pub fn watch_events(&self, app: &AppHandle) {
+        if app.get_webview_window(crate::MAIN_WINDOW).is_none() {
+            return;
+        }
         let mut slot = self.events.lock().expect("events lock");
         if slot
             .as_ref()

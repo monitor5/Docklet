@@ -25,6 +25,23 @@ export function publishedPorts(ports: Port[] | undefined): number[] {
   return [...new Set(published)].sort((a, b) => a - b);
 }
 
+/**
+ * The state of a container without the age in Docker's status text
+ * (`Up 13 seconds`, `Exited (1) 2 hours ago`), which would go stale between
+ * events. Keeps the parts that only change with an event: the exit code and
+ * the health check result.
+ */
+export function stateLabel(container: Container): string {
+  const state = container.State || "unknown";
+  const status = container.Status ?? "";
+  if (state === "exited" || state === "dead") {
+    const code = /^(?:Exited|Dead) \((-?\d+)\)/i.exec(status)?.[1];
+    return code === undefined ? state : `${state} (${code})`;
+  }
+  const health = /\((healthy|unhealthy|health: starting)\)/.exec(status)?.[1];
+  return health ? `${state} (${health})` : state;
+}
+
 export function shortId(id: string): string {
   return id.replace(/^sha256:/, "").slice(0, 12);
 }

@@ -23,8 +23,10 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 export default function App() {
-  const engine = useEngine();
   const notice = useNotice();
+  // One engine request at a time; the backend would refuse a second one.
+  const acting = notice.busy.has("start") || notice.busy.has("stop");
+  const engine = useEngine(acting);
   const [tab, setTab] = useState<TabId>("containers");
   const [mirroredDismissed, setMirroredDismissed] = useState(false);
   const { status } = engine;
@@ -48,8 +50,6 @@ export default function App() {
     });
 
   const screen = screenFor(status.state);
-  // One engine request at a time; the backend would refuse a second one.
-  const acting = notice.busy.has("start") || notice.busy.has("stop");
   const errors = (
     <ErrorBanner
       message={notice.error ?? engine.error}
