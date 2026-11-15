@@ -9,6 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use docklet_core::system_program;
+
 use crate::{download, no_window, verify_sha256};
 
 pub const DOCKER_CLI_VERSION: &str = "29.9.3";
@@ -60,7 +62,7 @@ pub fn setup(
         download(DOCKER_CLI_URL, &archive)?;
         verify_sha256(&archive, DOCKER_CLI_SHA256)?;
         // bsdtar ships with Windows and reads zip archives.
-        let extracted = run(Command::new("tar.exe")
+        let extracted = run(Command::new(system_program("tar.exe"))
             .arg("-xf")
             .arg(&archive)
             .arg("-C")
@@ -81,9 +83,16 @@ pub fn setup(
         false
     } else {
         progress(&format!("Downloading Docker Compose {COMPOSE_VERSION}"));
+        // Docker loads anything in cli-plugins, so only a verified file may
+        // ever appear there.
+        fs::create_dir_all(&cache)?;
+        let staged = cache.join("docker-compose.exe");
+        download(COMPOSE_URL, &staged)?;
+        verify_sha256(&staged, COMPOSE_SHA256)?;
         fs::create_dir_all(compose.parent().expect("has a parent"))?;
-        download(COMPOSE_URL, &compose)?;
-        verify_sha256(&compose, COMPOSE_SHA256)?;
+        let moved = move_file(&staged, &compose);
+        let _ = fs::remove_file(&staged);
+        moved?;
         true
     };
 
@@ -111,11 +120,28 @@ pub fn setup(
     })
 }
 
+/// Relative PATH entries (`.`, empty) are skipped: they resolve against the
+/// current directory, which may be untrusted.
 fn find_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
+}
+
+/// Renames, or copies when `from` and `to` are on different volumes (the
+/// cache under `%LOCALAPPDATA%` and the user profile can be).
+fn move_file(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if let Err(err) = fs::copy(from, to) {
+        // Never leave a partial copy where Docker would load it.
+        let _ = fs::remove_file(to);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Runs a command silently; an unsuccessful exit becomes an error carrying
@@ -129,5 +155,23 @@ fn run(command: &mut Command) -> io::Result<()> {
         Err(io::Error::other(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_file_replaces_the_source() {
+        let dir = std::env::temp_dir().join(format!("docklet-tools-move-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("staged.exe");
+        let to = dir.join("final.exe");
+        fs::write(&from, b"verified").unwrap();
+        move_file(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"verified");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

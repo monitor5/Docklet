@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         ["status"] => status(),
         ["install", options @ ..] => install(options),
         ["start"] => with_engine(|engine| {
+            warn_if_mirrored_networking();
             engine.start()?;
             proxy::ensure_running()?;
             println!("Engine is running. Docker host: {}", proxy::DOCKER_HOST);
@@ -139,7 +140,18 @@ fn status() -> Result<(), Failure> {
         EngineState::Error(reason) => format!("error: {reason}"),
     };
     println!("{line}");
+    warn_if_mirrored_networking();
     Ok(())
+}
+
+/// Published ports depend on WSL's NAT localhost forwarding.
+fn warn_if_mirrored_networking() {
+    if docklet_wsl::mirrored_networking() {
+        eprintln!(
+            "docklet: {}",
+            docklet_core::wslconfig::MIRRORED_NETWORKING_WARNING
+        );
+    }
 }
 
 fn install(options: &[&str]) -> Result<(), Failure> {

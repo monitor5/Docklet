@@ -726,6 +726,7 @@ dependencies = [
 name = "docklet-proxy"
 version = "0.1.0"
 dependencies = [
+ "docklet-core",
  "tokio",
  "windows",
 ]

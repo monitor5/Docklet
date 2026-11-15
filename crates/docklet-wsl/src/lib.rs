@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use docklet_core::engine::{self, DISTRO_NAME};
 use docklet_core::wsl::{Wsl, WslOutput, WslRunner};
-use docklet_core::{EngineState, wsl_output};
+use docklet_core::{EngineState, system_program, wsl_output, wslconfig};
 use sha2::{Digest, Sha256};
 
 pub mod tools;
@@ -35,7 +35,7 @@ pub struct SystemRunner;
 
 impl WslRunner for SystemRunner {
     fn run(&self, args: &[&str]) -> io::Result<WslOutput> {
-        let mut command = Command::new("wsl.exe");
+        let mut command = Command::new(system_program("wsl.exe"));
         command
             .args(args)
             // UTF-8 output where supported; `wsl_output::decode` handles the rest.
@@ -206,7 +206,8 @@ impl<R: WslRunner> Engine<R> {
 /// output (a script, an agent, CI) waiting forever.
 fn spawn_keepalive() -> io::Result<()> {
     spawn_detached(&format!(
-        "wsl.exe -d {DISTRO_NAME} -u root --exec /bin/sleep infinity"
+        "\"{}\" -d {DISTRO_NAME} -u root --exec /bin/sleep infinity",
+        system_program("wsl.exe").display()
     ))
 }
 
@@ -256,10 +257,23 @@ pub fn spawn_detached(command_line: &str) -> io::Result<()> {
 pub fn spawn_detached(_command_line: &str) -> io::Result<()> {
     Err(io::Error::other("the docklet engine only runs on Windows"))
 }
+
+/// True when the user's `%USERPROFILE%\.wslconfig` turns on mirrored
+/// networking, under which published ports may not reach Windows (see
+/// `docklet_core::wslconfig`). The file is only read, never written; a
+/// missing or unreadable file counts as not mirrored.
+pub fn mirrored_networking() -> bool {
+    std::env::var_os("USERPROFILE")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| fs::read(PathBuf::from(home).join(".wslconfig")).ok())
+        // Editors may save it as UTF-16; `decode` handles that and the BOM.
+        .is_some_and(|bytes| wslconfig::mirrored_networking(&wsl_output::decode(&bytes)))
+}
+
 /// Downloads with the `curl.exe` that ships with Windows, which keeps an HTTP
 /// and TLS stack out of the Docklet binaries.
 pub(crate) fn download(url: &str, destination: &Path) -> io::Result<()> {
-    let mut command = Command::new("curl.exe");
+    let mut command = Command::new(system_program("curl.exe"));
     command
         .args(["--fail", "--location", "--silent", "--show-error"])
         .args(["--retry", "3", "--output"])
