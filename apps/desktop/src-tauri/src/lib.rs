@@ -119,6 +119,12 @@ pub fn run_proxy_mode() -> Option<std::io::Result<()>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Registered first, as the plugin requires. A second launch lands here
+        // in the running instance and brings its window up instead. Proxy mode
+        // never reaches this builder, so it neither is nor blocks an instance.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window_detached(app);
+        }))
         .manage(state::AppState::default())
         // A page that reloads does not get to stop the logs it followed.
         .on_page_load(|webview, payload| {
@@ -157,12 +163,13 @@ pub fn run() {
             // the core alive in the tray; `AppHandle::exit` (Quit) passes a code.
             RunEvent::ExitRequested { api, code, .. } if code.is_none() => api.prevent_exit(),
             // The window took its WebView along without running the page's
-            // cleanup. The event subscription stays for the next window.
+            // cleanup. Nothing stays open without a window: the next list
+            // view asks for the event stream again.
             RunEvent::WindowEvent {
                 label,
                 event: WindowEvent::Destroyed,
                 ..
-            } if label == MAIN_WINDOW => app.state::<state::AppState>().streams.stop_all_logs(),
+            } if label == MAIN_WINDOW => app.state::<state::AppState>().streams.stop_all(),
             _ => {}
         });
 }

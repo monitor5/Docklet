@@ -1,20 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type EngineStatus, onDockerEvent, onEngineChanged } from "./api";
+import type { EngineState } from "./engine";
+import { nextPollDelay } from "./pollDelay";
 
-const STATUS_POLL_MS = 4000;
 const EVENT_DEBOUNCE_MS = 150;
 
-/** Engine state, polled while the window exists and refreshed on demand. */
-export function useEngine() {
+/**
+ * Engine state, polled while the document is visible and refreshed on demand.
+ * `busy` says one of this window's own requests is in flight.
+ */
+export function useEngine(busy: boolean) {
   const [status, setStatus] = useState<EngineStatus | null>(null);
   // Kept apart: a poll that works again clears its own error, but must not
   // clear what a tray action reported a moment earlier.
   const [pollError, setPollError] = useState<string | null>(null);
   const [trayError, setTrayError] = useState<string | null>(null);
 
+  const stateRef = useRef<EngineState | undefined>(undefined);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const rearmRef = useRef<() => void>(() => {});
+
   const refresh = useCallback(async () => {
     try {
-      setStatus(await api.engineStatus());
+      const next = await api.engineStatus();
+      stateRef.current = next.state;
+      setStatus(next);
       setPollError(null);
     } catch (err) {
       setPollError(String(err));
@@ -24,23 +35,51 @@ export function useEngine() {
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      clearTimeout(timer);
+      if (stopped) return;
+      const delay = nextPollDelay({
+        state: stateRef.current,
+        visible: !document.hidden,
+        busy: busyRef.current,
+      });
+      if (delay !== null) timer = setTimeout(run, delay);
+    };
     // The next poll is armed only when this one is over, so polls cannot
     // pile up behind a backend that is slow to answer.
-    const poll = async () => {
+    const run = async () => {
+      clearTimeout(timer);
       await refresh();
-      if (!stopped) timer = setTimeout(poll, STATUS_POLL_MS);
+      schedule();
     };
-    poll();
-    const unlisten = onEngineChanged((message) => {
+    rearmRef.current = schedule;
+    run();
+    const onVisibility = () => {
+      if (document.hidden) clearTimeout(timer);
+      else run();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    const unlistenEngine = onEngineChanged((message) => {
       setTrayError(message);
-      refresh();
+      run();
+    });
+    // A lost or renewed event stream may have hidden a change of the engine.
+    const unlistenDocker = onDockerEvent((kind) => {
+      if (kind === "disconnected" || kind === "reconnecting") run();
     });
     return () => {
       stopped = true;
       clearTimeout(timer);
-      unlisten.then((stop) => stop());
+      rearmRef.current = () => {};
+      document.removeEventListener("visibilitychange", onVisibility);
+      unlistenEngine.then((stop) => stop());
+      unlistenDocker.then((stop) => stop());
     };
   }, [refresh]);
+
+  // Starting or finishing a request changes the delay of the pending poll.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `busy` is the trigger
+  useEffect(() => rearmRef.current(), [busy]);
 
   const dismissError = useCallback(() => {
     setPollError(null);
