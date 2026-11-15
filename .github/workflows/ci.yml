@@ -69,7 +69,7 @@ jobs:
       # and never on a developer PC.
       - name: Test (runner only)
         timeout-minutes: 5
-        run: cargo test -p docklet-proxy -p docklet-wsl -- --ignored
+        run: cargo test -p docklet-proxy -p docklet-wsl -p docklet-cli -- --ignored
       - name: Build installer
         run: pnpm tauri build
       - uses: actions/upload-artifact@v7
