@@ -881,6 +881,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "docklet-native"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "docklet-proxy"
 version = "0.1.0"
 dependencies = [
