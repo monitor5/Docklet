@@ -286,6 +286,111 @@ jobs:
           Timed "docker-after-stop" "`"$docklet`" docker version" 60 $false
           if (Running) { Report "error" "stop" "a Docker command started the stopped engine"; exit 1 }
           Report "notice" "explicit stop" "engine stays off; docklet docker refused: $($Last.Text.Trim())"
+      # Watchers do not keep the engine awake: `docker events` left running,
+      # and a client that reconnects 5 s after its connection ends and only
+      # subscribes, as Docker Desktop's build listener does (it took 26 s).
+      # Ends stopped, as step 4b left it.
+      - name: 4c. idle stop under watchers
+        timeout-minutes: 15
+        env:
+          DOCKLET_IDLE_STOP_SECONDS: "20"
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
+          $docker = "`"$dockerExe`" --context docklet"
+          function StatusLine { & $docklet status | Select-Object -First 1 }
+          function WaitAsleep([string]$After) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            while ((Running) -and $watch.Elapsed.TotalSeconds -lt 180) { Start-Sleep -Seconds 2 }
+            if (Running) { Report "error" "idle stop" "distro still running 180 s after $After"; exit 1 }
+            $line = StatusLine
+            Report ($(if ($line -like "sleeping*") { "notice" } else { "error" })) "asleep after $After" "about $([int]$watch.Elapsed.TotalSeconds) s; status: $line"
+            if ($line -notlike "sleeping*") { exit 1 }
+          }
+          function RequireRunning([string]$After) {
+            $line = StatusLine
+            if ($line -ne "running" -or -not (Running)) { Report "error" "wake" "after ${After}: status '$line', distro running: $(Running)"; exit 1 }
+          }
+          function IdleCheck { (((& $docklet doctor --json 2>$null) | ConvertFrom-Json).data.checks | Where-Object { $_.id -eq "idle_stop" }) }
+          function WatcherLog { (Get-Content $watcherLog -Raw -ErrorAction SilentlyContinue) + "" }
+          # Connects, subscribes to events, reads until the connection ends,
+          # waits 5 s, and does it again. One process throughout.
+          $watcherScript = @'
+          param([string]$Log)
+          $request = [Text.Encoding]::ASCII.GetBytes("GET /events HTTP/1.1`r`nHost: docker`r`n`r`n")
+          for ($round = 1; $round -le 60; $round++) {
+            $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", "docklet_engine", [System.IO.Pipes.PipeDirection]::InOut)
+            try {
+              $pipe.Connect(10000)
+              Add-Content $Log "round $round connected"
+              $pipe.Write($request, 0, $request.Length)
+              $pipe.Flush()
+              $buffer = [byte[]]::new(4096)
+              $first = $true
+              while (($n = $pipe.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                if ($first) { Add-Content $Log "round $round response $([Text.Encoding]::ASCII.GetString($buffer, 0, [Math]::Min($n, 12)))"; $first = $false }
+              }
+              Add-Content $Log "round $round ended"
+            } catch {
+              Add-Content $Log "round $round failed: $($_.Exception.Message)"
+            } finally {
+              $pipe.Dispose()
+            }
+            Start-Sleep -Seconds 5
+          }
+          '@
+          $watcherLog = "$env:RUNNER_TEMP\watcher.txt"
+          Set-Content -Path "$env:RUNNER_TEMP\watcher.ps1" -Value $watcherScript
+          Step "start with a 20 s idle time" { & $docklet start }
+          RequireRunning "start"
+          $eventsOut = "$env:RUNNER_TEMP\events.txt"
+          $events = Start-Process cmd -ArgumentList "/s /c `"$docker events > `"$eventsOut`" 2>&1`"" -PassThru -WindowStyle Hidden
+          $watcher = Start-Process pwsh -ArgumentList "-NoProfile", "-File", "`"$env:RUNNER_TEMP\watcher.ps1`"", "-Log", "`"$watcherLog`"" -PassThru -WindowStyle Hidden
+          for ($i = 0; $i -lt 30 -and (WatcherLog) -notlike "*round 1 response HTTP/1.1*"; $i++) { Start-Sleep -Seconds 1 }
+          if ((WatcherLog) -notlike "*round 1 response HTTP/1.1*") { Report "error" "watcher" "no events response: $(WatcherLog)"; exit 1 }
+          # doctor names the clients of both connections; asking wakes nothing.
+          $check = IdleCheck
+          $ok = $check.status -eq "ok" -and $check.detail -like "*docker.exe*" -and $check.detail -like "*pwsh.exe*"
+          Report ($(if ($ok) { "notice" } else { "error" })) "doctor idle_stop while watched" "$($check.status): $($check.detail)"
+          if (-not $ok) { exit 1 }
+          # 1. Two open, quiet connections and still the engine goes to sleep.
+          WaitAsleep "two watchers connected"
+          # 2. Their connections were closed: docker events has ended.
+          $ended = $events.WaitForExit(30000)
+          Report ($(if ($ended) { "notice" } else { "error" })) "docker events ended with the engine" "ended: $ended; output: $((Get-Content $eventsOut -Raw -ErrorAction SilentlyContinue) + '')"
+          if (-not $ended) { taskkill /F /T /PID $events.Id | Out-Null; exit 1 }
+          # 3. The watcher reconnects and is held: the engine stays asleep, and
+          #    the proxy waits for it without spending CPU.
+          for ($i = 0; $i -lt 30 -and (WatcherLog) -notlike "*round 2 connected*"; $i++) { Start-Sleep -Seconds 1 }
+          $proxy = Get-Process docklet -ErrorAction SilentlyContinue
+          $before = ($proxy | Measure-Object CPU -Sum).Sum
+          Start-Sleep -Seconds 30
+          $delta = [math]::Round((Get-Process docklet -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum - $before, 2)
+          $log = WatcherLog
+          $ok = -not (Running) -and $log -like "*round 1 ended*" -and $log -like "*round 2 connected*" -and $log -notlike "*round 2 response*" -and $delta -le 1
+          Report ($(if ($ok) { "notice" } else { "error" })) "watcher reconnect held" "distro running: $(Running); proxy CPU seconds in 30 s: $delta; log: $log"
+          if (-not $ok) { taskkill /F /T /PID $watcher.Id | Out-Null; exit 1 }
+          $check = IdleCheck
+          Report ($(if ($check.detail -like "*pwsh.exe*") { "notice" } else { "error" })) "doctor idle_stop while asleep" "$($check.status): $($check.detail)"
+          if ($check.detail -notlike "*pwsh.exe*") { taskkill /F /T /PID $watcher.Id | Out-Null; exit 1 }
+          if (Running) { Report "error" "idle stop" "doctor woke the engine"; exit 1 }
+          # 4. A real client wakes it, and the held watcher is served then.
+          Timed "wake-under-watcher" "$docker version --format {{.Server.Version}}" 180
+          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "wake-under-watcher" "unexpected server version"; exit 1 }
+          RequireRunning "docker version"
+          for ($i = 0; $i -lt 30 -and (WatcherLog) -notlike "*round 2 response HTTP/1.1*"; $i++) { Start-Sleep -Seconds 1 }
+          $served = (WatcherLog) -like "*round 2 response HTTP/1.1*"
+          Report ($(if ($served) { "notice" } else { "error" })) "held watcher served after the wake" "$(WatcherLog)"
+          if (-not $served) { taskkill /F /T /PID $watcher.Id | Out-Null; exit 1 }
+          # 5. It is quiet again: the engine sleeps again, and stays asleep.
+          WaitAsleep "the held watcher was served"
+          Start-Sleep -Seconds 20
+          $asleep = -not (Running)
+          Report ($(if ($asleep) { "notice" } else { "error" })) "asleep with the watcher back" "log: $(WatcherLog)"
+          taskkill /F /T /PID $watcher.Id | Out-Null
+          if (-not $asleep) { exit 1 }
+          Step "stop" { & $docklet stop }
+          if (Get-Process docklet -ErrorAction SilentlyContinue) { Report "error" "stop" "pipe proxy still running"; exit 1 }
       - name: 5. Lifetime without keepalive
         timeout-minutes: 8
         run: |

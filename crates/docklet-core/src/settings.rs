@@ -3,10 +3,11 @@
 //! ```text
 //! # Docklet settings. Change them with `docklet config set`.
 //! idle-stop = 10
+//! watchers-keep-awake = no
 //! ```
 //!
 //! One `key = value` per line; a line that starts with `#` is a comment. The
-//! file has one setting today, so it is parsed by hand rather than with a
+//! file has two settings today, so it is parsed by hand rather than with a
 //! TOML or JSON dependency. Lines this version does not understand are kept
 //! when the file is rewritten: a newer Docklet may have written them.
 
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::idle::IdlePolicy;
+pub use crate::idle::Watchers;
 use crate::wsl_output;
 
 /// Name of the settings file inside the data directory
@@ -25,6 +27,10 @@ pub const FILE_NAME: &str = "config.txt";
 
 /// Key of the idle-stop setting, in the file and on the command line.
 pub const IDLE_STOP_KEY: &str = "idle-stop";
+
+/// Key of the setting that says whether a connection that carries nothing
+/// (a watcher) keeps the engine awake: `yes` or `no`.
+pub const WATCHERS_KEY: &str = "watchers-keep-awake";
 
 /// Environment variable that gives the pipe proxy an idle time in seconds,
 /// whatever the setting says. It exists for the end-to-end tests: the setting
@@ -91,6 +97,10 @@ impl fmt::Display for IdleStop {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settings {
     pub idle_stop: IdleStop,
+    /// Whether a quiet open connection keeps the engine awake. The default,
+    /// `no`, is what lets the engine sleep while Docker Desktop or an IDE
+    /// watches it.
+    pub watchers: Watchers,
 }
 
 impl Settings {
@@ -111,40 +121,58 @@ impl Settings {
                 problems.push(format!("line {number}: `{line}` is not `key = value`"));
                 continue;
             };
-            // Keys of other versions are not this version's to judge.
-            if !is_idle_stop(key) {
-                continue;
-            }
-            match IdleStop::parse(value) {
-                // The last one wins if the key was written twice by hand.
-                Some(idle_stop) => settings.idle_stop = idle_stop,
-                None => problems.push(format!(
-                    "line {number}: {IDLE_STOP_KEY} is `{}`, which is neither `off` nor a \
-                     number of minutes from 1 to {}",
-                    value.trim(),
-                    IdleStop::MAX_MINUTES
-                )),
+            // The last one wins if a key was written twice by hand. Keys of
+            // other versions are not this version's to judge.
+            if is_key(key, IDLE_STOP_KEY) {
+                match IdleStop::parse(value) {
+                    Some(idle_stop) => settings.idle_stop = idle_stop,
+                    None => problems.push(format!(
+                        "line {number}: {IDLE_STOP_KEY} is `{}`, which is neither `off` nor a \
+                         number of minutes from 1 to {}",
+                        value.trim(),
+                        IdleStop::MAX_MINUTES
+                    )),
+                }
+            } else if is_key(key, WATCHERS_KEY) {
+                match Watchers::parse(value) {
+                    Some(watchers) => settings.watchers = watchers,
+                    None => problems.push(format!(
+                        "line {number}: {WATCHERS_KEY} is `{}`, which is neither `yes` nor `no`",
+                        value.trim()
+                    )),
+                }
             }
         }
         (settings, problems)
     }
 }
 
-fn is_idle_stop(key: &str) -> bool {
-    key.trim().eq_ignore_ascii_case(IDLE_STOP_KEY)
+fn is_key(key: &str, name: &str) -> bool {
+    key.trim().eq_ignore_ascii_case(name)
 }
 
 /// The file's text with the idle-stop setting changed to `value`. Comments
 /// and other lines stay as they are.
 pub fn with_idle_stop(text: &str, value: IdleStop) -> String {
-    let setting = format!("{IDLE_STOP_KEY} = {value}");
+    with_setting(text, IDLE_STOP_KEY, &value.to_string())
+}
+
+/// The file's text with the watchers setting changed to `value`.
+pub fn with_watchers(text: &str, value: Watchers) -> String {
+    with_setting(text, WATCHERS_KEY, value.as_str())
+}
+
+/// The file's text with `key` set to `value`: its line replaced, or added at
+/// the end. Comments and other lines stay as they are.
+fn with_setting(text: &str, key: &str, value: &str) -> String {
+    let setting = format!("{key} = {value}");
     let mut out = String::new();
     let mut written = false;
     for line in text.trim_start_matches('\u{feff}').lines() {
         let is_setting = !line.trim_start().starts_with('#')
             && line
                 .split_once('=')
-                .is_some_and(|(key, _)| is_idle_stop(key));
+                .is_some_and(|(name, _)| is_key(name, key));
         if is_setting {
             // Written once: a second line for the same key is dropped.
             if !written {
@@ -181,9 +209,18 @@ pub fn load(data_dir: &Path) -> io::Result<(Settings, Vec<String>)> {
 
 /// Changes the idle-stop setting in the file, creating it if needed.
 pub fn save_idle_stop(data_dir: &Path, value: IdleStop) -> io::Result<()> {
+    save(data_dir, |text| with_idle_stop(text, value))
+}
+
+/// Changes the watchers setting in the file, creating it if needed.
+pub fn save_watchers(data_dir: &Path, value: Watchers) -> io::Result<()> {
+    save(data_dir, |text| with_watchers(text, value))
+}
+
+fn save(data_dir: &Path, change: impl FnOnce(&str) -> String) -> io::Result<()> {
     // Read first, and give up if that fails: a file that cannot be read
     // must not be replaced by one that holds this setting alone.
-    let text = with_idle_stop(&read(data_dir)?, value);
+    let text = change(&read(data_dir)?);
     fs::create_dir_all(data_dir)?;
     fs::write(path(data_dir), text)
 }
@@ -201,7 +238,7 @@ fn read(data_dir: &Path) -> io::Result<String> {
 /// The idle policy a pipe proxy starts with, or `None` for a proxy that only
 /// relays. `seconds_override` is the value of [`IDLE_SECONDS_ENV`]; a whole
 /// number of seconds above zero there wins over the setting, anything else is
-/// ignored.
+/// ignored. Watchers are ignored; see [`Settings::idle_policy`].
 pub fn idle_policy(setting: IdleStop, seconds_override: Option<&str>) -> Option<IdlePolicy> {
     let seconds = seconds_override
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -211,6 +248,15 @@ pub fn idle_policy(setting: IdleStop, seconds_override: Option<&str>) -> Option<
         None => Duration::from_secs(u64::from(setting.minutes()?) * 60),
     };
     Some(IdlePolicy::new(idle_after))
+}
+
+impl Settings {
+    /// The idle policy these settings ask for, as [`idle_policy`] with the
+    /// watchers setting applied.
+    pub fn idle_policy(&self, seconds_override: Option<&str>) -> Option<IdlePolicy> {
+        idle_policy(self.idle_stop, seconds_override)
+            .map(|policy| policy.with_watchers(self.watchers))
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +459,92 @@ mod tests {
         assert_eq!(policy.check_every(), Duration::from_secs(60));
         let week = idle_policy(IdleStop::After(IdleStop::MAX_MINUTES), None).unwrap();
         assert_eq!(week.idle_after(), Duration::from_secs(7 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn watchers_do_not_keep_the_engine_awake_by_default() {
+        assert_eq!(Settings::default().watchers, Watchers::Ignored);
+        let (settings, problems) = Settings::parse("idle-stop = 5\n");
+        assert!(problems.is_empty());
+        assert_eq!(settings.watchers, Watchers::Ignored);
+    }
+
+    #[test]
+    fn the_watchers_setting_is_yes_or_no() {
+        let (settings, problems) =
+            Settings::parse("Watchers-Keep-Awake = YES\r\nidle-stop = off\r\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(settings.watchers, Watchers::KeepAwake);
+        assert_eq!(settings.idle_stop, IdleStop::Off);
+        let (settings, problems) = Settings::parse("watchers-keep-awake = on\nidle-stop = 3\n");
+        assert_eq!(settings.watchers, Watchers::Ignored);
+        assert_eq!(settings.idle_stop, IdleStop::After(3));
+        assert_eq!(
+            problems,
+            ["line 1: watchers-keep-awake is `on`, which is neither `yes` nor `no`"]
+        );
+    }
+
+    #[test]
+    fn writing_one_setting_keeps_the_other() {
+        let text = with_idle_stop("", IdleStop::After(5));
+        let text = with_watchers(&text, Watchers::KeepAwake);
+        assert_eq!(
+            text,
+            "# Docklet settings. Change them with `docklet config set`.\n\
+             idle-stop = 5\nwatchers-keep-awake = yes\n"
+        );
+        let text = with_idle_stop(&text, IdleStop::Off);
+        let text = with_watchers(&text, Watchers::Ignored);
+        assert_eq!(
+            text,
+            "# Docklet settings. Change them with `docklet config set`.\n\
+             idle-stop = off\nwatchers-keep-awake = no\n"
+        );
+        let (settings, problems) = Settings::parse(&text);
+        assert!(problems.is_empty());
+        assert_eq!(
+            settings,
+            Settings {
+                idle_stop: IdleStop::Off,
+                watchers: Watchers::Ignored,
+            }
+        );
+    }
+
+    #[test]
+    fn saving_the_watchers_setting_reads_back() {
+        let dir = temp_dir("watchers");
+        save_idle_stop(&dir, IdleStop::After(7)).unwrap();
+        save_watchers(&dir, Watchers::KeepAwake).unwrap();
+        let settings = load(&dir).unwrap().0;
+        assert_eq!(settings.idle_stop, IdleStop::After(7));
+        assert_eq!(settings.watchers, Watchers::KeepAwake);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_policy_carries_the_watchers_setting() {
+        let settings = Settings {
+            idle_stop: IdleStop::After(10),
+            watchers: Watchers::KeepAwake,
+        };
+        let policy = settings.idle_policy(None).unwrap();
+        assert_eq!(policy.watchers(), Watchers::KeepAwake);
+        assert_eq!(policy.idle_after(), Duration::from_secs(600));
+        assert_eq!(
+            settings.idle_policy(Some("20")).unwrap().idle_after(),
+            Duration::from_secs(20)
+        );
+        let off = Settings {
+            idle_stop: IdleStop::Off,
+            watchers: Watchers::KeepAwake,
+        };
+        assert_eq!(off.idle_policy(None), None);
+        assert_eq!(
+            Settings::default().idle_policy(None).unwrap().watchers(),
+            Watchers::Ignored
+        );
     }
 
     #[test]

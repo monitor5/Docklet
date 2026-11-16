@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use docklet_core::docker_client::{self, ContextState};
 use docklet_core::doctor::{self, Check, EngineFacts, Facts, Level};
-use docklet_core::settings::{self, IdleStop};
+use docklet_core::idle::ProxyReport;
+use docklet_core::settings::{self, IdleStop, Settings, Watchers};
 use docklet_core::skills::{self, InstallOutcome, SkillStatus};
 use docklet_core::{ProxyMode, disk, engine};
 use docklet_wsl::tools::{self, CONTEXT_NAME, CliSetup};
@@ -394,29 +395,61 @@ fn config_get(ui: &Ui, key: Option<ConfigKey>) -> Result<Json, Failure> {
             settings::path(&data_dir).display()
         );
     }
-    let idle_stop = settings.idle_stop;
     match key {
-        Some(ConfigKey::IdleStop) => {
-            ui.say(&idle_stop.to_string());
-            Ok(idle_stop_data(idle_stop).into())
+        Some(key) => {
+            ui.say(&setting_value(&settings, key));
+            Ok(setting_data(&settings, key).into())
         }
         None => {
-            ui.say(&format!("{} = {idle_stop}", settings::IDLE_STOP_KEY));
-            let all: Vec<Json> = vec![idle_stop_data(idle_stop).into()];
+            for key in ConfigKey::ALL {
+                ui.say(&format!(
+                    "{} = {}",
+                    key.name(),
+                    setting_value(&settings, key)
+                ));
+            }
+            let all: Vec<Json> = ConfigKey::ALL
+                .into_iter()
+                .map(|key| setting_data(&settings, key).into())
+                .collect();
             Ok(Object::new().set("settings", all).into())
         }
     }
 }
 
+/// A setting's value as `config set` takes it.
+fn setting_value(settings: &Settings, key: ConfigKey) -> String {
+    match key {
+        ConfigKey::IdleStop => settings.idle_stop.to_string(),
+        ConfigKey::Watchers => settings.watchers.to_string(),
+    }
+}
+
+fn setting_data(settings: &Settings, key: ConfigKey) -> Object {
+    match key {
+        ConfigKey::IdleStop => idle_stop_data(settings.idle_stop),
+        ConfigKey::Watchers => watchers_data(settings.watchers),
+    }
+}
+
 fn config_set(ui: &Ui, change: ConfigChange) -> Result<Json, Failure> {
-    let ConfigChange::IdleStop(idle_stop) = change;
-    settings::save_idle_stop(&docklet_wsl::data_dir()?, idle_stop)?;
-    // A proxy reads the setting once, when it starts.
+    let data_dir = docklet_wsl::data_dir()?;
+    let data = match change {
+        ConfigChange::IdleStop(idle_stop) => {
+            settings::save_idle_stop(&data_dir, idle_stop)?;
+            idle_stop_data(idle_stop)
+        }
+        ConfigChange::Watchers(watchers) => {
+            settings::save_watchers(&data_dir, watchers)?;
+            watchers_data(watchers)
+        }
+    };
+    // A proxy reads the settings once, when it starts.
     let restart_needed = proxy::is_running();
-    for line in config_set_lines(idle_stop, restart_needed) {
+    for line in config_set_lines(change, restart_needed) {
         ui.say(&line);
     }
-    Ok(idle_stop_data(idle_stop)
+    Ok(data
         .set("applies_from", "next_start")
         .set("restart_needed", restart_needed)
         .into())
@@ -431,16 +464,36 @@ fn idle_stop_data(idle_stop: IdleStop) -> Object {
         .set("minutes", idle_stop.minutes().map(u64::from))
 }
 
-/// What `config set idle-stop` prints: what the value means, and when it
-/// takes effect.
-fn config_set_lines(idle_stop: IdleStop, proxy_running: bool) -> Vec<String> {
-    let meaning = match idle_stop {
-        IdleStop::Off => "idle-stop = off: the engine runs until `docklet stop`.".to_string(),
-        IdleStop::After(minutes) => format!(
+/// The watchers setting as `--json` reports it, with the value as a boolean.
+fn watchers_data(watchers: Watchers) -> Object {
+    Object::new()
+        .set("key", settings::WATCHERS_KEY)
+        .set("value", watchers.as_str())
+        .set("keep_awake", watchers == Watchers::KeepAwake)
+}
+
+/// What `config set` prints: what the value means, and when it takes
+/// effect.
+fn config_set_lines(change: ConfigChange, proxy_running: bool) -> Vec<String> {
+    let meaning = match change {
+        ConfigChange::IdleStop(IdleStop::Off) => {
+            "idle-stop = off: the engine runs until `docklet stop`.".to_string()
+        }
+        ConfigChange::IdleStop(IdleStop::After(minutes)) => format!(
             "idle-stop = {minutes}: an engine nothing used for {minutes} {} is stopped, \
              and starts again when Docker is used.",
             if minutes == 1 { "minute" } else { "minutes" }
         ),
+        ConfigChange::Watchers(Watchers::Ignored) => {
+            "watchers-keep-awake = no: a connection that carries nothing, such as Docker \
+             Desktop or an IDE watching the engine, does not keep it awake."
+                .to_string()
+        }
+        ConfigChange::Watchers(Watchers::KeepAwake) => {
+            "watchers-keep-awake = yes: every open connection keeps the engine awake, even \
+             one that carries nothing."
+                .to_string()
+        }
     };
     let applies = if proxy_running {
         "The change applies from the next `docklet start`. The engine that is running now \
@@ -515,7 +568,8 @@ fn run_doctor(ui: &Ui) -> Result<Json, Failure> {
         data_dir: data_dir.display().to_string(),
         free_space: disk::free_space(&data_dir).map_err(|err| err.to_string()),
     };
-    let checks = doctor::report(&facts);
+    let mut checks = doctor::report(&facts);
+    checks.push(idle_check(facts.proxy, &data_dir));
     for line in doctor_lines(&checks) {
         ui.say(&line);
     }
@@ -526,6 +580,40 @@ fn run_doctor(ui: &Ui) -> Result<Json, Failure> {
             ui.say(&doctor_summary(&checks));
             Ok(data)
         }
+    }
+}
+
+/// What keeps the engine awake, as an idle-stop proxy reports it. Asking
+/// connects to nothing, so it never wakes the engine.
+fn idle_check(proxy_mode: ProxyMode, data_dir: &Path) -> Check {
+    let report = match proxy_mode {
+        ProxyMode::IdleStop => proxy::report(data_dir),
+        _ => None,
+    };
+    idle_verdict(proxy_mode, report.as_ref())
+}
+
+fn idle_verdict(proxy_mode: ProxyMode, report: Option<&ProxyReport>) -> Check {
+    let (level, detail, fix) = match (proxy_mode, report) {
+        (ProxyMode::IdleStop, Some(report)) => report.verdict(),
+        (ProxyMode::IdleStop, None) => (
+            Level::Ok,
+            "on; the pipe proxy did not say what its connections are doing".to_string(),
+            None,
+        ),
+        (ProxyMode::Plain, _) => (
+            Level::Ok,
+            "off: the engine runs until `docklet stop`".to_string(),
+            None,
+        ),
+        (ProxyMode::Down, _) => (Level::Ok, "no pipe proxy runs".to_string(), None),
+    };
+    Check {
+        id: "idle_stop",
+        title: "Idle stop",
+        level,
+        detail,
+        fix,
     }
 }
 
@@ -743,6 +831,7 @@ mod tests {
         for check in doctor::report(&facts) {
             assert!(check.title.len() <= 17, "{}", check.title);
         }
+        assert!(idle_verdict(ProxyMode::Down, None).title.len() <= 17);
     }
 
     #[test]
@@ -934,30 +1023,129 @@ mod tests {
 
     #[test]
     fn setting_idle_stop_says_when_the_change_applies() {
+        let idle = |idle_stop| ConfigChange::IdleStop(idle_stop);
         assert_eq!(
-            config_set_lines(IdleStop::After(5), false),
+            config_set_lines(idle(IdleStop::After(5)), false),
             [
                 "idle-stop = 5: an engine nothing used for 5 minutes is stopped, \
                  and starts again when Docker is used.",
                 "The change applies from the next `docklet start`.",
             ]
         );
-        let one = config_set_lines(IdleStop::After(1), false);
+        let one = config_set_lines(idle(IdleStop::After(1)), false);
         assert!(one[0].contains("for 1 minute is stopped"), "{}", one[0]);
         // A proxy that is running keeps what it started with.
         assert_eq!(
-            config_set_lines(IdleStop::Off, true),
+            config_set_lines(idle(IdleStop::Off), true),
             [
                 "idle-stop = off: the engine runs until `docklet stop`.",
                 "The change applies from the next `docklet start`. The engine that is \
                  running now keeps the old setting until `docklet stop`.",
             ]
         );
-        for idle_stop in [IdleStop::Off, IdleStop::After(30)] {
+        let changes = [
+            idle(IdleStop::Off),
+            idle(IdleStop::After(30)),
+            ConfigChange::Watchers(Watchers::Ignored),
+            ConfigChange::Watchers(Watchers::KeepAwake),
+        ];
+        for change in changes {
             for proxy_running in [true, false] {
-                let lines = config_set_lines(idle_stop, proxy_running);
+                let lines = config_set_lines(change, proxy_running);
                 assert!(lines[1].contains("next `docklet start`"));
             }
         }
+    }
+
+    #[test]
+    fn setting_watchers_says_what_counts_as_use() {
+        let lines = config_set_lines(ConfigChange::Watchers(Watchers::Ignored), false);
+        assert!(
+            lines[0].starts_with("watchers-keep-awake = no: "),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("does not keep it awake"), "{}", lines[0]);
+        let lines = config_set_lines(ConfigChange::Watchers(Watchers::KeepAwake), false);
+        assert!(
+            lines[0].starts_with("watchers-keep-awake = yes: "),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn watchers_data_shape() {
+        let no: Json = watchers_data(Watchers::Ignored).into();
+        assert_eq!(
+            no.render(),
+            r#"{"key":"watchers-keep-awake","value":"no","keep_awake":false}"#
+        );
+        let yes: Json = watchers_data(Watchers::KeepAwake).into();
+        assert_eq!(
+            yes.render(),
+            r#"{"key":"watchers-keep-awake","value":"yes","keep_awake":true}"#
+        );
+    }
+
+    #[test]
+    fn config_get_lists_every_setting() {
+        let settings = Settings {
+            idle_stop: IdleStop::After(25),
+            watchers: Watchers::KeepAwake,
+        };
+        let values: Vec<String> = ConfigKey::ALL
+            .into_iter()
+            .map(|key| format!("{} = {}", key.name(), setting_value(&settings, key)))
+            .collect();
+        assert_eq!(values, ["idle-stop = 25", "watchers-keep-awake = yes"]);
+        let data: Json = setting_data(&settings, ConfigKey::Watchers).into();
+        assert!(data.render().contains(r#""keep_awake":true"#));
+    }
+
+    #[test]
+    fn the_idle_check_follows_the_proxy_and_its_report() {
+        use docklet_core::idle::{
+            ConnectionState, EnginePhase, ProxyReport, ReportedConnection, Watchers,
+        };
+        let plain = idle_verdict(ProxyMode::Plain, None);
+        assert_eq!((plain.id, plain.title), ("idle_stop", "Idle stop"));
+        assert_eq!(plain.level, Level::Ok);
+        assert_eq!(plain.detail, "off: the engine runs until `docklet stop`");
+        assert_eq!(
+            idle_verdict(ProxyMode::Down, None).detail,
+            "no pipe proxy runs"
+        );
+        let silent = idle_verdict(ProxyMode::IdleStop, None);
+        assert_eq!(silent.level, Level::Ok);
+        assert!(silent.detail.starts_with("on; "), "{}", silent.detail);
+        let report = ProxyReport {
+            phase: EnginePhase::Running,
+            watchers: Watchers::KeepAwake,
+            idle_after: Duration::from_secs(600),
+            unused_for: None,
+            connections: vec![ReportedConnection {
+                state: ConnectionState::Open,
+                pid: Some(4242),
+                program: Some("com.docker.build.exe".to_string()),
+                quiet: Duration::from_secs(3600),
+                age: Duration::from_secs(3600),
+                to_engine: 300,
+                to_client: 900,
+            }],
+        };
+        let watched = idle_verdict(ProxyMode::IdleStop, Some(&report));
+        assert_eq!(watched.level, Level::Warn);
+        assert!(
+            watched.detail.contains("com.docker.build.exe (pid 4242)"),
+            "{}",
+            watched.detail
+        );
+        assert_eq!(
+            watched.fix,
+            Some("docklet config set watchers-keep-awake no")
+        );
+        // A warning never fails doctor.
+        assert_eq!(doctor_failure(&[watched]), None);
     }
 }

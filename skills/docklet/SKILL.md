@@ -84,8 +84,8 @@ before Docker runs (`not_running`, `docker_cli_missing`).
 | `docklet doctor` | Check the setup; exit 1 if a check fails | `healthy`, `summary`, `checks` |
 | `docklet start` | Start the engine, or wake it, and wait until Docker is ready | `state`, `docker_host`, `pipe` |
 | `docklet stop` | Stop the engine; frees its memory. It stays off until started | `proxy_running` |
-| `docklet config get [<key>]` | Show the settings, or one | `key`, `value`, `minutes`; without a key, `settings` with one such entry each |
-| `docklet config set <key> <value>` | Change a setting: `idle-stop` takes a number of minutes or `off`. Applies from the next `docklet start` | `key`, `value`, `minutes`, `applies_from`, `restart_needed` |
+| `docklet config get [<key>]` | Show the settings, or one | `key`, `value`, and `minutes` (`idle-stop`) or `keep_awake` (`watchers-keep-awake`); without a key, `settings` with one such entry each |
+| `docklet config set <key> <value>` | Change a setting: `idle-stop` takes a number of minutes or `off`, `watchers-keep-awake` takes `yes` or `no`. Applies from the next `docklet start` | the same as `config get <key>`, and `applies_from`, `restart_needed` |
 | `docklet install [--base NAME]` | Download and install the engine distro (`up` does this too) | `distro`, `base`, `rootfs_file` |
 | `docklet bases` | Linux bases available for the engine distro | `default`, `bases` |
 | `docklet cli setup` | Install the Windows `docker` CLI and Compose if missing, create the `docklet` Docker context (`up` does this too) | `docker_host`, `docker_cli`, `docker_context`, `changed` |
@@ -107,8 +107,10 @@ first word of the output is the same state, written with a hyphen
 `doctor` returns one entry per check: `id`, `title`, `status` (`ok`, `warn` or
 `fail`), `detail`, and `fix` (a command) when there is one. The checks are
 `wsl`, `distro_installed`, `distro_running`, `dockerd`, `pipe_proxy`,
-`docker_cli`, `compose_plugin`, `docker_context`, `mirrored_networking` and
-`disk_space`. They are in the order problems have to be solved, so apply the
+`docker_cli`, `compose_plugin`, `docker_context`, `mirrored_networking`,
+`disk_space` and `idle_stop`. `idle_stop` says what keeps the engine awake and
+names the client program, or which watchers wait while it sleeps; it never
+fails. They are in the order problems have to be solved, so apply the
 first `fix` and run `doctor` again. A `fail` means Docker does not work until
 it is fixed, and that includes an engine that was stopped; a sleeping engine
 passes, because Docker works with it. A `warn` does not stop Docker from
@@ -117,24 +119,35 @@ working. When `doctor` exits 0, `docklet docker` works.
 ## Idle stop
 
 A running engine holds more than a gigabyte of memory even without
-containers. So the engine is stopped when, for the idle time, no Docker client
-was connected and no container was running, and it is started again by the
-next Docker command, whichever client sends it. `docklet status` then says
-`sleeping`.
+containers. So the engine is stopped when, for the idle time, no Docker
+connection carried any data and no container was running, and it is started
+again by the next Docker command, whichever client sends it. `docklet status`
+then says `sleeping`.
 
 - `sleeping` is not a problem and needs no `docklet start`. Run the Docker
   command; allow it some seconds more than usual.
-- A running container keeps the engine up. So does an open connection, such
-  as `docklet docker logs -f` or `docklet docker events`.
+- A running container keeps the engine up, and so does any command that is
+  moving data: a pull, a build, `logs -f` of a container that writes.
+- A connection that is open but carries nothing does not: Docker Desktop, an
+  IDE's Docker view or `docklet docker events` watching an engine with no
+  running container. Such a connection is closed when the engine goes to
+  sleep. When the same program reconnects only to watch, it waits without
+  waking the engine and is served at the next wake. A real command from it,
+  or any command from another program, wakes the engine as usual.
+- A program that polls (runs `docker ps` every few seconds) counts as use and
+  keeps the engine awake. `docklet doctor --json`, check `idle_stop`, names
+  the program that keeps it awake.
 - `docklet stop` is different: the engine then stays off, and
   `docklet docker` fails with `not_running`, until `docklet start` or
   `docklet up`.
 - `docklet config get idle-stop` shows the idle time in minutes, or `off`.
   `docklet config set idle-stop 30` changes it and
   `docklet config set idle-stop off` keeps the engine running until it is
-  stopped. A change applies from the next `docklet start`; when
-  `restart_needed` is true the engine that is running keeps the old setting
-  until `docklet stop`. Do not change the setting unless the user asks.
+  stopped. `docklet config set watchers-keep-awake yes` makes every open
+  connection count as use again, however quiet. A change applies from the
+  next `docklet start`; when `restart_needed` is true the engine that is
+  running keeps the old setting until `docklet stop`. Do not change a
+  setting unless the user asks.
 
 ## Error codes
 
