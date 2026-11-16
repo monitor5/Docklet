@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use docklet_core::settings::{self, IdleStop};
+use docklet_core::settings::{self, IdleStop, Watchers};
 
 use crate::failure::{ErrorCode, Failure};
 
@@ -66,14 +66,16 @@ pub enum SkillsAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {
     IdleStop,
+    Watchers,
 }
 
 impl ConfigKey {
-    pub const ALL: [Self; 1] = [Self::IdleStop];
+    pub const ALL: [Self; 2] = [Self::IdleStop, Self::Watchers];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::IdleStop => settings::IDLE_STOP_KEY,
+            Self::Watchers => settings::WATCHERS_KEY,
         }
     }
 
@@ -95,6 +97,7 @@ impl ConfigKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigChange {
     IdleStop(IdleStop),
+    Watchers(Watchers),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +239,14 @@ fn config_set(options: &[&str]) -> Result<Command, Failure> {
                     "{} takes a number of minutes from 1 to {}, or `off`; got `{value}`",
                     settings::IDLE_STOP_KEY,
                     IdleStop::MAX_MINUTES
+                ))
+            })?,
+        ConfigKey::Watchers => Watchers::parse(value)
+            .map(ConfigChange::Watchers)
+            .ok_or_else(|| {
+                Failure::usage(format!(
+                    "{} takes `yes` or `no`; got `{value}`",
+                    settings::WATCHERS_KEY
                 ))
             })?,
     };
@@ -420,12 +431,37 @@ mod tests {
         assert_eq!(unknown.code, ErrorCode::Usage);
         assert_eq!(
             unknown.message,
-            "unknown setting `memory`; the settings are: idle-stop"
+            "unknown setting `memory`; the settings are: idle-stop, watchers-keep-awake"
         );
         assert_eq!(
             failure("config get idle-stop now").message,
             "usage: docklet config get [<key>]"
         );
+        assert_eq!(
+            command("config get watchers-keep-awake"),
+            Command::ConfigGet(Some(ConfigKey::Watchers))
+        );
+    }
+
+    #[test]
+    fn config_set_watchers_takes_yes_or_no() {
+        assert_eq!(
+            command("config set watchers-keep-awake yes"),
+            Command::ConfigSet(ConfigChange::Watchers(Watchers::KeepAwake))
+        );
+        assert_eq!(
+            command("config set watchers-keep-awake no"),
+            Command::ConfigSet(ConfigChange::Watchers(Watchers::Ignored))
+        );
+        for value in ["on", "off", "true", "5"] {
+            let line = format!("config set watchers-keep-awake {value}");
+            let failure = failure(&line);
+            assert_eq!(failure.code, ErrorCode::Usage, "{line}");
+            assert_eq!(
+                failure.message,
+                format!("watchers-keep-awake takes `yes` or `no`; got `{value}`")
+            );
+        }
     }
 
     #[test]
@@ -478,7 +514,7 @@ mod tests {
         }
         assert_eq!(
             failure("config set memory 4G").message,
-            "unknown setting `memory`; the settings are: idle-stop"
+            "unknown setting `memory`; the settings are: idle-stop, watchers-keep-awake"
         );
         // `config` alone names no command.
         let bare = parse_line("config");

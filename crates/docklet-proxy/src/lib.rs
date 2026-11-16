@@ -66,12 +66,19 @@ pub fn serve_configured(
         .map(|(settings, _)| settings)
         .unwrap_or_default();
     let seconds = std::env::var(settings::IDLE_SECONDS_ENV).ok();
-    match settings::idle_policy(settings.idle_stop, seconds.as_deref()) {
+    match settings.idle_policy(seconds.as_deref()) {
         Some(policy) => {
             if config.trace {
-                eprintln!("[engine] idle stop after {:?}", policy.idle_after());
+                eprintln!(
+                    "[engine] idle stop after {:?}; {} = {}",
+                    policy.idle_after(),
+                    settings::WATCHERS_KEY,
+                    policy.watchers()
+                );
             }
-            serve_with_idle_stop(config, IdleStop::new(policy, hooks))
+            let idle =
+                IdleStop::new(policy, hooks).with_report(docklet_core::idle::report_path(data_dir));
+            serve_with_idle_stop(config, idle)
         }
         None => serve(config),
     }

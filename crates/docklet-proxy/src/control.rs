@@ -8,6 +8,10 @@
 //! so by existing. Whoever shows the engine's state needs to know: behind
 //! such a proxy a stopped distro is asleep, not stopped. Asking costs two
 //! `OpenEventW` calls and no `wsl.exe`.
+//!
+//! An idle-stop proxy also answers report requests: setting the report
+//! event makes it write what its connections are doing to a file and set
+//! the done event (see `request_report`). It costs nothing until asked.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -15,12 +19,15 @@ use std::time::{Duration, Instant};
 use docklet_core::ProxyMode;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CreateEventW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+    CreateEventW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, ResetEvent,
+    SYNCHRONIZATION_SYNCHRONIZE, SetEvent, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, w};
 
 const STOP_EVENT: PCWSTR = w!("Local\\docklet-proxy-stop");
 const IDLE_STOP_EVENT: PCWSTR = w!("Local\\docklet-proxy-idle-stop");
+const REPORT_EVENT: PCWSTR = w!("Local\\docklet-proxy-report");
+const REPORT_DONE_EVENT: PCWSTR = w!("Local\\docklet-proxy-report-done");
 
 /// Held by the running proxy.
 pub struct StopSignal(HANDLE);
@@ -85,6 +92,110 @@ impl Drop for IdleStopMarker {
             let _ = CloseHandle(self.0);
         }
     }
+}
+
+/// Held by an idle-stop proxy that writes reports: a request event other
+/// processes set, and a done event the proxy sets when the report is there.
+/// Both reset themselves when a waiter wakes.
+pub(crate) struct ReportSignal {
+    request: HANDLE,
+    done: HANDLE,
+}
+
+// The handles are only waited on and set; Win32 event handles are
+// thread-safe.
+unsafe impl Send for ReportSignal {}
+unsafe impl Sync for ReportSignal {}
+
+impl ReportSignal {
+    pub(crate) fn create() -> io::Result<Self> {
+        // SAFETY: plain Win32 calls; the handles are closed in `Drop`, or
+        // here if the second call fails.
+        unsafe {
+            let request =
+                CreateEventW(None, false, false, REPORT_EVENT).map_err(io::Error::other)?;
+            match CreateEventW(None, false, false, REPORT_DONE_EVENT) {
+                Ok(done) => Ok(Self { request, done }),
+                Err(err) => {
+                    let _ = CloseHandle(request);
+                    Err(io::Error::other(err))
+                }
+            }
+        }
+    }
+
+    /// Blocks the calling thread until a report is requested.
+    pub(crate) fn wait(&self) {
+        loop {
+            // SAFETY: the handle is valid for the lifetime of `self`.
+            if unsafe { WaitForSingleObject(self.request, INFINITE) } == WAIT_OBJECT_0 {
+                return;
+            }
+            // A failed wait returns at once; never retry it in a tight loop.
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Tells the process that asked that the report is written.
+    pub(crate) fn done(&self) {
+        // SAFETY: the handle is valid for the lifetime of `self`.
+        unsafe {
+            let _ = SetEvent(self.done);
+        }
+    }
+}
+
+impl Drop for ReportSignal {
+    fn drop(&mut self) {
+        // SAFETY: both handles came from CreateEventW.
+        unsafe {
+            let _ = CloseHandle(self.request);
+            let _ = CloseHandle(self.done);
+        }
+    }
+}
+
+/// Asks the running idle-stop proxy to write its report (to the file
+/// `docklet_core::idle::report_path` names) and waits for it, for at most
+/// `timeout`. False when no such proxy runs or it did not answer in time;
+/// a proxy of an older version never answers.
+pub fn request_report(timeout: Duration) -> bool {
+    let Some(request) = open(REPORT_EVENT) else {
+        return false;
+    };
+    // SAFETY: plain Win32 call with a static name.
+    let done = unsafe {
+        OpenEventW(
+            SYNCHRONIZATION_SYNCHRONIZE | EVENT_MODIFY_STATE,
+            false,
+            REPORT_DONE_EVENT,
+        )
+    };
+    let answered = match done {
+        Ok(done) => {
+            let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+            // SAFETY: both handles are open with the rights these calls need
+            // and are closed below.
+            let answered = unsafe {
+                // A done left over from an earlier request that nobody
+                // waited for must not count for this one.
+                let _ = ResetEvent(done);
+                let _ = SetEvent(request);
+                WaitForSingleObject(done, millis) == WAIT_OBJECT_0
+            };
+            // SAFETY: the handle came from OpenEventW.
+            unsafe {
+                let _ = CloseHandle(done);
+            }
+            answered
+        }
+        Err(_) => false,
+    };
+    // SAFETY: the handle came from OpenEventW.
+    unsafe {
+        let _ = CloseHandle(request);
+    }
+    answered
 }
 
 /// True when a proxy process of this user is running.
