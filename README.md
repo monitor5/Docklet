@@ -18,7 +18,7 @@ Desktop required.
   Every command takes `--json` and then prints one JSON object with a stable
   error code and the next command to run; `docklet help --json` lists the
   commands as data.
-- **Idle stop**: an engine with no open connection and no running container
+- **Idle stop**: an engine that carried no Docker traffic and ran no container
   for 10 minutes stops by itself and shows as `sleeping`; the next Docker
   command starts it again. `docklet config set idle-stop <minutes|off>` changes
   or disables this. See [Idle stop](#idle-stop).
@@ -75,8 +75,16 @@ The WSL VM is what an engine costs: around 1 GB of host memory even with no
 container. So the pipe proxy stops the distro once nothing has used it for a
 while, and keeps listening on the pipe.
 
-- **Idle** means no open connection to the pipe and no running container. A
-  running container keeps the engine up, and so does the open Docklet window.
+- **Idle** means no data on any connection to the pipe and no running
+  container. A running container keeps the engine up. A connection that is
+  open but silent does not: Docker Desktop's build listener, an IDE's Docker
+  view, a forgotten `docker events` or the open Docklet window. Those
+  connections are closed when the engine goes to sleep.
+- A program that was cut off that way and reconnects only to check or listen
+  is held without waking the engine and is served at the next wake.
+  `docklet config set watchers-keep-awake yes` restores the stricter rule
+  that any open connection keeps the engine awake. `docklet doctor` names the
+  program that keeps an engine awake.
 - **Sleeping** is the state after that. `docklet status` prints `sleeping`,
   with `"ready": true` in JSON. Any Docker client that connects wakes the
   engine; that first command takes as long as an engine start. `status`,
