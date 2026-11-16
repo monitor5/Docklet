@@ -14,8 +14,9 @@ pub enum WindowState {
     /// No window: nothing is watched, followed or sampled.
     #[default]
     Gone,
-    /// Minimised or covered. Streams stay open so the lists are current when
-    /// it shows again; nothing is polled or sampled.
+    /// Minimised or covered. Nothing is polled or sampled. `Streams` keeps
+    /// what is open, so a followed log goes on; `App` ends the event
+    /// subscription as well, since it loads no list for a hidden window.
     Hidden,
     Visible,
 }

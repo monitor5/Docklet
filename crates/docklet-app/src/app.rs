@@ -231,8 +231,10 @@ impl App {
     ///
     /// The engine state is polled only while the window is visible, and
     /// once when it becomes visible; what was known before that is
-    /// forgotten until the poll answers. `Hidden` ends the usage sampling;
-    /// `Gone` also ends the event subscription and every followed log.
+    /// forgotten until the poll answers. `Hidden` ends the usage sampling
+    /// and the event subscription and forgets the shown list, so nothing
+    /// is loaded for a window nobody sees; a followed log goes on, and is
+    /// whole when the window is back. `Gone` ends the logs too.
     /// Saying the same state again does nothing, so it can be called from
     /// every message that might have changed it.
     pub fn set_window(&self, window: WindowState) {
@@ -242,7 +244,7 @@ impl App {
                 return;
             }
             shared.window = window;
-            if window == WindowState::Gone {
+            if window != WindowState::Visible {
                 shared.list = None;
             }
             if window == WindowState::Visible {
@@ -253,7 +255,12 @@ impl App {
                 shared.state = None;
             }
         }
-        self.inner.backend.streams().set_window(window);
+        let streams = self.inner.backend.streams();
+        streams.set_window(window);
+        if window == WindowState::Hidden {
+            // `Gone` ended them already, with the logs.
+            streams.stop_events();
+        }
         self.inner.apply_sampling();
         if window == WindowState::Visible {
             self.inner.poll_now.notify_one();
@@ -337,12 +344,20 @@ impl App {
         });
     }
 
-    /// Says which list the window shows, or `None` for none. The list is
-    /// loaded now and again whenever Docker reports a change; each load
-    /// arrives as a `List`. Does nothing unless the engine runs.
+    /// Says which list the window shows, or `None` for none (a log covers
+    /// it). The list is loaded now and again whenever Docker reports a
+    /// change; each load arrives as a `List`. Loads nothing unless the
+    /// engine runs.
+    ///
+    /// Without a list nothing listens to Docker's events, and the
+    /// containers' usage is only taken for the list that shows it: what
+    /// nobody sees is not asked for every second.
     pub fn show_list(&self, kind: Option<ResourceKind>) {
         self.inner.shared().list = kind;
-        let Some(kind) = kind else { return };
+        self.inner.apply_sampling();
+        let Some(kind) = kind else {
+            return self.inner.backend.streams().stop_events();
+        };
         if self.inner.may_use_docker() {
             self.inner.backend.streams().watch_events();
         }
@@ -472,7 +487,8 @@ impl App {
 
     /// Says whether the window shows usage figures. While it does and is
     /// visible, `HostUsage` arrives every two seconds and, from a running
-    /// engine whose list is shown, `ContainerUsage` about once a second.
+    /// engine whose list of containers is shown (`show_list`),
+    /// `ContainerUsage` about once a second.
     pub fn set_usage(&self, shown: bool) {
         self.inner.shared().shows_usage = shown;
         self.inner.apply_sampling();
@@ -548,8 +564,11 @@ impl Inner {
         let shared = self.shared();
         let sampled = sampling(shared.window, shared.state.as_ref());
         let shown = shared.shows_usage;
+        // The containers' figures are columns of their list and nothing
+        // else: every round of them is a request per running container.
+        let listed = shared.list == Some(ResourceKind::Container);
         let streams = self.backend.streams();
-        streams.set_usage(shown && sampled.host, shown && sampled.containers);
+        streams.set_usage(shown && sampled.host, shown && sampled.containers && listed);
     }
 
     /// Polls the engine state once and tells the shell.

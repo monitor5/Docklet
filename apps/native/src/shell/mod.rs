@@ -3,7 +3,13 @@
 //!
 //! The window is created on demand and destroyed on close; only the host
 //! stays. Its state lives in a `Box<Shell>` whose pointer is the window's
-//! user data from creation until `WM_NCDESTROY`.
+//! user data from creation until `WM_NCDESTROY`. Everything the window
+//! holds goes with that box: fonts, brushes, the log's bitmap and buffers.
+//!
+//! Closing and minimising are two things. A closed window is gone, and the
+//! next one starts from nothing (`UiEvent::WindowClosed`). A minimised one
+//! keeps what it shows and stops drawing: no timer runs, and whoever
+//! drives it sends nothing until it is back (`UiEvent::WindowHidden`).
 //!
 //! Window procedures re-enter (a message sent to the list comes back as
 //! `WM_NOTIFY`), so no `RefCell` is borrowed mutably across a call into
@@ -22,7 +28,7 @@ use windows::Win32::Graphics::Gdi::{
     RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, SetBkColor, SetTextColor,
 };
 use windows::Win32::UI::Controls::{
-    LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, WC_BUTTONW, WC_STATICW,
+    DRAWITEMSTRUCT, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, WC_BUTTONW, WC_STATICW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -36,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     ShowWindow, WA_INACTIVE, WINDOWPLACEMENT, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU,
     WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP,
+    WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KILLFOCUS,
     WM_MOUSEWHEEL, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
     WM_SIZE, WM_TIMER, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
 };
@@ -62,7 +68,6 @@ use crate::win::{
 
 const MAIN_CLASS: PCWSTR = w!("Docklet.Native.Main");
 const LOG_CLASS: PCWSTR = w!("Docklet.Native.Log");
-const USAGE_CLASS: PCWSTR = w!("Docklet.Native.Usage");
 
 mod ids {
     pub const TABS: usize = 100;
@@ -135,6 +140,9 @@ pub(crate) struct Shell {
     tab: Cell<usize>,
     /// The filter text is being set by code, so its change is not news.
     quiet_filter: Cell<bool>,
+    /// Tables arrived while a log covered the list; it shows them when the
+    /// log is closed.
+    table_stale: Cell<bool>,
     log_open: Cell<bool>,
     /// Shown and not minimised.
     visible: Cell<bool>,
@@ -146,7 +154,6 @@ pub(crate) struct Shell {
 pub(crate) fn register_classes() {
     register_class(MAIN_CLASS, Some(main_proc));
     register_class(LOG_CLASS, Some(logs::log_proc));
-    register_class(USAGE_CLASS, Some(usage_proc));
 }
 
 fn shell_of<'a>(hwnd: HWND) -> Option<&'a Shell> {
@@ -202,17 +209,25 @@ fn create() {
     let static_text = |style: u32| child(hwnd, WC_STATICW, "", style, 0, 0);
     let button = |label: &str, id: usize| child(hwnd, WC_BUTTONW, label, WS_TABSTOP.0, 0, id);
 
+    // Controls are read and tabbed through in the order they are made, so
+    // they are made from the top of the window down. The meters come and go
+    // later; they take their place after the banner.
+    let tabs = TabStrip::create(hwnd, ids::TABS);
+    let status = static_text(SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS);
+    let header_button = button("", ids::HEADER_BUTTON);
+    let banner = BannerBar::create(hwnd, ids::BANNER_DISMISS);
+    let usage = UsageStrip::create(hwnd, ids::USAGE, banner.dismiss);
     let shell = Box::new(Shell {
         hwnd,
         theme: RefCell::new(Rc::new(Theme::new(ctx.dark()))),
         fonts: RefCell::new(Rc::new(Fonts::new(dpi.0, hwnd))),
         dpi: Cell::new(dpi),
-        tabs: TabStrip::create(hwnd, ids::TABS),
-        status: static_text(SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS),
-        header_button: button("", ids::HEADER_BUTTON),
-        banner: BannerBar::create(hwnd, ids::BANNER_DISMISS),
+        tabs,
+        status,
+        header_button,
+        banner,
         banner_rect: Cell::new(RECT::default()),
-        usage: UsageStrip::create(hwnd, USAGE_CLASS, ids::USAGE),
+        usage,
         entry: EntryRow::create(hwnd, ids::ENTRY_EDIT, ids::ENTRY_BUTTON),
         has_entry: Cell::new(false),
         filter: FilterBox::create(hwnd, ids::FILTER),
@@ -234,6 +249,7 @@ fn create() {
         ),
         tab: Cell::new(0),
         quiet_filter: Cell::new(false),
+        table_stale: Cell::new(false),
         log_open: Cell::new(false),
         visible: Cell::new(false),
         timer: Cell::new(false),
@@ -253,7 +269,8 @@ fn create() {
 
     shell.apply_fonts();
     shell.apply_theme();
-    shell.tab.set(ctx.last_tab.get());
+    // A new window is on its first tab, with nothing typed and nothing
+    // selected: what the last one showed went with it.
     shell.header_changed();
     shell.banner_changed();
     shell.usage_changed();
@@ -420,7 +437,7 @@ impl Shell {
         show_window(self.header_button, has_header_button);
         show_window(self.banner.text, has_banner);
         show_window(self.banner.dismiss, has_banner);
-        show_window(self.usage.hwnd, has_usage);
+        self.usage.set_visible(has_usage);
         let tables = view == View::Tables;
         self.entry.set_visible(tables && self.has_entry.get());
         for control in self.filter.controls() {
@@ -528,7 +545,8 @@ impl Shell {
             self.banner_rect.set(RECT::default());
         }
         if has_usage {
-            place(self.usage.hwnd, margin, y, width - 2 * margin, px(40));
+            self.usage
+                .layout(margin, y, width - 2 * margin, px(40), dpi);
             y += px(40) + px(8);
         }
 
@@ -611,7 +629,11 @@ impl Shell {
         }
     }
 
-    /// The window was shown or restored (true), or minimised or closed.
+    /// The window was shown or restored (true), or minimised. Minimised it
+    /// keeps everything it shows, a followed log and its lines included,
+    /// and does nothing: no timer runs and nothing is drawn. Only the
+    /// log's bitmap goes, which is as large as the view and drawn again in
+    /// a moment.
     fn set_visible(&self, visible: bool) {
         if self.visible.replace(visible) == visible {
             return;
@@ -664,24 +686,24 @@ impl Shell {
     }
 
     pub(crate) fn usage_changed(&self) {
-        let (meters_shown, was_shown) = {
-            let model = ctx().model.borrow();
-            self.usage.set(&model.usage);
-            (
-                !model.usage.is_empty(),
-                crate::win::is_visible(self.usage.hwnd),
-            )
-        };
-        if meters_shown != was_shown {
+        // A meter that changed draws itself; only another number of meters
+        // moves anything else.
+        let resized = self.usage.set(&ctx().model.borrow().usage);
+        if resized {
             self.apply_visibility();
             self.layout();
         }
     }
 
     fn on_command(&self, id: usize, code: u32) {
-        use windows::Win32::UI::WindowsAndMessaging::{BN_CLICKED, CBN_SELCHANGE, EN_CHANGE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BN_CLICKED, CBN_SELCHANGE, EN_CHANGE, STN_CLICKED,
+        };
         let ctx = ctx();
         match id {
+            // A click on a meter asks what the meters mean, and why one
+            // has no figure.
+            ids::USAGE if code == STN_CLICKED => ctx.emit(UiEvent::UsageClicked),
             ids::FILTER if code == EN_CHANGE => self.filter_changed(),
             ids::REMOVE if code == BN_CLICKED => self.remove_selected(),
             ids::CLEAR if code == BN_CLICKED => self.clear_selection(),
@@ -828,21 +850,29 @@ impl Shell {
         };
         // SAFETY: `placement` is sized as the call demands.
         if unsafe { GetWindowPlacement(self.hwnd, &mut placement) }.is_ok() {
+            // Where the window was is the one thing the next one takes
+            // over. Its tab, filter, selection and log are not.
             ctx.placement.set(Some(placement));
         }
-        ctx.last_tab.set(self.tab.get());
-        if self.log_open.get() {
-            ctx.model.borrow_mut().log = None;
-            self.close_log();
-        }
-        self.set_visible(false);
+        self.drop_log();
+        self.visible.set(false);
+        self.message.set_animating(false);
+        self.update_timer();
         ctx.main.set(None);
-        // The window is the only reader of the lists; they come again with
-        // the next WindowShown.
-        let mut model = ctx.model.borrow_mut();
-        model.tables = Vec::new();
-        model.entries = Vec::new();
-        model.usage = Vec::new();
+        {
+            // The window was the only reader of these. What the next one
+            // needs comes with its WindowShown.
+            let mut model = ctx.model.borrow_mut();
+            model.tables = Vec::new();
+            model.entries = Vec::new();
+            model.usage = Vec::new();
+            model.log = None;
+            model.log_note = String::new();
+        }
+        // Said once everything of the window is let go of: what follows
+        // from it finds no window any more.
+        ctx.emit(UiEvent::WindowClosed);
+        crate::host::window_closed(ctx);
     }
 
     /// Ctrl+Tab and Ctrl+Shift+Tab switch tabs, Ctrl+F goes to the filter,
@@ -963,6 +993,16 @@ unsafe extern "system" fn main_proc(
             shell.erase(HDC(wparam.0 as *mut c_void));
             return LRESULT(1);
         }
+        WM_DRAWITEM => {
+            // SAFETY: for this message `lparam` points to a DRAWITEMSTRUCT.
+            let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            let (theme, fonts) = (shell.theme(), shell.fonts());
+            if shell.usage.draw(item, &theme, &fonts, shell.dpi.get()) {
+                return LRESULT(1);
+            }
+            // SAFETY: forwarding the message as it was received.
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
             return shell.on_ctl_color(
                 message,
@@ -1066,48 +1106,5 @@ unsafe extern "system" fn tabs_proc(
         }
         // SAFETY: forwarding the message as it was received.
         _ => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
-    }
-}
-
-unsafe extern "system" fn usage_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    // SAFETY: a child's parent outlives it.
-    let parent =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) }.unwrap_or_default();
-    let Some(shell) = shell_of(parent).filter(|shell| shell.usage.hwnd == hwnd) else {
-        // SAFETY: forwarding the message as it was received.
-        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-    };
-    match message {
-        WM_ERASEBKGND => LRESULT(1),
-        // A click asks what the meters mean, and why one has no figure.
-        WM_LBUTTONUP => {
-            ctx().emit(UiEvent::UsageClicked);
-            LRESULT(0)
-        }
-        WM_PAINT => {
-            let mut paint = PAINTSTRUCT::default();
-            // SAFETY: the usual paint bracket for this window.
-            unsafe {
-                let hdc = BeginPaint(hwnd, &mut paint);
-                let model = ctx().model.borrow();
-                shell.usage.paint(
-                    hdc,
-                    client_rect(hwnd),
-                    &model.usage,
-                    &shell.theme(),
-                    &shell.fonts(),
-                    shell.dpi.get(),
-                );
-                let _ = EndPaint(hwnd, &paint);
-            }
-            LRESULT(0)
-        }
-        // SAFETY: forwarding the message as it was received.
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }

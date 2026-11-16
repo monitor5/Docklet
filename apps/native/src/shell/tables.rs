@@ -15,7 +15,7 @@ use windows::Win32::UI::Controls::{
     CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, HDN_ITEMSTATEICONCLICK,
     LIST_VIEW_ITEM_STATE_FLAGS, LVFI_PARTIAL, LVFI_STRING, LVIF_INDENT, LVIF_STATE, LVIF_TEXT,
     LVIS_STATEIMAGEMASK, LVITEMW, LVM_ENSUREVISIBLE, LVN_COLUMNCLICK, LVN_GETDISPINFOW,
-    LVN_ITEMACTIVATE, LVN_ODFINDITEMW, NM_CLICK, NM_CUSTOMDRAW, NMCUSTOMDRAW,
+    LVN_ITEMACTIVATE, LVN_ODFINDITEMW, LVN_SETDISPINFOW, NM_CLICK, NM_CUSTOMDRAW, NMCUSTOMDRAW,
     NMCUSTOMDRAW_DRAW_STAGE, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW,
     NMLVFINDITEMW, TCN_SELCHANGE,
 };
@@ -33,6 +33,7 @@ use windows::core::PCWSTR;
 use super::{Shell, ids};
 use crate::boundary::{Line, RowFlags, Table, UiEvent};
 use crate::host::ctx;
+use crate::widgets::columns::Pressed;
 use crate::widgets::lines::{self, LineKey};
 use crate::widgets::selection_bar::BarButtons;
 use crate::widgets::table::TableView;
@@ -132,13 +133,38 @@ impl Shell {
         self.tab.set(tab);
         self.tabs.select(tab);
         crate::win::invalidate(self.tabs.hwnd);
+        self.name_list();
         self.rebuild_table();
         self.apply_visibility();
         self.layout();
     }
 
+    /// Names the list after its tab, for screen readers: a list without a
+    /// name is read as its control number.
+    fn name_list(&self) {
+        let title = {
+            let model = ctx().model.borrow();
+            model.tabs.get(self.tab.get()).cloned().unwrap_or_default()
+        };
+        crate::win::set_text(self.table.list, &title);
+    }
+
     pub(crate) fn table_changed(&self, tab: usize) {
-        if tab == self.tab.get() {
+        if tab != self.tab.get() {
+            return;
+        }
+        if self.log_open.get() {
+            // The log covers the list. It is brought up to date once, when
+            // the log is closed, not with every table that arrives.
+            self.table_stale.set(true);
+            return;
+        }
+        self.rebuild_table();
+    }
+
+    /// Brings the list up to date if tables arrived while a log covered it.
+    pub(super) fn refresh_stale_table(&self) {
+        if self.table_stale.get() {
             self.rebuild_table();
         }
     }
@@ -147,6 +173,7 @@ impl Shell {
     /// focus on the line it was on if that line is still there.
     pub(super) fn rebuild_table(&self) {
         let ctx = ctx();
+        self.table_stale.set(false);
         let tab = self.tab.get();
         let focus = self.table.focused().and_then(|index| self.key_at(index));
         let model = ctx.model.borrow();
@@ -205,20 +232,26 @@ impl Shell {
 
     pub(super) fn select_tab(&self, tab: usize) {
         let ctx = ctx();
-        if self.log_open.get() {
-            ctx.model.borrow_mut().log = None;
-            self.close_log();
-        }
         self.tab.set(tab);
         // The filter of the tab arrives with the answer to the event below;
         // until then the box is empty rather than the other tab's.
         self.set_filter(tab, "");
         self.show_entry(None);
+        self.name_list();
         self.rebuild_table();
         crate::win::send(self.table.list, LVM_ENSUREVISIBLE, 0, 0);
-        self.apply_visibility();
-        self.layout();
+        // The tab is said before a log that covered the old one is closed:
+        // whoever listens then loads the list of the new tab, and not that
+        // of the old one first.
         ctx.emit(UiEvent::TabChanged { tab });
+        if self.log_open.get() {
+            ctx.model.borrow_mut().log = None;
+            // Lays the window out again as well.
+            self.close_log();
+        } else {
+            self.apply_visibility();
+            self.layout();
+        }
     }
 
     /// Puts `text` into the filter box of `tab`, without reporting it as
@@ -434,6 +467,11 @@ impl Shell {
                 let info = unsafe { &mut *(lparam.0 as *mut NMLVDISPINFOW) };
                 self.fill_item(&mut info.item);
             }
+            (ids::LIST, LVN_SETDISPINFOW) => {
+                // SAFETY: as above.
+                let info = unsafe { &*(lparam.0 as *const NMLVDISPINFOW) };
+                self.item_set(&info.item);
+            }
             (ids::LIST, NM_CUSTOMDRAW) => {
                 // SAFETY: as above.
                 let draw = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
@@ -568,15 +606,15 @@ impl Shell {
             // SAFETY: as above.
             unsafe { SelectObject(hdc, fonts.ui.into()) };
             if Some(column) == actions_column {
-                let labels: Vec<(&str, bool)> = lines::button_actions(table)
-                    .into_iter()
-                    .map(|action| {
-                        let label = table.actions[action].label.as_str();
-                        (label, row.action_enabled(action))
-                    })
-                    .collect();
+                // What stands in a place depends on the row: Stop on one
+                // that runs, where Start is on one that does not.
+                let label = |slot: usize| {
+                    let action = self.table.slot_action(row, slot)?;
+                    let label = table.actions.get(action)?.label.as_str();
+                    Some((label, row.action_enabled(action)))
+                };
                 let cell = self.table.cell_rect(index, column);
-                self.table.paint_buttons(hdc, cell, &labels, &theme, dpi);
+                self.table.paint_buttons(hdc, cell, label, &theme, dpi);
                 return Some(CDRF_SKIPDEFAULT);
             }
             let status = table
@@ -610,14 +648,55 @@ impl Shell {
         if hit.column != actions_column {
             return;
         }
-        let buttons = self.with_table(lines::button_actions).unwrap_or_default();
         let cell = self.table.cell_rect(hit.item, actions_column);
-        let slot = self
-            .table
-            .buttons()
-            .hit(cell, buttons.len(), point.x, point.y);
-        if let Some(action) = slot.and_then(|slot| buttons.get(slot)) {
-            self.run_action(hit.item, *action);
+        let buttons = self.table.buttons();
+        let Some((pressed, button)) = buttons.hit(cell, point.x, point.y) else {
+            return;
+        };
+        // A group header has no buttons, whatever is under the pointer.
+        let slot_action = |slot: usize| {
+            let action = self.with_table(|table| {
+                let row = lines::row_at(table, hit.item)?;
+                self.table.slot_action(row, slot)
+            });
+            action.flatten()
+        };
+        match pressed {
+            Pressed::Slot(slot) => {
+                if let Some(action) = slot_action(slot) {
+                    self.run_action(hit.item, action);
+                }
+            }
+            // The buttons that did not fit are in the row's menu, with
+            // everything else that can be done to the row.
+            Pressed::More => {
+                let is_row = self.with_table(|table| lines::row_at(table, hit.item).is_some());
+                if is_row == Some(true) {
+                    self.table.focus_item(hit.item, false);
+                    let under = POINT {
+                        x: button.left,
+                        y: button.bottom,
+                    };
+                    self.row_menu(hit.item, under);
+                }
+            }
+        }
+    }
+
+    /// The list was told the state of a line's box instead of being asked:
+    /// an accessibility tool ticked or unticked it. The boxes are not the
+    /// list's to keep, so this is a click on the box like any other.
+    fn item_set(&self, item: &LVITEMW) {
+        if !item.mask.contains(LVIF_STATE) || item.stateMask.0 & LVIS_STATEIMAGEMASK.0 == 0 {
+            return;
+        }
+        let Ok(index) = usize::try_from(item.iItem) else {
+            return;
+        };
+        let wanted = item.state.0 & LVIS_STATEIMAGEMASK.0 == TableView::check_state(Some(true));
+        let ticked = self.with_table(|table| table.lines.get(index).and_then(lines::check_of));
+        if ticked.flatten().is_some_and(|ticked| ticked != wanted) {
+            self.toggle_at(index, false);
         }
     }
 
@@ -737,12 +816,13 @@ impl Shell {
         }
     }
 
-    /// The row's context menu: its actions (the keyboard's way to the row
-    /// buttons), Copy, and the selection's Remove and Clear.
+    /// The context menu of the list, by right click, the Apps key or
+    /// Shift+F10: the menu of the line under the pointer or, from the
+    /// keyboard, of the focused line.
     pub(super) fn list_context_menu(&self, lparam: LPARAM) {
         // From the keyboard the point is (-1, -1).
         let keyboard = point_of(lparam) == POINT { x: -1, y: -1 };
-        let (index, mut point) = if keyboard {
+        let (index, point) = if keyboard {
             let Some(index) = self.table.focused() else {
                 return;
             };
@@ -762,74 +842,21 @@ impl Shell {
             self.table.focus_item(hit.item, false);
             (hit.item, to_client(self.table.list, screen))
         };
+        self.row_menu(index, point);
+    }
+
+    /// The menu of line `index`, opened at `point` of the list. For a row
+    /// it holds every action of the table, with or without a button, the
+    /// row's own (its ports), Copy, and the selection's Remove and Clear:
+    /// the drawn buttons are nothing a keyboard or a screen reader can
+    /// reach, so whatever they do is here too.
+    fn row_menu(&self, index: usize, mut point: POINT) {
         // SAFETY: converting a point of the list to screen coordinates.
         unsafe {
             let _ = ClientToScreen(self.table.list, &mut point);
         }
         let tab = self.tab.get();
-        let text = self.row_text(index).unwrap_or_default();
-        let items = self.with_table(|table| {
-            let mut items = Vec::new();
-            match table.lines.get(index)? {
-                Line::Row(row) => {
-                    let event = |action: &str| {
-                        Chosen::Event(UiEvent::RowAction {
-                            tab,
-                            id: row.id.clone(),
-                            action: action.to_string(),
-                        })
-                    };
-                    for (action, spec) in table.actions.iter().enumerate() {
-                        let enabled = row.action_enabled(action);
-                        items.push(MenuItem::new(&spec.label, enabled, event(&spec.key)));
-                    }
-                    let busy = row.flags.contains(RowFlags::BUSY);
-                    for extra in &row.extra {
-                        items.push(MenuItem::new(&extra.label, !busy, event(&extra.key)));
-                    }
-                }
-                Line::Group {
-                    name,
-                    collapsed,
-                    check,
-                    ..
-                } => {
-                    let label = if *collapsed { "Expand" } else { "Collapse" };
-                    let name = name.clone();
-                    let fold = UiEvent::GroupFolded {
-                        tab,
-                        name: name.clone(),
-                    };
-                    items.push(MenuItem::new(label, true, Chosen::Event(fold)));
-                    if let Some(checked) = check {
-                        let label = if *checked {
-                            "Deselect group"
-                        } else {
-                            "Select group"
-                        };
-                        let toggle = UiEvent::GroupToggled { tab, name };
-                        items.push(MenuItem::new(label, true, Chosen::Event(toggle)));
-                    }
-                }
-            }
-            items.push(MenuItem::separator());
-            items.push(MenuItem::new("Copy\tCtrl+C", true, Chosen::Copy(text)));
-            if table.selected > 0 {
-                let remove = UiEvent::RemoveRequested { tab, id: None };
-                items.push(MenuItem::new(
-                    format!("Remove {} selected\tDel", table.selected),
-                    true,
-                    Chosen::Event(remove),
-                ));
-                let clear = UiEvent::SelectionCleared { tab };
-                items.push(MenuItem::new(
-                    "Clear selection\tEsc",
-                    true,
-                    Chosen::Event(clear),
-                ));
-            }
-            Some(items)
-        });
+        let items = self.with_table(|table| line_menu(table, index, tab));
         if let Some(items) = items.flatten() {
             self.popup(items, point);
         }
@@ -884,6 +911,78 @@ impl Shell {
         }
         None
     }
+}
+
+/// What the menu of line `index` of `table` holds, or `None` if there is no
+/// such line. See `Shell::row_menu`.
+fn line_menu(table: &Table, index: usize, tab: usize) -> Option<Vec<MenuItem>> {
+    let mut items = Vec::new();
+    let text = match table.lines.get(index)? {
+        Line::Row(row) => {
+            let event = |action: &str| {
+                Chosen::Event(UiEvent::RowAction {
+                    tab,
+                    id: row.id.clone(),
+                    action: action.to_string(),
+                })
+            };
+            // All of them, in the table's order: an action that does not
+            // apply is greyed, not left out, so the menu reads the same on
+            // every row.
+            for (action, spec) in table.actions.iter().enumerate() {
+                let enabled = row.action_enabled(action);
+                items.push(MenuItem::new(&spec.label, enabled, event(&spec.key)));
+            }
+            let busy = row.flags.contains(RowFlags::BUSY);
+            for extra in &row.extra {
+                items.push(MenuItem::new(&extra.label, !busy, event(&extra.key)));
+            }
+            row.cells.join("\t")
+        }
+        Line::Group {
+            name,
+            collapsed,
+            check,
+            ..
+        } => {
+            let label = if *collapsed { "Expand" } else { "Collapse" };
+            let fold = UiEvent::GroupFolded {
+                tab,
+                name: name.clone(),
+            };
+            items.push(MenuItem::new(label, true, Chosen::Event(fold)));
+            if let Some(checked) = check {
+                let label = if *checked {
+                    "Deselect group"
+                } else {
+                    "Select group"
+                };
+                let toggle = UiEvent::GroupToggled {
+                    tab,
+                    name: name.clone(),
+                };
+                items.push(MenuItem::new(label, true, Chosen::Event(toggle)));
+            }
+            name.clone()
+        }
+    };
+    items.push(MenuItem::separator());
+    items.push(MenuItem::new("Copy\tCtrl+C", true, Chosen::Copy(text)));
+    if table.selected > 0 {
+        let remove = UiEvent::RemoveRequested { tab, id: None };
+        items.push(MenuItem::new(
+            format!("Remove {} selected\tDel", table.selected),
+            true,
+            Chosen::Event(remove),
+        ));
+        let clear = UiEvent::SelectionCleared { tab };
+        items.push(MenuItem::new(
+            "Clear selection\tEsc",
+            true,
+            Chosen::Event(clear),
+        ));
+    }
+    Some(items)
 }
 
 /// The list's own messages: checkboxes by mouse and keyboard, the header's
@@ -943,4 +1042,130 @@ pub(super) unsafe extern "system" fn list_proc(
     }
     // SAFETY: forwarding the message as it was received.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use docklet_app::present::{TABS, table_view};
+    use docklet_app::{ListModel, ResourceKind};
+
+    use super::*;
+    use crate::boundary::{Action, Row};
+
+    /// The labels of a menu and whether each can be chosen; a separator is
+    /// an empty label.
+    fn labels(items: &[MenuItem]) -> Vec<(&str, bool)> {
+        let items = items.iter();
+        items
+            .map(|item| (item.label.as_str(), item.enabled))
+            .collect()
+    }
+
+    /// The containers table with one running container that publishes a
+    /// port.
+    fn containers() -> Table {
+        let mut table = table_view(&ListModel::new(ResourceKind::Container), true, None);
+        let mut row = Row::new("abc", vec!["web".to_string(), "nginx:1".to_string()]);
+        // Stop, Restart, Logs, Open and Remove apply; Start does not.
+        row.actions = 0b11_1110;
+        row.extra = vec![Action::in_menu("open:8080", "Open localhost:8080")];
+        table.lines = vec![
+            Line::Group {
+                name: "shop".to_string(),
+                count: 1,
+                collapsed: false,
+                check: Some(false),
+            },
+            Line::Row(row),
+        ];
+        table
+    }
+
+    #[test]
+    fn a_rows_menu_offers_every_action_with_or_without_a_button() {
+        let table = containers();
+        let items = line_menu(&table, 1, 0).unwrap();
+        assert_eq!(
+            labels(&items),
+            [
+                ("Start", false),
+                ("Stop", true),
+                ("Restart", true),
+                ("Logs", true),
+                ("Open", true),
+                ("Remove", true),
+                ("Open localhost:8080", true),
+                ("", false),
+                ("Copy\tCtrl+C", true),
+            ]
+        );
+        // Each asks for its own action of this row.
+        let asked: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match &item.chosen {
+                Chosen::Event(UiEvent::RowAction { tab: 0, id, action }) if id == "abc" => {
+                    Some(action.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "start",
+                "stop",
+                "restart",
+                "logs",
+                "open",
+                "remove",
+                "open:8080"
+            ]
+        );
+        assert!(matches!(&items[8].chosen, Chosen::Copy(text) if text == "web\tnginx:1"));
+    }
+
+    #[test]
+    fn every_tabs_row_menu_holds_all_of_the_tabs_actions() {
+        for (tab, kind) in TABS.into_iter().enumerate() {
+            let mut table = table_view(&ListModel::new(kind), true, None);
+            table.lines = vec![Line::Row(Row::new("x", vec!["name".to_string()]))];
+            let items = line_menu(&table, 0, tab).unwrap();
+            for action in &table.actions {
+                let offered = items.iter().any(|item| {
+                    matches!(&item.chosen, Chosen::Event(UiEvent::RowAction { action: key, .. })
+                        if *key == action.key)
+                        && item.label == action.label
+                });
+                assert!(offered, "{kind:?}: {} is not in the menu", action.label);
+            }
+        }
+    }
+
+    #[test]
+    fn a_busy_row_has_its_menu_with_everything_greyed() {
+        let mut table = containers();
+        if let Line::Row(row) = &mut table.lines[1] {
+            row.flags = RowFlags::BUSY;
+        }
+        let items = line_menu(&table, 1, 0).unwrap();
+        assert!(items[..7].iter().all(|item| !item.enabled));
+        // Copying its text is still possible.
+        assert!(items[8].enabled);
+    }
+
+    #[test]
+    fn the_selection_and_the_groups_have_their_items_too() {
+        let mut table = containers();
+        table.selected = 3;
+        let row = line_menu(&table, 1, 0).unwrap();
+        let tail: Vec<&str> = row[9..].iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(tail, ["Remove 3 selected\tDel", "Clear selection\tEsc"]);
+        let group = line_menu(&table, 0, 0).unwrap();
+        assert_eq!(
+            labels(&group)[..2],
+            [("Collapse", true), ("Select group", true)]
+        );
+        assert!(matches!(&group[3].chosen, Chosen::Copy(text) if text == "shop"));
+        assert!(line_menu(&table, 9, 0).is_none());
+    }
 }

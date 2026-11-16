@@ -71,38 +71,97 @@ impl RemovalPlan {
         self.items.iter().map(|item| item.id.as_str()).collect()
     }
 
+    /// Whether the engine is known to refuse `item`: an image or a volume
+    /// that a container uses. A running container is not kept; it is
+    /// stopped.
+    fn keeps(&self, item: &RemovalItem) -> bool {
+        self.kind != ResourceKind::Container && item.in_use
+    }
+
+    /// The plan without what the engine is known to refuse: what asking
+    /// for the removal really removes, and what to hand to the engine.
+    pub fn going(&self) -> Self {
+        let going = self.items.iter().filter(|item| !self.keeps(item));
+        Self {
+            kind: self.kind,
+            items: going.cloned().collect(),
+        }
+    }
+
+    /// How many of the items `going` leaves out.
+    pub fn kept(&self) -> usize {
+        self.items.iter().filter(|item| self.keeps(item)).count()
+    }
+
     /// The question to ask before removing: "Remove 7 containers? 2 are
-    /// running and will be stopped."
+    /// running and will be stopped." It counts what will really go; what
+    /// was selected but stays is said after it. For a plan of which nothing
+    /// can go there is no question: see [`Self::refusal`].
     pub fn confirmation(&self) -> String {
-        let count = self.items.len();
-        let mut text = match self.items.as_slice() {
-            [] => return "Nothing is selected.".to_string(),
+        let selected = self.items.len();
+        let kept = self.kept();
+        let going: Vec<&RemovalItem> = self.items.iter().filter(|item| !self.keeps(item)).collect();
+        let count = going.len();
+        let mut text = match going.as_slice() {
+            [] if selected == 0 => return "Nothing is selected.".to_string(),
+            [] => return "Nothing of what is selected can be removed.".to_string(),
             [only] => format!("Remove {} {}?", noun(self.kind, 1), only.name),
             _ => format!("Remove {count} {}?", noun(self.kind, count)),
         };
-        let running = self.items.iter().filter(|item| item.running).count();
-        let in_use = self.items.iter().filter(|item| item.in_use).count();
         // What the removal does beyond removing, and what it will not do.
-        // "It is", "1 is" or "2 are", for a part of the items.
-        let some_are = |part: usize| match (count, part) {
-            (1, _) => "It is".to_string(),
-            (_, 1) => "1 is".to_string(),
-            (_, part) => format!("{part} are"),
-        };
-        // What the removal does beyond removing, and what it will not do.
+        let running = going.iter().filter(|item| item.running).count();
         if self.kind == ResourceKind::Container && running > 0 {
-            let some_are = some_are(running);
+            // "It is", "1 is" or "2 are", for a part of the items.
+            let some_are = match (count, running) {
+                (1, _) => "It is".to_string(),
+                (_, 1) => "1 is".to_string(),
+                (_, running) => format!("{running} are"),
+            };
             text.push_str(&format!(" {some_are} running and will be stopped."));
         }
         if self.kind == ResourceKind::Volume {
             let whose = if count == 1 { "Its" } else { "Their" };
             text.push_str(&format!(" {whose} data will be deleted."));
         }
-        if self.kind != ResourceKind::Container && in_use > 0 {
-            let some_are = some_are(in_use);
-            text.push_str(&format!(" {some_are} in use and will be kept."));
+        if kept > 0 {
+            let are = if kept == 1 { "is" } else { "are" };
+            text.push_str(&format!(
+                " {kept} of the {selected} selected {are} in use and will be kept."
+            ));
         }
         text
+    }
+
+    /// What to say instead of asking, as a title and a sentence under it,
+    /// when something is selected and none of it can be removed: every item
+    /// is in use. `None` when there is something to ask about.
+    pub fn refusal(&self) -> Option<(String, String)> {
+        let count = self.items.len();
+        if count == 0 || self.kept() < count {
+            return None;
+        }
+        Some(match self.items.as_slice() {
+            [only] => {
+                let noun = noun(self.kind, 1);
+                // "Image", "Volume".
+                let mut title = noun[..1].to_uppercase();
+                title.push_str(&format!("{} {} is in use", &noun[1..], only.name));
+                let body = format!(
+                    "A container uses it, so Docker will not remove it. Remove that container \
+                     first, then the {noun}."
+                );
+                (title, body)
+            }
+            _ => {
+                let nouns = noun(self.kind, count);
+                let title = format!("The {count} selected {nouns} are in use");
+                let body = format!(
+                    "Containers use them, so Docker will not remove them. Remove those \
+                     containers first, then the {nouns}."
+                );
+                (title, body)
+            }
+        })
     }
 
     /// What `id` is called in a sentence.
@@ -164,10 +223,30 @@ pub fn removal_summary(plan: &RemovalPlan, report: &RemoveReport) -> String {
             _ => format!("Removed {removed} {}.", noun(plan.kind, removed)),
         };
     }
-    let mut text = match removed {
+    let outcome = match removed {
         0 => "Nothing was removed.".to_string(),
         _ => format!("Removed {removed}."),
     };
+    format!("{outcome} {}", removal_reasons(plan, report))
+}
+
+/// How a removal went, in a few words without a full stop, for a title:
+/// "Removed 5 of 7 images", "Nothing was removed". Why is in
+/// [`removal_reasons`], which says nothing of this again.
+pub fn removal_outcome(plan: &RemovalPlan, report: &RemoveReport) -> String {
+    let removed = report.removed();
+    let asked = report.results.len();
+    match (removed, report.failed()) {
+        (0, _) => "Nothing was removed".to_string(),
+        (_, 0) => format!("Removed {removed} {}", noun(plan.kind, removed)),
+        _ => format!("Removed {removed} of {asked} {}", noun(plan.kind, asked)),
+    }
+}
+
+/// Why items of a removal were left: "2 are in use: web, db. 1 failed: x.
+/// The engine said: ..." Empty when nothing failed.
+pub fn removal_reasons(plan: &RemovalPlan, report: &RemoveReport) -> String {
+    let mut text = String::new();
     for reason in [
         RemoveFailure::InUse,
         RemoveFailure::HasDependents,
@@ -188,8 +267,11 @@ pub fn removal_summary(plan: &RemovalPlan, report: &RemoveReport) -> String {
             .map(|result| plan.name_of(&result.id))
             .collect();
         let phrase = failure_phrase(reason, failed.len());
+        if !text.is_empty() {
+            text.push(' ');
+        }
         text.push_str(&format!(
-            " {} {phrase}: {}.",
+            "{} {phrase}: {}.",
             failed.len(),
             name_list(&names)
         ));
@@ -397,15 +479,98 @@ mod tests {
         let images = [used, image("sha256:b", &["redis:7"], 1, 0)];
         let table = images_table(&images);
         let plan = RemovalPlan::new(ResourceKind::Image, &table.rows);
+        // The question counts what goes, not what was selected.
         assert_eq!(
             plan.confirmation(),
-            "Remove 2 images? 1 is in use and will be kept."
+            "Remove image redis:7? 1 of the 2 selected is in use and will be kept."
         );
-        let one = RemovalPlan::new(ResourceKind::Image, &table.rows[..1]);
+        assert_eq!(plan.kept(), 1);
+        assert_eq!(plan.going().ids(), ["sha256:b"]);
+        assert_eq!(plan.refusal(), None);
+    }
+
+    /// A plan of `kind` whose items are in use where `in_use` says so.
+    fn plan_of(kind: ResourceKind, in_use: &[bool]) -> RemovalPlan {
+        let items = in_use
+            .iter()
+            .enumerate()
+            .map(|(index, in_use)| RemovalItem {
+                id: format!("id-{index}"),
+                name: format!("item-{index}"),
+                running: false,
+                in_use: *in_use,
+            });
+        RemovalPlan {
+            kind,
+            items: items.collect(),
+        }
+    }
+
+    #[test]
+    fn the_question_counts_what_will_really_go() {
+        let images = plan_of(ResourceKind::Image, &[true, false, false, true, false]);
         assert_eq!(
-            one.confirmation(),
-            "Remove image nginx:latest? It is in use and will be kept."
+            images.confirmation(),
+            "Remove 3 images? 2 of the 5 selected are in use and will be kept."
         );
+        assert_eq!(images.going().items.len(), 3);
+        let volumes = plan_of(ResourceKind::Volume, &[false, true, false]);
+        assert_eq!(
+            volumes.confirmation(),
+            "Remove 2 volumes? Their data will be deleted. 1 of the 3 selected is in use and \
+             will be kept."
+        );
+        // Nothing is known to be refused: the plan goes as it is.
+        let free = plan_of(ResourceKind::Image, &[false, false]);
+        assert_eq!(free.going(), free);
+        assert_eq!(free.kept(), 0);
+    }
+
+    #[test]
+    fn a_selection_of_which_nothing_can_go_is_refused_not_asked_about() {
+        let both = plan_of(ResourceKind::Image, &[true, true]);
+        assert!(both.going().is_empty());
+        let (title, body) = both.refusal().unwrap();
+        assert_eq!(title, "The 2 selected images are in use");
+        assert_eq!(
+            body,
+            "Containers use them, so Docker will not remove them. Remove those containers \
+             first, then the images."
+        );
+        let one = plan_of(ResourceKind::Volume, &[true]);
+        let (title, body) = one.refusal().unwrap();
+        assert_eq!(title, "Volume item-0 is in use");
+        assert_eq!(
+            body,
+            "A container uses it, so Docker will not remove it. Remove that container first, \
+             then the volume."
+        );
+        // The title and the sentence under it say different things.
+        assert!(!body.contains(&title));
+        // A running container is stopped, not kept; and nothing selected is
+        // nothing to refuse.
+        let containers = plan_of(ResourceKind::Container, &[true, true]);
+        assert_eq!(containers.refusal(), None);
+        assert_eq!(containers.kept(), 0);
+        assert_eq!(plan_of(ResourceKind::Image, &[]).refusal(), None);
+    }
+
+    #[test]
+    fn the_outcome_and_the_reasons_do_not_repeat_each_other() {
+        let plan = container_plan(&[("a", false), ("b", false), ("c", false)]);
+        let in_use = RemoveFailure::InUse;
+        let some = report(&plan, &[("b", in_use, "x")]);
+        assert_eq!(removal_outcome(&plan, &some), "Removed 2 of 3 containers");
+        assert_eq!(removal_reasons(&plan, &some), "1 is in use: b.");
+        let none = report(
+            &plan,
+            &[("a", in_use, "x"), ("b", in_use, "x"), ("c", in_use, "x")],
+        );
+        assert_eq!(removal_outcome(&plan, &none), "Nothing was removed");
+        assert_eq!(removal_reasons(&plan, &none), "3 are in use: a, b, c.");
+        let all = report(&plan, &[]);
+        assert_eq!(removal_outcome(&plan, &all), "Removed 3 containers");
+        assert_eq!(removal_reasons(&plan, &all), "");
     }
 
     #[test]

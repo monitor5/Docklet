@@ -1,21 +1,24 @@
 //! The log view: a custom-painted window over a [`LogSource`].
 //!
-//! It paints only the lines that fit, at most once per timer tick, from
-//! buffers it keeps between frames: copying a page of text out of the source,
-//! splitting it into colour runs and drawing it allocates nothing once the
-//! buffers have grown. The source's lock is held only while copying.
+//! It keeps the page it last drew as a bitmap. A page that differs from it
+//! by a few lines, as one that follows a log does, is that bitmap moved,
+//! with only the new lines drawn ([`reuse`]); a page that does not differ
+//! is not drawn at all. Copying text out of the source, splitting it into
+//! colour runs and drawing it allocates nothing once the buffers have
+//! grown. The source's lock is held only while copying.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DT_CENTER, DT_SINGLELINE,
     DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FillRect, FrameRect, GetStockObject, HBITMAP,
-    HBRUSH, HDC, HFONT, HGDIOBJ, MoveToEx, OPAQUE, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-    SetDCBrushColor, SetTextAlign, SetTextColor, TA_BASELINE, TA_NOUPDATECP, TA_UPDATECP,
-    TRANSPARENT, TextOutW,
+    HBRUSH, HDC, HFONT, HGDIOBJ, IntersectClipRect, MoveToEx, OPAQUE, RestoreDC, SRCCOPY, SaveDC,
+    SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetTextAlign, SetTextColor, TA_BASELINE,
+    TA_NOUPDATECP, TA_UPDATECP, TRANSPARENT, TextOutW,
 };
 use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -49,6 +52,18 @@ pub fn sanitize_into(line: &str, out: &mut Vec<u16>) {
             _ => out.push(unit),
         }
     }
+}
+
+/// Drawing a frame may take one part in this many of the time: 2.5%.
+const DRAWING_SHARE: u32 = 40;
+
+/// How long after a frame that took `cost` to draw the next one may be
+/// drawn, so that drawing stays within its share of a processor whatever a
+/// page costs: a few lines that scroll in cost next to nothing and are
+/// shown at once, a log that replaces the whole page with every frame is
+/// shown less often, and less often still in a large window.
+pub fn pause_after(cost: Duration) -> Duration {
+    cost * DRAWING_SHARE
 }
 
 /// What the scroll bar is told: the last position, the page and the
@@ -100,26 +115,98 @@ pub(crate) struct Look<'a> {
     pub ascent: i32,
     /// Where a line starts: the margin, less what is scrolled sideways.
     pub left: i32,
-    pub focused: bool,
+}
+
+/// Which rows of a page the bitmap already shows right, once its content
+/// is moved by `shift` rows (down when positive). The rest is drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reuse {
+    pub shift: i64,
+    pub kept: Range<usize>,
+}
+
+impl Reuse {
+    const NONE: Self = Self {
+        shift: 0,
+        kept: 0..0,
+    };
+}
+
+/// What of a page drawn from line `was_top`, with `was_count` rows that
+/// held a line, still serves a page from line `top`. `whole` rows fit the
+/// view completely; `rows` counts the one cut off at the bottom too.
+///
+/// A line never changes once it is written, and it keeps its number. So a
+/// page that follows a log by a line or two is the old page moved up, with
+/// those lines drawn under it: the cost of a frame is that of the lines
+/// that are new, not of the page.
+pub fn reuse(was_top: u64, was_count: usize, top: u64, whole: usize, rows: usize) -> Reuse {
+    // A row cut off at the bottom is right where it is, and nowhere else.
+    let complete = was_count.min(whole);
+    if top == was_top {
+        return Reuse {
+            shift: 0,
+            kept: 0..was_count.min(rows),
+        };
+    }
+    if top > was_top {
+        return match usize::try_from(top - was_top) {
+            Ok(up) if up < complete => Reuse {
+                shift: -(up as i64),
+                kept: 0..complete - up,
+            },
+            _ => Reuse::NONE,
+        };
+    }
+    match usize::try_from(was_top - top) {
+        Ok(down) if down < rows && complete > 0 => Reuse {
+            shift: down as i64,
+            kept: down..(down + complete).min(rows),
+        },
+        _ => Reuse::NONE,
+    }
+}
+
+/// How a page looks apart from which lines it shows. When this differs,
+/// nothing of the bitmap is right any more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Appearance {
+    dark: bool,
+    font: isize,
+    line_height: i32,
+    left: i32,
+    selection: Option<(u64, u64)>,
+}
+
+/// What the bitmap shows: `count` lines from line `top` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Drawn {
+    top: u64,
+    count: usize,
+    appearance: Appearance,
 }
 
 /// One page of the log: its text, and the bitmap it is drawn into.
 #[derive(Default)]
 pub(crate) struct Frame {
-    /// The visible lines, back to back.
+    /// The lines being drawn, back to back.
     text: Vec<u16>,
-    /// Number and end offset in `text` of each visible line.
+    /// Number and end offset in `text` of each of them.
     lines: Vec<(u64, usize)>,
     spans: Vec<Span>,
-    /// Double buffer, kept between frames and dropped when the view hides.
+    /// The page as it was last drawn, kept between frames and dropped when
+    /// the view hides.
     dc: HDC,
     bitmap: HBITMAP,
     old_bitmap: HGDIOBJ,
     size: (i32, i32),
+    /// What the bitmap shows, while it shows anything of use.
+    drawn: Option<Drawn>,
 }
 
 impl Frame {
     fn release(&mut self) {
+        self.drawn = None;
         if self.dc.is_invalid() {
             return;
         }
@@ -148,8 +235,13 @@ impl Frame {
         self.size = (width, height);
     }
 
+    /// Forgets what the bitmap shows: the next page is drawn whole.
+    pub(crate) fn forget(&mut self) {
+        self.drawn = None;
+    }
+
     /// Copies up to `rows` lines from `top` on out of `source`, or none.
-    pub(crate) fn load(&mut self, source: Option<&dyn LogSource>, top: u64, rows: usize) {
+    fn load(&mut self, source: Option<&dyn LogSource>, top: u64, rows: usize) {
         self.text.clear();
         self.lines.clear();
         if let Some(source) = source {
@@ -162,27 +254,74 @@ impl Frame {
         }
     }
 
-    /// Draws the loaded lines into the frame's bitmap and copies it to
-    /// `hdc`, which covers `area`.
-    pub(crate) fn draw(
+    /// Makes the bitmap show the lines `top..end` of `source` that fit
+    /// `area`, drawing only what it does not show already. `hdc` is a DC
+    /// of the window, to make the bitmap for.
+    pub(crate) fn update(
         &mut self,
         hdc: HDC,
         area: RECT,
-        selected: impl Fn(u64) -> bool,
+        source: Option<&dyn LogSource>,
+        (top, end): (u64, u64),
+        selection: Option<(u64, u64)>,
         look: &Look<'_>,
     ) {
         self.ensure(hdc, area.right, area.bottom);
+        let line_height = look.line_height.max(1);
+        let rows = ((area.bottom + line_height - 1) / line_height).max(0) as usize;
+        let whole = (area.bottom / line_height).max(0) as usize;
+        let count = end.saturating_sub(top).min(rows as u64) as usize;
+        let appearance = Appearance {
+            dark: look.theme.dark,
+            font: look.font.0 as isize,
+            line_height,
+            left: look.left,
+            selection,
+        };
+        let wanted = Drawn {
+            top,
+            count,
+            appearance,
+        };
+        if self.drawn == Some(wanted) {
+            return;
+        }
+        let reuse = match self.drawn {
+            Some(was) if was.appearance == appearance => {
+                reuse(was.top, was.count, top, whole, rows)
+            }
+            _ => Reuse::NONE,
+        };
+        // Never more rows than there are lines now.
+        let kept = reuse.kept.start.min(count)..reuse.kept.end.min(count);
         let memory = self.dc;
-        let theme = look.theme;
-        // SAFETY: `memory` is the frame's DC, `hdc` the caller's; the font
-        // is selected back out and the text alignment restored.
-        unsafe {
-            FillRect(memory, &area, theme.surface_brush);
-            let old_font = SelectObject(memory, look.font.into());
-            SetBkMode(memory, TRANSPARENT);
-            let dc_brush = HBRUSH(GetStockObject(DC_BRUSH).0);
-            if self.lines.is_empty() {
-                SetTextColor(memory, theme.muted);
+        if reuse.shift != 0 && !kept.is_empty() {
+            let by = reuse.shift as i32 * line_height;
+            // SAFETY: copies within the frame's own bitmap; GDI handles a
+            // source and a destination that overlap.
+            unsafe {
+                let _ = BitBlt(
+                    memory,
+                    0,
+                    by.max(0),
+                    area.right,
+                    area.bottom - by.abs(),
+                    Some(memory),
+                    0,
+                    (-by).max(0),
+                    SRCCOPY,
+                );
+            }
+        }
+        self.draw_rows(0..kept.start, area, source, (top, count), selection, look);
+        self.draw_rows(kept.end..rows, area, source, (top, count), selection, look);
+        if count == 0 {
+            // SAFETY: `memory` is the frame's DC; the font is selected back
+            // out.
+            unsafe {
+                let old_font = SelectObject(memory, look.font.into());
+                SetBkMode(memory, TRANSPARENT);
+                SetTextColor(memory, look.theme.muted);
                 let mut empty: Vec<u16> = "No log lines yet".encode_utf16().collect();
                 let mut rect = area;
                 DrawTextW(
@@ -191,22 +330,60 @@ impl Frame {
                     &mut rect,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 );
+                SelectObject(memory, old_font);
             }
+        }
+        self.drawn = Some(wanted);
+    }
+
+    /// Draws the rows `rows` of a page that shows `count` lines from line
+    /// `top` on: the background of each, and its line if it has one.
+    fn draw_rows(
+        &mut self,
+        rows: Range<usize>,
+        area: RECT,
+        source: Option<&dyn LogSource>,
+        (top, count): (u64, usize),
+        selection: Option<(u64, u64)>,
+        look: &Look<'_>,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let with_lines = rows.start..rows.end.min(count).max(rows.start);
+        self.load(source, top + rows.start as u64, with_lines.len());
+        let memory = self.dc;
+        let theme = look.theme;
+        let line_height = look.line_height.max(1);
+        let selected =
+            |number: u64| selection.is_some_and(|(first, last)| (first..=last).contains(&number));
+        // SAFETY: `memory` is the frame's DC; the font is selected back out
+        // and the text alignment restored.
+        unsafe {
+            let band = RECT {
+                left: 0,
+                top: rows.start as i32 * line_height,
+                right: area.right,
+                bottom: (rows.end as i32 * line_height).min(area.bottom),
+            };
+            FillRect(memory, &band, theme.surface_brush);
+            let old_font = SelectObject(memory, look.font.into());
+            let dc_brush = HBRUSH(GetStockObject(DC_BRUSH).0);
             // On the baseline, so text in two fonts lines up. Opaque, since
             // blending each glyph into what is there costs half as much
             // again; a line of the log font is exactly as tall as its row.
             SetTextAlign(memory, TA_UPDATECP | TA_BASELINE);
             SetBkMode(memory, OPAQUE);
             let mut start = 0;
-            for (row, &(number, end)) in self.lines.iter().enumerate() {
-                let y = row as i32 * look.line_height;
+            for (offset, &(number, end)) in self.lines.iter().enumerate() {
+                let y = (rows.start + offset) as i32 * line_height;
                 let background = if selected(number) {
                     SetDCBrushColor(memory, theme.selection);
                     let band = RECT {
                         left: 0,
                         top: y,
                         right: area.right,
-                        bottom: y + look.line_height,
+                        bottom: y + line_height,
                     };
                     FillRect(memory, &band, dc_brush);
                     theme.selection
@@ -242,22 +419,51 @@ impl Frame {
             }
             SetTextAlign(memory, TA_NOUPDATECP);
             SetBkMode(memory, TRANSPARENT);
-            if look.focused {
-                SetDCBrushColor(memory, theme.accent);
-                FrameRect(memory, &area, dc_brush);
-            }
             SelectObject(memory, old_font);
+        }
+    }
+
+    /// Copies the part `rect` of the page to `hdc`. A view that has the
+    /// focus gets a frame around it, which is no part of the bitmap: the
+    /// bitmap's content moves when the log does.
+    pub(crate) fn blit(&self, hdc: HDC, rect: RECT, area: RECT, focus: Option<COLORREF>) {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        // SAFETY: `hdc` is the caller's DC, the source the frame's own; the
+        // DC's state is saved and restored around the clipping.
+        unsafe {
+            let Some(color) = focus else {
+                let _ = BitBlt(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    width,
+                    height,
+                    Some(self.dc),
+                    rect.left,
+                    rect.top,
+                    SRCCOPY,
+                );
+                return;
+            };
+            // The frame's pixels are painted once, by the frame: copying
+            // the page over them first would make it flicker.
+            let saved = SaveDC(hdc);
+            IntersectClipRect(hdc, 1, 1, area.right - 1, area.bottom - 1);
             let _ = BitBlt(
                 hdc,
-                0,
-                0,
-                area.right,
-                area.bottom,
-                Some(memory),
-                0,
-                0,
+                rect.left,
+                rect.top,
+                width,
+                height,
+                Some(self.dc),
+                rect.left,
+                rect.top,
                 SRCCOPY,
             );
+            let _ = RestoreDC(hdc, saved);
+            SetDCBrushColor(hdc, color);
+            FrameRect(hdc, &area, HBRUSH(GetStockObject(DC_BRUSH).0));
         }
     }
 }
@@ -282,6 +488,12 @@ pub struct LogView {
     scrollbar: Cell<Option<(i32, u32, i32)>>,
     focused: Cell<bool>,
     frame: RefCell<Frame>,
+    /// Not before this is the next frame taken from the source (see
+    /// [`pause_after`]).
+    rest_until: Cell<Option<Instant>>,
+    /// The source changed since the status line was last brought up to
+    /// date (see [`Self::take_news`]).
+    news: Cell<bool>,
 }
 
 impl LogView {
@@ -304,7 +516,31 @@ impl LogView {
             scrollbar: Cell::new(None),
             focused: Cell::new(false),
             frame: RefCell::new(Frame::default()),
+            rest_until: Cell::new(None),
+            news: Cell::new(false),
         }
+    }
+
+    /// Whether lines arrived, or the log ended, since this was last asked:
+    /// then the count in the status line and the scroll bar are out of
+    /// date, also for a paused view whose page did not change. On a quiet
+    /// log this stays false, and nothing is recomputed.
+    pub fn take_news(&self) -> bool {
+        self.news.replace(false)
+    }
+
+    /// A frame took `cost` to paint: the next one waits its turn.
+    pub fn painted(&self, cost: Duration) {
+        self.rest_until
+            .set(Some(Instant::now() + pause_after(cost)));
+    }
+
+    /// Whether the last frame was cheap enough, or long enough ago, for
+    /// the next one to be due.
+    pub fn is_rested(&self) -> bool {
+        self.rest_until
+            .get()
+            .is_none_or(|until| Instant::now() >= until)
     }
 
     pub fn set_fonts(&self, fonts: &Fonts) {
@@ -317,6 +553,8 @@ impl LogView {
     pub fn open(&self, source: Option<Arc<dyn LogSource>>) {
         *self.source.borrow_mut() = source;
         *self.state.borrow_mut() = LogState::new();
+        // Another log numbers its lines anew.
+        self.frame.borrow_mut().forget();
         self.seen.set(u64::MAX);
         self.shift.set(0);
         self.resize();
@@ -359,6 +597,7 @@ impl LogView {
         if self.seen.replace(generation) == generation {
             return false;
         }
+        self.news.set(true);
         let (first, end) = source.bounds();
         let mut state = self.state.borrow_mut();
         let shown = |state: &LogState| (state.top(), state.end().min(state.top() + state.page()));
@@ -439,23 +678,30 @@ impl LogView {
         copy_to_clipboard(owner, &text)
     }
 
-    pub fn paint(&self, hdc: HDC, theme: &Theme, fonts: &Fonts, dpi: Dpi) {
+    /// Paints the part `rect` of the view: brings the page up to date,
+    /// which costs nothing when it is, and copies that part of it.
+    pub fn paint(&self, hdc: HDC, rect: RECT, theme: &Theme, fonts: &Fonts, dpi: Dpi) {
         let area = client_rect(self.hwnd);
-        let line_height = self.line_height.get().max(1);
-        let rows = ((area.bottom + line_height - 1) / line_height).max(0) as usize;
         let state = self.state.borrow();
         let mut frame = self.frame.borrow_mut();
-        frame.load(self.source.borrow().as_deref(), state.top(), rows);
         let look = Look {
             theme,
             font: fonts.mono,
             hangul: fonts.hangul,
-            line_height,
+            line_height: self.line_height.get().max(1),
             ascent: fonts.mono_ascent,
             left: dpi.px(6) - self.shift.get(),
-            focused: self.focused.get(),
         };
-        frame.draw(hdc, area, |number| state.is_selected(number), &look);
+        frame.update(
+            hdc,
+            area,
+            self.source.borrow().as_deref(),
+            (state.top(), state.end()),
+            state.selection(),
+            &look,
+        );
+        let focus = self.focused.get().then_some(theme.accent);
+        frame.blit(hdc, rect, area, focus);
     }
 }
 
@@ -496,6 +742,62 @@ mod tests {
             scroll_info(0, 1_100, 1_060, 40)
         );
         assert_eq!(scroll_info(0, 0, 0, 1), (0, 1, 0));
+    }
+
+    fn kept(shift: i64, kept: Range<usize>) -> Reuse {
+        Reuse { shift, kept }
+    }
+
+    #[test]
+    fn a_page_that_follows_a_log_is_the_old_page_moved_up() {
+        // 40 whole rows and one cut off; all 41 held a line.
+        // Two lines arrived: the page moves up two rows, and the rows from
+        // 38 on are drawn (two new lines and the cut one).
+        assert_eq!(reuse(100, 41, 102, 40, 41), kept(-2, 0..38));
+        // Nothing arrived: nothing to draw.
+        assert_eq!(reuse(100, 41, 100, 40, 41), kept(0, 0..41));
+        // A page or more arrived, as at 10,000 lines a second: all of it
+        // is drawn.
+        assert_eq!(reuse(100, 41, 140, 40, 41), Reuse::NONE);
+        assert_eq!(reuse(100, 41, 9_000, 40, 41), Reuse::NONE);
+        // One row short of a page still saves that row.
+        assert_eq!(reuse(100, 41, 139, 40, 41), kept(-39, 0..1));
+    }
+
+    #[test]
+    fn a_log_shorter_than_the_view_grows_at_its_end() {
+        // 5 lines of a log that starts at line 0: three more arrive, and
+        // rows 0 to 4 stay as they are.
+        assert_eq!(reuse(0, 5, 0, 40, 41), kept(0, 0..5));
+        // Nothing was drawn yet: nothing to keep.
+        assert_eq!(reuse(0, 0, 0, 40, 41), kept(0, 0..0));
+    }
+
+    #[test]
+    fn scrolling_back_moves_the_page_down() {
+        // Three lines up: rows 3 to 40 hold what rows 0 to 37 held, cut
+        // off at the bottom as the last row always is.
+        assert_eq!(reuse(100, 41, 97, 40, 41), kept(3, 3..41));
+        // A view that fits its rows exactly loses the last three.
+        assert_eq!(reuse(100, 40, 97, 40, 40), kept(3, 3..40));
+        // A page or more up: all of it is drawn.
+        assert_eq!(reuse(100, 41, 59, 40, 41), Reuse::NONE);
+        assert_eq!(reuse(100, 41, 0, 40, 41), Reuse::NONE);
+        // A view too small for a whole row has nothing worth moving.
+        assert_eq!(reuse(100, 1, 99, 0, 1), Reuse::NONE);
+        assert_eq!(reuse(100, 1, 101, 0, 1), Reuse::NONE);
+    }
+
+    #[test]
+    fn drawing_keeps_to_its_share_whatever_a_frame_costs() {
+        // Two lines scrolled in: the next 80 ms tick is not held up.
+        assert!(pause_after(Duration::from_micros(300)) < Duration::from_millis(80));
+        // A whole page of a large window: about four frames a second.
+        assert_eq!(
+            pause_after(Duration::from_millis(6)),
+            Duration::from_millis(240)
+        );
+        assert_eq!(pause_after(Duration::ZERO), Duration::ZERO);
     }
 
     fn pieces(text: &str) -> Vec<(String, bool)> {

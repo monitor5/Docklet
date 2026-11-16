@@ -1,13 +1,18 @@
 //! The log page: opening and closing the view, its frame timer, its status
 //! line, and the view's window procedure.
 //!
-//! The view repaints on a timer, about 12 times a second however fast lines
-//! arrive, and only when the lines on screen changed. The timer runs only
+//! A timer asks the log for news about 12 times a second. A tick on which
+//! nothing arrived costs a comparison; one that brought lines repaints,
+//! and the view then draws only the lines that are new. What a frame costs
+//! decides how soon the next one may follow, so drawing keeps to a few
+//! percent of a processor however fast the log runs. The timer runs only
 //! while the log is open and the window is shown and not minimised.
+
+use std::time::Instant;
 
 use docklet_app::format::format_count;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, HDC, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT,
     VK_PRIOR, VK_RIGHT, VK_UP,
@@ -29,13 +34,12 @@ use crate::host::ctx;
 use crate::win::{control_down, high_word, low_word, point_of, set_text, shift_down, text_of};
 
 pub(super) const LOG_TIMER: usize = 1;
-/// The view repaints at most this often, however fast lines arrive. Drawing
-/// a page of text is nearly all a frame costs (2.6 ms measured for a page of
-/// coloured lines with Hangul, 1.3 ms for ASCII), so the rate is what the
-/// log costs: at 80 ms a log of 10,000 lines a second stays readable as it
-/// scrolls and takes about 3% of one core.
+/// The view looks for new lines this often, and repaints at most this
+/// often. A frame that replaced the whole page holds the next one back
+/// (`log_view::pause_after`); one that scrolled a few lines in does not.
 const FRAME_MS: u32 = 80;
-/// The status line is text in a control; it changes every this many frames.
+/// The status line and the scroll bar are controls that repaint when they
+/// are told something new; they are told every this many ticks.
 const STATUS_EVERY: u32 = 5;
 /// Characters one sideways step moves.
 const SHIFT_STEP: i32 = 8;
@@ -98,10 +102,21 @@ impl Shell {
         }
         self.log.close();
         self.update_timer();
+        // Tables that arrived while the log covered the list.
+        self.refresh_stale_table();
         self.apply_visibility();
         self.layout();
         self.focus_default();
         ctx().emit(UiEvent::LogClosed);
+    }
+
+    /// Lets go of the log with the window that is being destroyed: nothing
+    /// is laid out again, and nobody is told. `WindowClosed` says it all.
+    pub(super) fn drop_log(&self) {
+        if self.log_open.replace(false) {
+            self.log.close();
+            self.update_timer();
+        }
     }
 
     pub(super) fn close_log_by_user(&self) {
@@ -131,6 +146,8 @@ impl Shell {
                 SetTimer(Some(self.hwnd), LOG_TIMER, FRAME_MS, None);
                 // Catch up at once on what came while hidden.
                 self.log_frame();
+                self.log.sync_scrollbar();
+                self.update_log_status();
             } else {
                 let _ = KillTimer(Some(self.hwnd), LOG_TIMER);
             }
@@ -141,20 +158,39 @@ impl Shell {
     /// only if that changed the lines on screen: a view that does not
     /// follow stays as it is while lines pile up below it.
     fn log_frame(&self) {
-        let changed = self.log.poll();
-        self.log.sync_scrollbar();
-        if changed {
+        if self.log.poll() {
             crate::win::invalidate(self.log.hwnd);
         }
     }
 
     pub(super) fn on_log_timer(&self) {
-        self.log_frame();
+        // Not while the last frame is still being paid for. What arrives
+        // meanwhile is in the next one.
+        if self.log.is_rested() {
+            self.log_frame();
+        }
         let ticks = self.ticks.get().wrapping_add(1);
         self.ticks.set(ticks);
-        if ticks.is_multiple_of(STATUS_EVERY) {
+        // Only if something arrived since they were last told: a tick of a
+        // quiet log ends with the comparison in `poll`.
+        if ticks.is_multiple_of(STATUS_EVERY) && self.log.take_news() {
+            self.log.sync_scrollbar();
             self.update_log_status();
         }
+    }
+
+    /// The log view's WM_PAINT: paints what `paint` asks for, and notes
+    /// what it cost.
+    fn paint_log(&self, hdc: HDC, paint: &PAINTSTRUCT) {
+        let started = Instant::now();
+        self.log.paint(
+            hdc,
+            paint.rcPaint,
+            &self.theme(),
+            &self.fonts(),
+            self.dpi.get(),
+        );
+        self.log.painted(started.elapsed());
     }
 
     fn update_log_status(&self) {
@@ -348,9 +384,7 @@ pub(super) unsafe extern "system" fn log_proc(
             // SAFETY: the usual paint bracket for this window.
             unsafe {
                 let hdc = BeginPaint(hwnd, &mut paint);
-                shell
-                    .log
-                    .paint(hdc, &shell.theme(), &shell.fonts(), shell.dpi.get());
+                shell.paint_log(hdc, &paint);
                 let _ = EndPaint(hwnd, &paint);
             }
         }

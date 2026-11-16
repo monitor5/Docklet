@@ -191,11 +191,6 @@ impl LogState {
         })
     }
 
-    pub fn is_selected(&self, line: u64) -> bool {
-        self.selection()
-            .is_some_and(|(first, last)| (first..=last).contains(&line))
-    }
-
     /// The selection's moving end, which a drag keeps in view.
     pub fn caret(&self) -> Option<u64> {
         self.selection.map(|selection| selection.caret)
@@ -307,8 +302,6 @@ mod tests {
         assert!(!state.following());
         state.select_to(91);
         assert_eq!(state.selection(), Some((91, 95)));
-        assert!(state.is_selected(93));
-        assert!(!state.is_selected(96));
         state.select_from(99, true);
         assert_eq!(state.selection(), Some((95, 99)));
         state.select_from(10, false);
