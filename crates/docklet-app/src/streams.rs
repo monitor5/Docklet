@@ -242,6 +242,16 @@ impl Streams {
         self.stop_streams(&mut self.state());
     }
 
+    /// Ends the event subscription, with the container stats that ride on
+    /// it, and leaves the followed logs alone: for a window that shows a
+    /// log and no list, or is minimised with a log open. `watch_events`
+    /// subscribes again.
+    pub fn stop_events(&self) {
+        if let Some(task) = self.state().events.take() {
+            task.abort();
+        }
+    }
+
     fn stop_streams(&self, state: &mut State) {
         if let Some(task) = state.events.take() {
             task.abort();
@@ -684,6 +694,25 @@ mod tests {
         assert_eq!(streams.window(), WindowState::Visible);
         streams.watch_events();
         assert!(streams.state().events.is_some());
+    }
+
+    #[test]
+    fn the_events_can_end_without_the_logs() {
+        let runtime = runtime();
+        let (streams, _) = streams(&runtime);
+        streams.set_window(WindowState::Visible);
+        streams.watch_events();
+        // A followed log, as far as the bookkeeping goes.
+        let log = runtime.spawn(std::future::pending::<()>());
+        streams.state().logs.insert(7, log);
+        streams.stop_events();
+        assert!(streams.state().events.is_none());
+        assert!(streams.state().logs.contains_key(&7));
+        // Minimised keeps the log too; only `Gone` ends it.
+        streams.set_window(WindowState::Hidden);
+        assert!(streams.state().logs.contains_key(&7));
+        streams.set_window(WindowState::Gone);
+        assert!(streams.state().logs.is_empty());
     }
 
     #[test]

@@ -6,8 +6,10 @@
 //! same window, and what it asks for is answered from the data here with the
 //! same messages. Nothing in it touches WSL, Docker or the engine pipe.
 //!
-//! The figures and the log run on their own threads, and only while the
-//! window is shown: they block on a condition variable otherwise.
+//! The figures and the log run on their own threads and block on a
+//! condition variable while nobody wants them: the figures run while the
+//! window is shown, the log for as long as it is followed, which a
+//! minimised window does not end and a closed one does.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -399,11 +401,14 @@ impl Inner {
     }
 
     /// Opens and closes the gates of the two threads to match the state.
+    /// A followed log goes on behind a minimised window, as a real one
+    /// does; only a closed window ends it.
     fn sync_gates(&self) {
         let state = lock(&self.state);
         let visible = state.window == WindowState::Visible;
         self.figures.set(visible && state.usage);
-        self.logging.set(visible && state.log.is_some());
+        self.logging
+            .set(state.window != WindowState::Gone && state.log.is_some());
     }
 
     /// Sends the list the window shows again, after it changed.
@@ -424,9 +429,12 @@ impl Inner {
         let mut tick = 0u64;
         loop {
             self.figures.wait();
+            // The containers' figures only for the list that shows them, as
+            // the real engine takes them.
             let usage: Option<Vec<ContainerUsage>> = {
                 let state = lock(&self.state);
-                (state.engine == EngineState::Running).then(|| {
+                let listed = state.list == Some(ResourceKind::Container);
+                (state.engine == EngineState::Running && listed).then(|| {
                     let running = state.containers.iter().filter(|c| c.running);
                     running.map(|c| container_usage(c, tick)).collect()
                 })
@@ -530,8 +538,12 @@ impl Engine for Demo {
         let stuck = {
             let mut state = lock(&self.inner.state);
             state.window = window;
-            if window == WindowState::Gone {
+            // As `docklet_app::App` does: no list for a window nobody sees,
+            // and no log for one that is closed.
+            if window != WindowState::Visible {
                 state.list = None;
+            }
+            if window == WindowState::Gone {
                 state.log = None;
             }
             window == WindowState::Visible && std::mem::take(&mut state.stuck_install)
@@ -999,6 +1011,27 @@ mod tests {
         assert!(!followed(&demo));
         // Nothing runs for a window that is away.
         assert!(!demo.inner.logging.is_open() && !demo.inner.figures.is_open());
+    }
+
+    #[test]
+    fn a_minimised_window_keeps_its_log_and_nothing_else() {
+        let (demo, _messages) = demo_running();
+        demo.show_list(Some(ResourceKind::Container));
+        demo.set_usage(true);
+        // No log is followed: minimising leaves no thread with work.
+        demo.set_window(WindowState::Hidden);
+        let state = lock(&demo.inner.state);
+        assert_eq!(state.list, None);
+        drop(state);
+        assert!(!demo.inner.logging.is_open() && !demo.inner.figures.is_open());
+        // A log that is followed stays so, and is let go of when the
+        // window closes. (The window was never visible here, so the log's
+        // thread found its gate shut.)
+        let (demo, _messages) = demo_running();
+        lock(&demo.inner.state).log = Some((1, SharedLog::new()));
+        lock(&demo.inner.state).window = WindowState::Hidden;
+        demo.set_window(WindowState::Gone);
+        assert!(lock(&demo.inner.state).log.is_none());
     }
 
     #[test]

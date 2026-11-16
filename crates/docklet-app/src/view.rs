@@ -40,6 +40,11 @@ pub struct Column {
     /// The cell shows the row's state: drawn in the "good" colour when the
     /// row has [`RowFlags::ACTIVE`] and muted otherwise.
     pub status: bool,
+    /// How soon the column gives way when the window is too narrow for
+    /// every column at its minimum: the highest number goes first, 0 never.
+    /// A table never needs to be scrolled sideways. The buttons of the
+    /// actions fold by the same numbers ([`Action::fold`]).
+    pub priority: u8,
 }
 
 impl Column {
@@ -51,7 +56,13 @@ impl Column {
             min_width: 60,
             sortable: true,
             status: false,
+            priority: 0,
         }
+    }
+
+    pub fn priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
     }
 
     pub fn right(mut self) -> Self {
@@ -78,8 +89,15 @@ pub struct Action {
     pub key: String,
     pub label: String,
     /// A row action that has a button in the last column. The others are
-    /// only in the row's context menu.
+    /// only in the row's context menu, which offers every action.
     pub button: bool,
+    /// The button stands where the button before it stands, on the rows
+    /// that one does not apply to: Stop where Start would be.
+    pub alternate: bool,
+    /// How soon the button folds into the row's menu when the window is
+    /// too narrow: the highest number goes first, 0 never. Counted together
+    /// with [`Column::priority`].
+    pub fold: u8,
 }
 
 impl Action {
@@ -89,6 +107,8 @@ impl Action {
             key: key.into(),
             label: label.into(),
             button: true,
+            alternate: false,
+            fold: 0,
         }
     }
 
@@ -98,6 +118,18 @@ impl Action {
             button: false,
             ..Self::new(key, label)
         }
+    }
+
+    /// See [`Action::alternate`].
+    pub fn alternate(mut self) -> Self {
+        self.alternate = true;
+        self
+    }
+
+    /// See [`Action::fold`].
+    pub fn fold(mut self, fold: u8) -> Self {
+        self.fold = fold;
+        self
     }
 }
 
@@ -460,9 +492,14 @@ pub enum TrayCommand {
 pub enum UiEvent {
     /// The window was created or restored. Data may flow again.
     WindowShown,
-    /// The window was closed (only the tray is left) or minimised. Nothing
-    /// is drawn until [`UiEvent::WindowShown`]: hold nothing for it.
+    /// The window was minimised. Nothing is drawn until
+    /// [`UiEvent::WindowShown`]: no list and no figure is wanted, but the
+    /// window keeps what it has, and a followed log goes on so that it is
+    /// whole when the window is back.
     WindowHidden,
+    /// The window was closed; only the tray is left. Hold nothing for it:
+    /// the next window starts from nothing, on the first tab.
+    WindowClosed,
     /// Another thread asked for the UI thread's attention; nothing the
     /// user did.
     Wake,
@@ -544,7 +581,9 @@ pub enum UiEvent {
     UsageClicked,
     Tray(TrayCommand),
     LogOpened,
-    /// The user closed the log view, or it went with the window.
+    /// The log view was taken down while the window stays: the user closed
+    /// it, or went to another tab. A log that goes with its window is not
+    /// reported; [`UiEvent::WindowClosed`] covers it.
     LogClosed,
     /// F5.
     Refresh,
@@ -568,7 +607,12 @@ mod tests {
 
     #[test]
     fn actions_are_buttons_unless_they_are_for_the_menu() {
-        assert!(Action::new("logs", "Logs").button);
+        let logs = Action::new("logs", "Logs");
+        assert!(logs.button && !logs.alternate && logs.fold == 0);
         assert!(!Action::in_menu("restart", "Restart").button);
+        let stop = Action::new("stop", "Stop").alternate().fold(3);
+        assert!(stop.button && stop.alternate && stop.fold == 3);
+        assert_eq!(Column::new("Name", 1).priority, 0);
+        assert_eq!(Column::new("Ports", 1).priority(4).priority, 4);
     }
 }

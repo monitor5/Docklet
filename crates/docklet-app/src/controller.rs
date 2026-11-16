@@ -8,15 +8,23 @@
 //! about lists: which rows show and which are selected is in the
 //! `ListModel`s here and nowhere else.
 //!
-//! Two rules it keeps:
+//! Three rules it keeps:
 //!
-//! - Nothing is held for a window that is not shown. Closed or minimised,
-//!   the engine is told the window is gone: no poll, no event stream, no
-//!   followed log, no sampling.
+//! - Nothing is held for a window that was closed: no poll, no event
+//!   stream, no followed log, no sampling, and none of the lists. The next
+//!   window starts from nothing: first tab, no filter, no selection, no
+//!   line left over from the last one.
+//! - A minimised window keeps what it shows, and a log it follows goes on,
+//!   so the log is whole when the window is back. Nothing else is asked
+//!   meanwhile: no poll, no event stream, no list, no sampling.
 //! - Docker is only asked once a status poll made since the window was last
 //!   shown said the engine runs. What was true before the window went away
 //!   is not acted on: the engine may have gone to sleep, and a request
 //!   would wake it.
+//!
+//! What nobody sees is not asked for either: while a log covers the list,
+//! the engine is told that no list shows, which ends the reloads and the
+//! containers' usage until the log is closed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -143,12 +151,10 @@ enum Pending {
     Prune(PruneTarget),
 }
 
-/// The log the window shows.
+/// The log the window shows, followed for as long as it is open.
 struct OpenLog {
-    id: String,
-    title: String,
-    /// `None` while nothing follows it: the window is away.
-    token: Option<u32>,
+    /// What `Engine::follow_logs` returned.
+    token: u32,
 }
 
 /// What was last sent, so that only changes are sent again.
@@ -167,7 +173,8 @@ struct Sent {
 }
 
 impl Sent {
-    /// The window lost what only it kept: lists, meters and what was typed.
+    /// A new window has none of what only a window keeps: lists, meters
+    /// and what was typed.
     fn window_gone(&mut self) {
         self.tables = [None; 4];
         self.usage = None;
@@ -179,8 +186,8 @@ impl Sent {
 pub struct Controller<E: Engine, U: Ui> {
     engine: E,
     ui: U,
-    /// The window is shown and not minimised.
-    visible: bool,
+    /// Shown (`Visible`), minimised (`Hidden`) or closed (`Gone`).
+    window: WindowState,
     /// What the last poll answered.
     status: Option<EngineStatus>,
     /// Why the engine could not be looked at, while nothing is known.
@@ -224,7 +231,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
         let mut controller = Self {
             engine,
             ui,
-            visible: false,
+            window: WindowState::Gone,
             status: None,
             status_error: None,
             fresh: false,
@@ -265,7 +272,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
     }
 
     /// Shows a line of information above the content, until it is
-    /// dismissed or something else is said.
+    /// dismissed, something else is said or the window is closed.
     pub fn show_info(&mut self, text: impl Into<String>) {
         self.info = Some(text.into());
         self.sync();
@@ -273,6 +280,19 @@ impl<E: Engine, U: Ui> Controller<E, U> {
 
     fn state(&self) -> Option<&EngineState> {
         self.status.as_ref().map(|status| &status.state)
+    }
+
+    /// The window is shown and not minimised.
+    fn visible(&self) -> bool {
+        self.window == WindowState::Visible
+    }
+
+    /// Says how something went, above the content. Not to a window that is
+    /// closed: the next one starts without lines from before it.
+    fn say(&mut self, info: String) {
+        if self.window != WindowState::Gone {
+            self.info = Some(info);
+        }
     }
 
     fn kind(&self) -> ResourceKind {
@@ -292,12 +312,13 @@ impl<E: Engine, U: Ui> Controller<E, U> {
         match event {
             UiEvent::WindowShown => self.window_shown(),
             UiEvent::WindowHidden => self.window_hidden(),
+            UiEvent::WindowClosed => self.window_closed(),
             UiEvent::TabChanged { tab } if tab < TABS.len() => {
                 self.tab = tab;
                 self.sent.tables[tab] = None;
                 self.send_filter();
                 if self.listing {
-                    self.engine.show_list(Some(self.kind()));
+                    self.watch_list();
                 }
             }
             UiEvent::FilterChanged { tab, text } => {
@@ -370,35 +391,81 @@ impl<E: Engine, U: Ui> Controller<E, U> {
     }
 
     fn window_shown(&mut self) {
-        if self.visible {
+        let was = self.window;
+        if was == WindowState::Visible {
             return;
         }
-        self.visible = true;
+        self.window = WindowState::Visible;
         // What is known is from before the window went away. The poll this
         // starts says what is true now; the lists wait for it.
         self.fresh = false;
-        self.sent.window_gone();
-        self.ui.send(UiUpdate::Tabs(present::tab_titles()));
-        self.send_filter();
+        if was == WindowState::Gone {
+            // A new window: it has nothing yet. A restored one kept what it
+            // showed, and gets what changed meanwhile.
+            self.sent.window_gone();
+            self.ui.send(UiUpdate::Tabs(present::tab_titles()));
+            self.send_filter();
+        }
         self.engine.set_window(WindowState::Visible);
     }
 
+    /// The window was minimised. The log it follows goes on; everything
+    /// else waits for the window to be back.
     fn window_hidden(&mut self) {
-        if !self.visible {
+        if !self.visible() {
             return;
         }
-        self.visible = false;
+        self.window = WindowState::Hidden;
         self.fresh = false;
         self.listing = false;
         self.set_usage(false);
-        if let Some(log) = &mut self.log {
-            // Ended by the engine below. It is followed again, from its
-            // last lines, when the window is back.
-            log.token = None;
+        // `Hidden` ends the event stream and the reloads with it, and keeps
+        // the logs that are followed.
+        self.engine.set_window(WindowState::Hidden);
+    }
+
+    /// The window was closed. Everything goes, and what was the window's
+    /// own is forgotten, so the next one starts clean.
+    fn window_closed(&mut self) {
+        if self.window == WindowState::Gone {
+            return;
         }
-        // Not `Hidden`: that keeps the event stream, which is a Docker
-        // connection and a `wsl.exe` child for as long as it lasts.
+        self.window = WindowState::Gone;
+        self.fresh = false;
+        self.listing = false;
+        self.set_usage(false);
+        if self.log.take().is_some() {
+            // The engine ends it below, with everything else.
+            self.ui.send(UiUpdate::CloseLog);
+        }
         self.engine.set_window(WindowState::Gone);
+
+        self.tab = 0;
+        // With them go the filters, the sort orders, the folded groups and
+        // the selections, and the rows nobody is left to look at.
+        self.lists = TABS.map(ListModel::new);
+        self.raw = [None, None, None, None];
+        self.usage.clear();
+        self.disk_generation += 1;
+        self.disk_asked = false;
+        // A question went with the window that showed it.
+        self.pending.clear();
+        self.error = None;
+        self.info = None;
+        self.sent.window_gone();
+    }
+
+    /// Tells the engine which list is in view, which is none while a log
+    /// covers it: then nothing reloads and no usage is taken for it.
+    fn watch_list(&mut self) {
+        let kind = self.log.is_none().then(|| self.kind());
+        if kind != Some(ResourceKind::Container) && self.usage.containers().is_some() {
+            // The figures stop coming; old ones would look current when
+            // the list shows again.
+            self.usage.set_containers(None);
+            self.lists[0].set_usage(None);
+        }
+        self.engine.show_list(kind);
     }
 
     fn set_usage(&mut self, shown: bool) {
@@ -514,9 +581,15 @@ impl<E: Engine, U: Ui> Controller<E, U> {
         if plan.is_empty() {
             return;
         }
+        // Everything in it is in use: said at once, with nothing to agree
+        // to, instead of a removal that removes nothing.
+        if let Some(notice) = present::removal_refusal(&plan) {
+            return self.ui.send(UiUpdate::Notice(notice));
+        }
         let token = self.token();
         let confirm = present::removal_confirm(token, &plan);
-        self.pending.insert(token, Pending::Remove(plan));
+        // What is in use is not even tried: the question said so.
+        self.pending.insert(token, Pending::Remove(plan.going()));
         self.ui.send(UiUpdate::Confirm(confirm));
     }
 
@@ -585,24 +658,17 @@ impl<E: Engine, U: Ui> Controller<E, U> {
             return;
         };
         let title = row.name.clone();
-        self.close_log();
-        self.log = Some(OpenLog {
-            id,
-            title,
-            token: None,
-        });
-        self.follow_log();
-    }
-
-    /// Follows the open log from its last lines, into a fresh buffer.
-    fn follow_log(&mut self) {
-        let Some(log) = &mut self.log else {
-            return;
-        };
+        if let Some(open) = self.log.take() {
+            // The view stays up and shows the other log.
+            self.engine.stop_logs(open.token);
+        }
         let buffer = SharedLog::new();
-        log.token = Some(self.engine.follow_logs(log.id.clone(), buffer.clone()));
+        let token = self.engine.follow_logs(id, buffer.clone());
+        self.log = Some(OpenLog { token });
+        // The log covers the list.
+        self.watch_list();
         self.ui.send(UiUpdate::ShowLog(view::LogPane {
-            title: log.title.clone(),
+            title,
             source: Arc::new(buffer),
         }));
     }
@@ -610,18 +676,25 @@ impl<E: Engine, U: Ui> Controller<E, U> {
     /// Ends the open log, if there is one, and takes its view down.
     fn close_log(&mut self) {
         if let Some(log) = self.log.take() {
-            if let Some(token) = log.token {
-                self.engine.stop_logs(token);
-            }
+            self.engine.stop_logs(log.token);
             self.ui.send(UiUpdate::CloseLog);
         }
     }
 
-    /// The window took the log view down.
+    /// The window took the log view down: the list is in view again.
     fn log_closed(&mut self) {
-        if let Some(token) = self.log.take().and_then(|log| log.token) {
-            self.engine.stop_logs(token);
+        let Some(log) = self.log.take() else {
+            return;
+        };
+        self.engine.stop_logs(log.token);
+        if self.listing {
+            self.watch_list();
         }
+    }
+
+    /// The list of containers is what the window shows right now.
+    fn shows_containers(&self) -> bool {
+        self.listing && self.log.is_none() && self.kind() == ResourceKind::Container
     }
 
     // -----------------------------------------------------------------
@@ -678,7 +751,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
                 self.lists[present::tab_of(plan.kind)].clear_selection();
                 self.forget_disk();
                 if report.failed() == 0 {
-                    self.info = Some(removal_summary(&plan, &report));
+                    self.say(removal_summary(&plan, &report));
                 } else {
                     let notice = present::removal_notice(&plan, &report);
                     self.ui.send(UiUpdate::Notice(notice));
@@ -687,7 +760,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
             Message::Pruned { target, result } => match result {
                 Ok(report) => {
                     self.forget_disk();
-                    self.info = Some(prune_summary(target, &report));
+                    self.say(prune_summary(target, &report));
                 }
                 Err(error) => self.fail(error),
             },
@@ -699,7 +772,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
                     Some(error) => self.fail(error),
                     None => {
                         self.forget_disk();
-                        self.info = Some(format!("Pulled {reference}."));
+                        self.say(format!("Pulled {reference}."));
                         // Empties the box for the next image.
                         let entry = view::Entry {
                             text: Some(String::new()),
@@ -714,16 +787,19 @@ impl<E: Engine, U: Ui> Controller<E, U> {
                 }
             }
             Message::Log { token, message } => {
-                let ours = self
-                    .log
-                    .as_ref()
-                    .is_some_and(|log| log.token == Some(token));
+                let ours = self.log.as_ref().is_some_and(|log| log.token == token);
                 if let (true, LogMessage::Ended { error }) = (ours, message) {
                     let note = match error {
                         None => "log ended".to_string(),
                         Some(error) => format!("log stopped: {error}"),
                     };
                     self.ui.send(UiUpdate::LogNote(note));
+                    // A log ends with its container, or with the engine.
+                    // While a log shows, nothing else would tell before the
+                    // next slow poll: no event stream is open.
+                    if self.visible() {
+                        self.engine.refresh_status();
+                    }
                 }
             }
             Message::HostUsage(reading) => {
@@ -732,7 +808,9 @@ impl<E: Engine, U: Ui> Controller<E, U> {
                 }
             }
             Message::ContainerUsage(usage) => {
-                if self.usage_on {
+                // A round that was under way when the list went out of
+                // view is not shown as current when it is back.
+                if self.usage_on && self.shows_containers() {
                     self.usage.set_containers(usage);
                     self.lists[0].set_usage(self.usage.containers());
                 }
@@ -752,7 +830,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
         self.status = Some(status);
         // A poll the window did not ask for (the tray's start or stop) says
         // nothing about what to show.
-        if !self.visible {
+        if !self.visible() {
             return;
         }
         self.fresh = true;
@@ -767,10 +845,9 @@ impl<E: Engine, U: Ui> Controller<E, U> {
             self.leave_lists();
         } else if !self.listing && self.requested != Some(Transition::Stopping) {
             self.listing = true;
-            self.engine.show_list(Some(self.kind()));
-            if self.log.is_some() {
-                self.follow_log();
-            }
+            // A log that was followed through a minimised window is still
+            // followed, and still covers the list.
+            self.watch_list();
         }
     }
 
@@ -833,10 +910,11 @@ impl<E: Engine, U: Ui> Controller<E, U> {
         }
     }
 
-    /// Something failed. Shown above the content, or in a box of its own
-    /// when there is no window to show it in (a start from the tray).
+    /// Something failed. Shown above the content, where a minimised window
+    /// has it when it is back, or in a box of its own when there is no
+    /// window to show it in (a start from the tray).
     fn fail(&mut self, error: String) {
-        if self.visible {
+        if self.window != WindowState::Gone {
             self.info = None;
             self.error = Some(error);
         } else {
@@ -927,7 +1005,7 @@ impl<E: Engine, U: Ui> Controller<E, U> {
             self.sent.tray = Some(tray.clone());
             self.ui.send(UiUpdate::Tray(tray));
         }
-        if !self.visible {
+        if !self.visible() {
             return;
         }
         self.sync_usage();
@@ -1306,7 +1384,7 @@ mod tests {
     fn a_hidden_window_holds_nothing_and_asks_again_only_after_a_fresh_poll() {
         let mut harness = Harness::running();
         harness.event(UiEvent::WindowHidden);
-        assert_eq!(harness.calls(), ["usage false", "window Gone"]);
+        assert_eq!(harness.calls(), ["usage false", "window Hidden"]);
         // Nothing of what the engine still sends reaches a window that is away.
         harness.message(containers());
         harness.message(Message::HostUsage(HostReading::Failed("x".to_string())));
@@ -1335,15 +1413,110 @@ mod tests {
     #[test]
     fn a_window_that_comes_back_to_a_running_engine_gets_its_lists_again() {
         let mut harness = Harness::running();
+        harness.event(UiEvent::FilterChanged {
+            tab: 0,
+            text: "shop".to_string(),
+        });
         harness.event(UiEvent::WindowHidden);
         harness.updates();
         harness.event(UiEvent::WindowShown);
-        // The window dropped its lists; it gets the one it shows again, as
-        // it was, until the engine has answered.
-        assert_eq!(harness.table(0).summary, "3 containers");
+        // It was only minimised: it shows what it showed, filter and all,
+        // and is told nothing about its tabs or its filter again.
+        assert_eq!(harness.table(0).summary, "2 of 3 containers");
+        assert!(
+            !harness
+                .updates()
+                .iter()
+                .any(|update| matches!(update, UiUpdate::Tabs(_) | UiUpdate::Filter { .. }))
+        );
         harness.calls();
         harness.message(status(EngineState::Running));
         assert_eq!(harness.calls(), ["usage true", "show container"]);
+    }
+
+    #[test]
+    fn a_closed_window_takes_everything_of_its_own_along() {
+        let mut harness = Harness::running();
+        harness.event(UiEvent::TabChanged { tab: 1 });
+        harness.message(Message::List {
+            kind: ResourceKind::Image,
+            result: Ok(List::Images(vec![image("sha256:a", &["nginx:1"], 1, 0)])),
+        });
+        harness.event(UiEvent::FilterChanged {
+            tab: 1,
+            text: "nginx".to_string(),
+        });
+        harness.event(UiEvent::AllToggled { tab: 1 });
+        assert_eq!(harness.table(1).selected, 1);
+        harness.message(Message::Pruned {
+            target: PruneTarget::StoppedContainers,
+            result: Ok(PruneReport::default()),
+        });
+        assert!(harness.banner().is_some());
+        harness.calls();
+
+        harness.event(UiEvent::WindowClosed);
+        assert_eq!(harness.calls(), ["usage false", "window Gone"]);
+        // Nothing is kept for a window that is not there: no rows, no
+        // filter, no selection, no line about what was done.
+        assert_eq!(harness.banner(), None);
+        for kind in TABS {
+            let list = harness.controller.list(kind);
+            assert_eq!((list.total(), list.filter()), (0, ""), "{kind:?}");
+            assert_eq!(list.selected_count(), 0);
+        }
+        assert!(harness.controller.raw.iter().all(Option::is_none));
+        // Closing what is closed, or minimising it, does nothing.
+        harness.event(UiEvent::WindowClosed);
+        harness.event(UiEvent::WindowHidden);
+        assert_eq!(harness.calls(), [] as [&str; 0]);
+        harness.updates();
+
+        // The next window starts on the first tab, with an empty filter.
+        harness.event(UiEvent::WindowShown);
+        assert_eq!(harness.calls(), ["window Visible"]);
+        assert_eq!(harness.table(0).summary, "Loading…");
+        assert_eq!(harness.table(0).selected, 0);
+        let updates = harness.updates();
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            UiUpdate::Filter { tab: 0, text } if text.is_empty()
+        )));
+        assert!(
+            updates
+                .iter()
+                .any(|update| matches!(update, UiUpdate::Tabs(_)))
+        );
+        harness.message(status(EngineState::Running));
+        assert_eq!(harness.calls(), ["usage true", "show container"]);
+    }
+
+    #[test]
+    fn what_ends_while_the_window_is_closed_leaves_no_line_for_the_next_one() {
+        let mut harness = Harness::running();
+        harness.event(UiEvent::WindowClosed);
+        harness.message(Message::Pruned {
+            target: PruneTarget::StoppedContainers,
+            result: Ok(PruneReport::default()),
+        });
+        harness.message(Message::PullDone {
+            reference: "nginx:1".to_string(),
+            error: None,
+        });
+        harness.event(UiEvent::WindowShown);
+        assert_eq!(harness.banner(), None);
+        // A minimised window is still there: it has the line when it is back.
+        harness.message(status(EngineState::Running));
+        harness.event(UiEvent::WindowHidden);
+        harness.message(Message::Pruned {
+            target: PruneTarget::StoppedContainers,
+            result: Ok(PruneReport::default()),
+        });
+        harness.event(UiEvent::WindowShown);
+        assert_eq!(
+            harness.banner().unwrap().text,
+            "No stopped containers to remove."
+        );
     }
 
     #[test]
@@ -1499,8 +1672,91 @@ mod tests {
             },
         });
         let notice = harness.notice().unwrap();
-        assert!(notice.message.starts_with("Removed 2. 1 failed: web."));
+        assert_eq!(notice.title, "Removed 2 of 3 containers");
+        assert!(notice.message.starts_with("1 failed: web."));
         assert_eq!(notice.detail.as_deref(), Some("web: driver failed"));
+    }
+
+    /// A window on the images tab with three images, of which `a` and `b`
+    /// are in use.
+    fn images_in_use() -> Harness {
+        let mut harness = Harness::running();
+        harness.event(UiEvent::TabChanged { tab: 1 });
+        let image = |name: &str, used: bool| {
+            let tag = format!("{name}:1");
+            let mut image = image(&format!("sha256:{name}"), &[tag.as_str()], 1, 0);
+            image.containers = i64::from(used);
+            image
+        };
+        harness.message(Message::List {
+            kind: ResourceKind::Image,
+            result: Ok(List::Images(vec![
+                image("a", true),
+                image("b", true),
+                image("c", false),
+            ])),
+        });
+        harness.calls();
+        harness.updates();
+        harness
+    }
+
+    #[test]
+    fn a_selection_that_is_all_in_use_is_said_so_and_not_asked_about() {
+        let mut harness = images_in_use();
+        for name in ["a", "b"] {
+            harness.event(UiEvent::RowToggled {
+                tab: 1,
+                id: format!("sha256:{name}"),
+                range: false,
+            });
+        }
+        harness.updates();
+        harness.event(UiEvent::RemoveRequested { tab: 1, id: None });
+        let updates = harness.updates();
+        // No question, so nothing to agree to and nothing asked of the engine.
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, UiUpdate::Confirm(_)))
+        );
+        let notice = updates
+            .iter()
+            .find_map(|update| match update {
+                UiUpdate::Notice(notice) => Some(notice.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(notice.title, "The 2 selected images are in use");
+        assert!(!notice.message.contains(&notice.title));
+        assert_eq!(harness.calls(), [] as [&str; 0]);
+        // The same for one row's own Remove.
+        harness.event(UiEvent::RowAction {
+            tab: 1,
+            id: "sha256:a".to_string(),
+            action: "remove".to_string(),
+        });
+        assert_eq!(harness.notice().unwrap().title, "Image a:1 is in use");
+    }
+
+    #[test]
+    fn a_removal_takes_only_what_can_go_and_counts_that() {
+        let mut harness = images_in_use();
+        harness.event(UiEvent::AllToggled { tab: 1 });
+        harness.event(UiEvent::RemoveRequested { tab: 1, id: None });
+        let confirm = harness.confirm();
+        assert_eq!(confirm.title, "Remove image c:1?");
+        assert_eq!(
+            confirm.message,
+            "2 of the 3 selected are in use and will be kept. This cannot be undone."
+        );
+        assert_eq!(confirm.accept, "Remove");
+        harness.event(UiEvent::Confirmed {
+            token: confirm.token,
+            accepted: true,
+        });
+        // What is in use is not even tried.
+        assert_eq!(harness.calls(), ["remove sha256:c"]);
     }
 
     #[test]
@@ -1835,7 +2091,8 @@ mod tests {
             id: "id-web".to_string(),
             action: "logs".to_string(),
         });
-        assert_eq!(harness.calls(), ["follow id-web"]);
+        // The log covers the list: nothing is loaded or sampled for it.
+        assert_eq!(harness.calls(), ["follow id-web", "show none"]);
         let pane = Harness::pane;
         assert_eq!(pane(&harness).title, "web");
         // The view reads what the engine's thread writes.
@@ -1857,14 +2114,16 @@ mod tests {
         });
         assert!(harness.updates().is_empty());
 
+        // The end of the log was a reason to look at the engine; closing
+        // the view brings the list back.
         harness.event(UiEvent::LogClosed);
-        assert_eq!(harness.calls(), ["unfollow 1"]);
+        assert_eq!(harness.calls(), ["refresh", "unfollow 1", "show container"]);
         harness.event(UiEvent::LogClosed);
         assert_eq!(harness.calls(), [] as [&str; 0]);
     }
 
     #[test]
-    fn a_log_is_let_go_while_the_window_is_minimised_and_taken_up_again() {
+    fn another_tab_under_an_open_log_loads_only_its_own_list() {
         let mut harness = Harness::running();
         harness.event(UiEvent::RowAction {
             tab: 0,
@@ -1872,29 +2131,121 @@ mod tests {
             action: "logs".to_string(),
         });
         harness.calls();
-        harness.event(UiEvent::WindowHidden);
-        // `Gone` ends the log with everything else.
-        assert_eq!(harness.calls(), ["usage false", "window Gone"]);
-        harness.event(UiEvent::WindowShown);
+        // The window says the tab first, then that the log is closed.
+        harness.event(UiEvent::TabChanged { tab: 1 });
+        harness.event(UiEvent::LogClosed);
+        // The containers, which the log covered, are not loaded in between.
+        assert_eq!(harness.calls(), ["show none", "unfollow 1", "show image"]);
+    }
+
+    #[test]
+    fn a_log_goes_on_while_the_window_is_minimised() {
+        let mut harness = Harness::running();
+        harness.event(UiEvent::RowAction {
+            tab: 0,
+            id: "id-web".to_string(),
+            action: "logs".to_string(),
+        });
+        harness.calls();
         harness.updates();
+        harness.event(UiEvent::WindowHidden);
+        // `Hidden` keeps the log; nothing ends it and nothing closes its view.
+        assert_eq!(harness.calls(), ["usage false", "window Hidden"]);
+        // Lines keep arriving in the buffer the view reads.
+        harness.engine.logs.borrow()[0].append(["while minimised".to_string()]);
+        harness.event(UiEvent::WindowShown);
         harness.message(status(EngineState::Running));
+        // Not followed again, so not started over from its last lines; and
+        // it still covers the list.
         assert_eq!(
             harness.calls(),
-            [
-                "window Visible",
-                "usage true",
-                "show container",
-                "follow id-web"
-            ]
+            ["window Visible", "usage true", "show none"]
         );
+        let updates = harness.updates();
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, UiUpdate::ShowLog(_) | UiUpdate::CloseLog))
+        );
+        assert_eq!(harness.engine.logs.borrow().len(), 1);
+        assert_eq!(harness.engine.logs.borrow()[0].read(|log| log.len()), 1);
+    }
+
+    #[test]
+    fn a_log_goes_with_the_window_that_is_closed() {
+        let mut harness = Harness::running();
+        harness.event(UiEvent::RowAction {
+            tab: 0,
+            id: "id-web".to_string(),
+            action: "logs".to_string(),
+        });
+        // Closed from the taskbar while minimised: the same as closed.
+        harness.event(UiEvent::WindowHidden);
+        harness.calls();
+        harness.updates();
+        harness.event(UiEvent::WindowClosed);
+        // `Gone` ends the log with everything else.
+        assert_eq!(harness.calls(), ["window Gone"]);
         assert!(
             harness
                 .updates()
                 .iter()
+                .any(|update| matches!(update, UiUpdate::CloseLog))
+        );
+        harness.event(UiEvent::WindowShown);
+        harness.message(status(EngineState::Running));
+        // The next window shows the list, not the log.
+        assert_eq!(
+            harness.calls(),
+            ["window Visible", "usage true", "show container"]
+        );
+        assert!(
+            !harness
+                .updates()
+                .iter()
                 .any(|update| matches!(update, UiUpdate::ShowLog(_)))
         );
-        // A fresh buffer: the last lines come again and are not doubled.
-        assert_eq!(harness.engine.logs.borrow().len(), 2);
+    }
+
+    #[test]
+    fn nothing_is_taken_for_a_list_that_a_log_covers() {
+        let mut harness = Harness::running();
+        let sample = || Message::ContainerUsage(Some(vec![usage("web", Some(12.5), 52_400_000)]));
+        let cpu = |harness: &Harness| -> String {
+            let table = harness.table(0);
+            let row = table.lines.iter().find_map(|line| match line {
+                view::Line::Row(row) if row.id == "id-web" => Some(row.clone()),
+                _ => None,
+            });
+            row.unwrap().cells[4].clone()
+        };
+        harness.message(sample());
+        assert_eq!(cpu(&harness), "12.5%");
+        harness.event(UiEvent::RowAction {
+            tab: 0,
+            id: "id-web".to_string(),
+            action: "logs".to_string(),
+        });
+        // The figures of the covered list are forgotten, and a round that
+        // was under way is not taken in.
+        assert_eq!(cpu(&harness), "—");
+        harness.updates();
+        harness.message(sample());
+        assert!(
+            !harness
+                .updates()
+                .iter()
+                .any(|update| matches!(update, UiUpdate::Table { .. }))
+        );
+        harness.event(UiEvent::LogClosed);
+        harness.message(sample());
+        assert_eq!(cpu(&harness), "12.5%");
+        // The same on another tab: the containers are not in view there.
+        harness.event(UiEvent::TabChanged { tab: 1 });
+        harness.calls();
+        harness.event(UiEvent::TabChanged { tab: 0 });
+        assert_eq!(harness.calls(), ["show container"]);
+        assert_eq!(cpu(&harness), "—");
     }
 
     #[test]

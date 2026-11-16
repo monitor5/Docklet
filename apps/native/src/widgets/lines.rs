@@ -55,6 +55,28 @@ pub fn button_actions(table: &Table) -> Vec<usize> {
         .collect()
 }
 
+/// The places for buttons in the actions column, in order: each lists the
+/// actions (by their index in `Table::actions`) that can stand there. An
+/// action marked `alternate` joins the place of the button before it.
+pub fn button_slots(table: &Table) -> Vec<Vec<usize>> {
+    let mut slots: Vec<Vec<usize>> = Vec::new();
+    for action in button_actions(table) {
+        match slots.last_mut() {
+            Some(slot) if table.actions[action].alternate => slot.push(action),
+            _ => slots.push(vec![action]),
+        }
+    }
+    slots
+}
+
+/// The action whose button stands in `slot` on `row`: the first that
+/// applies to the row, or the slot's first where none does.
+pub fn slot_action(row: &Row, slot: &[usize]) -> Option<usize> {
+    let applies = |action: usize| action < 32 && row.actions & (1 << action) != 0;
+    let fitting = slot.iter().copied().find(|&action| applies(action));
+    fitting.or(slot.first().copied())
+}
+
 /// The first line from `start` on, wrapping, whose first cell (or group
 /// name) starts with `prefix`, ignoring case: type-to-find.
 pub fn find_prefix(lines: &[Line], prefix: &str, start: usize) -> Option<usize> {
@@ -159,5 +181,41 @@ mod tests {
             ..Table::default()
         };
         assert_eq!(button_actions(&table), [0, 2]);
+    }
+
+    #[test]
+    fn an_alternate_button_stands_where_the_one_before_it_does() {
+        let table = Table {
+            actions: vec![
+                Action::new("start", "Start"),
+                Action::new("stop", "Stop").alternate(),
+                Action::in_menu("restart", "Restart"),
+                Action::new("logs", "Logs"),
+            ],
+            ..Table::default()
+        };
+        let slots = button_slots(&table);
+        assert_eq!(slots, [vec![0, 1], vec![3]]);
+        let mut stopped = Row::new("a", vec![]);
+        stopped.actions = 0b1001;
+        let mut running = Row::new("b", vec![]);
+        running.actions = 0b1110;
+        assert_eq!(slot_action(&stopped, &slots[0]), Some(0));
+        assert_eq!(slot_action(&running, &slots[0]), Some(1));
+        // A busy row keeps the button of what applies to it, disabled.
+        running.flags = crate::boundary::RowFlags::BUSY;
+        assert_eq!(slot_action(&running, &slots[0]), Some(1));
+        assert!(!running.action_enabled(1));
+        // Neither applies: the first stands there, disabled.
+        let mut neither = Row::new("c", vec![]);
+        neither.actions = 0b1000;
+        assert_eq!(slot_action(&neither, &slots[0]), Some(0));
+        assert_eq!(slot_action(&neither, &[]), None);
+        // An alternate with no button before it gets a place of its own.
+        let lone = Table {
+            actions: vec![Action::new("stop", "Stop").alternate()],
+            ..Table::default()
+        };
+        assert_eq!(button_slots(&lone), [vec![0]]);
     }
 }

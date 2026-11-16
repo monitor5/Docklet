@@ -241,7 +241,8 @@ pub struct Sort {
 }
 
 /// The text typed into a filter box. A row matches when every word occurs
-/// in one of its cells or in its group's name, whatever the case.
+/// in one of its cells, in its group's name or in one of its published
+/// ports (the Ports cell does not write them all out), whatever the case.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
     words: Vec<String>,
@@ -260,9 +261,15 @@ impl Filter {
 
     pub fn matches(&self, row: &Row) -> bool {
         let fields = || row.cells.iter().chain(row.group.as_ref());
+        let in_ports = |word: &str| {
+            let ports = row.ports.iter();
+            ports
+                .map(|port| format!(":{port}"))
+                .any(|port| port.contains(word))
+        };
         self.words
             .iter()
-            .all(|word| fields().any(|field| field.to_lowercase().contains(word)))
+            .all(|word| fields().any(|field| field.to_lowercase().contains(word)) || in_ports(word))
     }
 }
 
@@ -397,13 +404,27 @@ pub fn containers_table(
     table
 }
 
+/// Ports written out in the Ports cell; the rest are counted.
+const PORTS_SHOWN: usize = 2;
+
+/// The Ports cell: `:8080 :8443`, and `:8080 :8443 +3` for more than two.
+/// A cell with every port would be cut off in the middle of a number; all
+/// of them are in the row's menu, and the filter finds each (`Filter`).
+pub fn ports_text(ports: &[u16]) -> String {
+    let shown = &ports[..ports.len().min(PORTS_SHOWN)];
+    let mut text: Vec<String> = shown.iter().map(|port| format!(":{port}")).collect();
+    if ports.len() > PORTS_SHOWN {
+        text.push(format!("+{}", ports.len() - PORTS_SHOWN));
+    }
+    text.join(" ")
+}
+
 fn container_row(container: &ContainerSummary) -> Row {
     let name = container_name(container);
     let running = is_running(container);
     let ports = published_ports(container.ports.as_deref());
-    let shown_ports: Vec<String> = ports.iter().map(|port| format!(":{port}")).collect();
     let first_port = match ports.first() {
-        Some(&port) => number(shown_ports.join(" "), f64::from(port)),
+        Some(&port) => number(ports_text(&ports), f64::from(port)),
         None => missing(""),
     };
     let cells = vec![
@@ -714,6 +735,34 @@ mod tests {
         );
         assert_eq!(row.ports, [443, 8080]);
         assert!(row.flags.running);
+    }
+
+    #[test]
+    fn the_ports_cell_writes_two_ports_out_and_counts_the_rest() {
+        assert_eq!(ports_text(&[]), "");
+        assert_eq!(ports_text(&[18080]), ":18080");
+        assert_eq!(ports_text(&[18080, 18081]), ":18080 :18081");
+        assert_eq!(ports_text(&[80, 443, 8080, 9000]), ":80 :443 +2");
+        // Never longer than this, whatever a container publishes.
+        let most = ports_text(&[65531, 65532, 65533, 65534, 65535]);
+        assert_eq!(most, ":65531 :65532 +3");
+    }
+
+    #[test]
+    fn the_filter_finds_a_port_the_cell_only_counts() {
+        let mut web = container("web", None, true);
+        let port = |public| PortSummary {
+            ip: None,
+            private_port: 80,
+            public_port: Some(public),
+            typ: Some(PortSummaryTypeEnum::TCP),
+        };
+        web.ports = Some(vec![port(80), port(443), port(9000)]);
+        let table = containers_table(&[web, container("db", None, true)], None);
+        assert_eq!(table.rows[1].cells[container_column::PORTS], ":80 :443 +1");
+        assert_eq!(ordered(&table, None, "9000"), ["web"]);
+        assert_eq!(ordered(&table, None, ":443 web"), ["web"]);
+        assert!(ordered(&table, None, "9001").is_empty());
     }
 
     #[test]

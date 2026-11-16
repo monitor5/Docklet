@@ -6,14 +6,17 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Controls::{
     ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
     INITCOMMONCONTROLSEX, InitCommonControlsEx,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    IsDialogMessageW, MSG, PostMessageW, PostQuitMessage, RegisterWindowMessageW, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOWPLACEMENT, WM_APP, WM_DESTROY, WS_OVERLAPPED,
+    IsDialogMessageW, KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
+    SetTimer, TranslateMessage, WINDOW_EX_STYLE, WINDOWPLACEMENT, WM_APP, WM_DESTROY, WM_TIMER,
+    WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -31,6 +34,11 @@ pub(crate) const HOST_CLASS: PCWSTR = w!("Docklet.Native.Host");
 /// Posted by a second instance: show the window.
 pub(crate) const WM_SHOW_REQUEST: u32 = WM_APP + 11;
 const WM_SHOW_DIALOG: u32 = WM_APP + 12;
+/// The one-shot timer that runs [`release_memory`] after the window closed.
+const RELEASE_TIMER: usize = 2;
+/// Long enough for what the window started to have ended: the engine's
+/// streams are aborted at once, and their tasks are gone within a moment.
+const RELEASE_AFTER_MS: u32 = 3_000;
 
 /// How [`run`] starts.
 #[derive(Clone, Debug, Default)]
@@ -70,10 +78,9 @@ pub(crate) struct Ctx {
     pub dark_api: Option<DarkApi>,
     /// The main window, while it exists.
     pub main: Cell<Option<HWND>>,
-    /// Where the main window was when it was last closed.
+    /// Where the main window was when it was last closed: the one thing a
+    /// new window takes over from the last.
     pub placement: Cell<Option<WINDOWPLACEMENT>>,
-    /// The tab the main window showed when it was last closed.
-    pub last_tab: Cell<usize>,
     handler: RefCell<Box<dyn FnMut(UiEvent)>>,
     events: RefCell<VecDeque<UiEvent>>,
     dispatching: Cell<bool>,
@@ -169,7 +176,6 @@ pub fn run(handle: UiHandle, options: RunOptions, on_event: impl FnMut(UiEvent) 
         dark_api,
         main: Cell::new(None),
         placement: Cell::new(None),
-        last_tab: Cell::new(0),
         handler: RefCell::new(Box::new(on_event)),
         events: RefCell::new(VecDeque::new()),
         dispatching: Cell::new(false),
@@ -377,6 +383,41 @@ fn tray_command(ctx: &Ctx, command: TrayCommand) {
     }
 }
 
+/// The main window was closed and only the tray icon is left. What the
+/// window held is freed by now or about to be: its fonts, brushes and
+/// bitmap with its state, the lists and the log's lines with whoever drove
+/// it. A moment later, when the threads that fed it have wound down, the
+/// memory that leaves free is given back to Windows (see
+/// [`release_memory`]).
+pub(crate) fn window_closed(ctx: &Ctx) {
+    // SAFETY: a timer of this thread's own window. Setting it again while
+    // it runs only starts its time over.
+    unsafe {
+        SetTimer(Some(ctx.host), RELEASE_TIMER, RELEASE_AFTER_MS, None);
+    }
+}
+
+/// Gives back what a closed window leaves behind.
+///
+/// Freeing memory returns it to the process heap, not to Windows, and
+/// every page the window's code and data touched stays in the working set
+/// until Windows wants it for something else: a process that only shows a
+/// tray icon would go on looking as large as when its window was open.
+/// Windows trims a process like this by itself when its window is
+/// minimised; a window that is destroyed gets no such trim, so it is asked
+/// for here. Pages that are needed again come back as they are touched.
+fn release_memory() {
+    // SAFETY: both calls act on this process alone and take no pointers.
+    // Compacting the heap decommits what is free in it; the two sizes of
+    // -1 are the documented way to ask for the working set to be emptied.
+    unsafe {
+        if let Ok(heap) = GetProcessHeap() {
+            HeapCompact(heap, HEAP_FLAGS(0));
+        }
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
 /// Closes the window and the tray icon; the loop ends with them.
 pub(crate) fn quit(ctx: &Ctx) {
     // SAFETY: both are windows of this thread; destroying the main window
@@ -407,6 +448,17 @@ unsafe extern "system" fn host_proc(
         }
         WM_SHOW_REQUEST => shell::show(),
         WM_SHOW_DIALOG => show_dialogs(ctx),
+        WM_TIMER if wparam.0 == RELEASE_TIMER => {
+            // Once: the timer is not a poll.
+            // SAFETY: the timer belongs to this window.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), RELEASE_TIMER);
+            }
+            // Opened again meanwhile: the window needs what it has.
+            if ctx.main.get().is_none() {
+                release_memory();
+            }
+        }
         tray::WM_TRAY => {
             let state = ctx.model.borrow().tray.clone();
             if let Some(command) = tray::command(hwnd, lparam, &state) {

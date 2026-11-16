@@ -6,7 +6,7 @@ use docklet_engine::{DiskTotals, DiskUsage, RemoveReport, ResourceKind};
 use crate::format::{format_bytes, format_count};
 use crate::list::{Item, ListModel};
 use crate::pull::pull_button_label;
-use crate::removal::{PruneTarget, RemovalPlan, noun, removal_summary};
+use crate::removal::{PruneTarget, RemovalPlan, noun, removal_outcome, removal_reasons};
 use crate::screen::{EngineCommand, WSL_INSTALL_COMMAND, screen_text, state_label};
 use crate::table::{RowAction, SortDirection, container_column};
 use crate::usage::{Meter, MeterState};
@@ -61,21 +61,36 @@ pub fn kind_of(tab: usize) -> Option<ResourceKind> {
 /// buttons. A row's `view::Row::actions` has a bit for each. The port in
 /// `OpenPort` stands for "a port": the button opens the row's first one,
 /// and each port has an item of its own in the row's menu.
+///
+/// A container is started or stopped, never both, so the two share one
+/// place. When the window is too narrow for a row, buttons fold into the
+/// row's menu and columns go, in the order of `fold` here and of `layout`
+/// below, highest first: the least used first, and the name, the state and
+/// Start or Stop last.
 fn row_actions(kind: ResourceKind) -> Vec<(RowAction, view::Action)> {
-    let remove = (RowAction::Remove, view::Action::new(key::REMOVE, "Remove"));
+    let remove = view::Action::new(key::REMOVE, "Remove");
     match kind {
         ResourceKind::Container => vec![
             (RowAction::Start, view::Action::new(key::START, "Start")),
-            (RowAction::Stop, view::Action::new(key::STOP, "Stop")),
+            (
+                RowAction::Stop,
+                view::Action::new(key::STOP, "Stop").alternate(),
+            ),
             (
                 RowAction::Restart,
                 view::Action::in_menu(key::RESTART, "Restart"),
             ),
-            (RowAction::Logs, view::Action::new(key::LOGS, "Logs")),
-            (RowAction::OpenPort(0), view::Action::new(key::OPEN, "Open")),
-            remove,
+            (
+                RowAction::Logs,
+                view::Action::new(key::LOGS, "Logs").fold(2),
+            ),
+            (
+                RowAction::OpenPort(0),
+                view::Action::new(key::OPEN, "Open").fold(6),
+            ),
+            (RowAction::Remove, remove.fold(7)),
         ],
-        _ => vec![remove],
+        _ => vec![(RowAction::Remove, remove)],
     }
 }
 
@@ -87,31 +102,50 @@ fn applies(row: &crate::table::Row, action: RowAction) -> bool {
     }
 }
 
-/// Narrowest each column gets, in device-independent pixels.
-fn min_widths(kind: ResourceKind) -> &'static [u16] {
+/// For each column: the narrowest it gets, in device-independent pixels,
+/// and how soon it gives way in a narrow window (`view::Column::priority`).
+///
+/// The minimum holds what the column shows without cutting it: Ports two
+/// ports and a count (`table::ports_text`), the I/O columns a pair of
+/// sizes. Of the containers' columns the live figures go before what tells
+/// one container from another.
+fn layout(kind: ResourceKind) -> &'static [(u16, u8)] {
     match kind {
-        ResourceKind::Container => &[130, 90, 80, 60, 56, 70, 110, 110],
-        ResourceKind::Image => &[160, 100, 70, 90],
-        ResourceKind::Volume | ResourceKind::Network => &[160, 70, 70],
+        ResourceKind::Container => &[
+            (130, 0),
+            (90, 2),
+            (80, 1),
+            (104, 3),
+            (56, 4),
+            (70, 5),
+            (110, 8),
+            (110, 9),
+        ],
+        ResourceKind::Image => &[(160, 0), (100, 3), (70, 1), (90, 2)],
+        ResourceKind::Volume | ResourceKind::Network => &[(160, 0), (70, 2), (70, 1)],
     }
 }
 
 fn columns(list: &ListModel) -> Vec<view::Column> {
     let kind = list.kind();
-    let widths = min_widths(kind);
+    let layout = layout(kind);
     list.columns()
         .iter()
         .enumerate()
-        .map(|(index, column)| view::Column {
-            title: column.title.to_string(),
-            align: match column.align {
-                crate::table::Align::Left => view::Align::Left,
-                crate::table::Align::Right => view::Align::Right,
-            },
-            weight: column.width,
-            min_width: widths.get(index).copied().unwrap_or(60),
-            sortable: true,
-            status: kind == ResourceKind::Container && index == container_column::STATE,
+        .map(|(index, column)| {
+            let (min_width, priority) = layout.get(index).copied().unwrap_or((60, 0));
+            view::Column {
+                title: column.title.to_string(),
+                align: match column.align {
+                    crate::table::Align::Left => view::Align::Left,
+                    crate::table::Align::Right => view::Align::Right,
+                },
+                weight: column.width,
+                min_width,
+                sortable: true,
+                status: kind == ResourceKind::Container && index == container_column::STATE,
+                priority,
+            }
         })
         .collect()
 }
@@ -433,7 +467,9 @@ pub fn question(text: &str) -> (String, String) {
     }
 }
 
-/// The question to ask before a removal.
+/// The question to ask before a removal of what is selected. The button
+/// counts what will really go (`RemovalPlan::going`), as the question does.
+/// Ask only when something can go: see [`removal_refusal`].
 pub fn removal_confirm(token: u64, plan: &RemovalPlan) -> view::Confirm {
     let (title, rest) = question(&plan.confirmation());
     let message = if rest.is_empty() {
@@ -445,11 +481,23 @@ pub fn removal_confirm(token: u64, plan: &RemovalPlan) -> view::Confirm {
         token,
         title,
         message,
-        accept: match plan.items.len() {
-            1 => "Remove".to_string(),
+        accept: match plan.items.len() - plan.kept() {
+            0 | 1 => "Remove".to_string(),
             count => format!("Remove {count}"),
         },
     }
+}
+
+/// What to say instead of asking when nothing of what is selected can be
+/// removed, or `None` when there is something to ask about.
+pub fn removal_refusal(plan: &RemovalPlan) -> Option<view::Notice> {
+    let (title, message) = plan.refusal()?;
+    Some(view::Notice {
+        title,
+        message,
+        detail: None,
+        tone: view::Tone::Info,
+    })
 }
 
 /// The question to ask before a prune.
@@ -468,8 +516,8 @@ pub fn prune_confirm(token: u64, target: PruneTarget) -> view::Confirm {
     }
 }
 
-/// What to show after a removal that left something behind: the summary,
-/// and what the engine said about each item.
+/// What to show after a removal that left something behind: how it went as
+/// the title, why under it, and what the engine said about each item.
 pub fn removal_notice(plan: &RemovalPlan, report: &RemoveReport) -> view::Notice {
     let failures: Vec<String> = report
         .results
@@ -480,12 +528,8 @@ pub fn removal_notice(plan: &RemovalPlan, report: &RemoveReport) -> view::Notice
         })
         .collect();
     view::Notice {
-        title: if report.removed() == 0 {
-            "Nothing was removed".to_string()
-        } else {
-            "Not everything was removed".to_string()
-        },
-        message: removal_summary(plan, report),
+        title: removal_outcome(plan, report),
+        message: removal_reasons(plan, report),
         detail: (!failures.is_empty()).then(|| failures.join("\n")),
         tone: view::Tone::Warning,
     }
@@ -588,6 +632,24 @@ mod tests {
         assert_eq!(keys, ["start", "stop", "restart", "logs", "open", "remove"]);
         // Restart is in the context menu only.
         assert!(!table.actions[2].button);
+        // Stop stands where Start does; neither ever folds into the menu,
+        // and of the others Remove goes first.
+        let layout: Vec<(bool, u8)> = table
+            .actions
+            .iter()
+            .map(|action| (action.alternate, action.fold))
+            .collect();
+        assert_eq!(
+            layout,
+            [
+                (false, 0),
+                (true, 0),
+                (false, 0),
+                (false, 2),
+                (false, 6),
+                (false, 7)
+            ]
+        );
         assert_eq!(table.default_action, Some(3));
         let rows = rows(&table);
         let enabled = |row: &view::Row| -> Vec<bool> {
@@ -598,6 +660,28 @@ mod tests {
         assert_eq!(enabled(rows[1]), [false, true, true, true, true, true]);
         assert!(rows[1].flags.contains(view::RowFlags::ACTIVE));
         assert!(!rows[0].flags.contains(view::RowFlags::ACTIVE));
+    }
+
+    #[test]
+    fn every_list_says_which_columns_stay_in_a_narrow_window() {
+        for kind in TABS {
+            let table = table_view(&ListModel::new(kind), true, None);
+            let priorities: Vec<u8> = table.columns.iter().map(|c| c.priority).collect();
+            // The name stays whatever the width, and no two give way at once.
+            assert_eq!(priorities[0], 0, "{kind:?}");
+            let mut sorted = priorities.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), priorities.len(), "{kind:?}");
+            // Every column has a minimum of its own.
+            assert_eq!(layout(kind).len(), table.columns.len(), "{kind:?}");
+        }
+        let containers = table_view(&ListModel::new(ResourceKind::Container), true, None);
+        // The disk and network figures go first, the state last.
+        let order = |column: usize| containers.columns[column].priority;
+        assert!(order(container_column::DISK_IO) > order(container_column::NET_IO));
+        assert!(order(container_column::NET_IO) > order(container_column::MEMORY));
+        assert!(order(container_column::PORTS) > order(container_column::STATE));
     }
 
     #[test]
@@ -891,6 +975,65 @@ mod tests {
         );
     }
 
+    /// Images `a:1`, `b:1`, ... of which those named in `used` are in use.
+    fn image_plan(names: &[&str], used: &[&str]) -> RemovalPlan {
+        let images: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let tag = format!("{name}:1");
+                let mut image = image(&format!("sha256:{name}"), &[tag.as_str()], 1, 0);
+                image.containers = i64::from(used.contains(name));
+                image
+            })
+            .collect();
+        RemovalPlan::new(ResourceKind::Image, &images_table(&images).rows)
+    }
+
+    #[test]
+    fn the_accept_button_counts_what_will_really_go() {
+        let some = removal_confirm(1, &image_plan(&["a", "b", "c", "d"], &["b"]));
+        assert_eq!(some.title, "Remove 3 images?");
+        assert_eq!(
+            some.message,
+            "1 of the 4 selected is in use and will be kept. This cannot be undone."
+        );
+        assert_eq!(some.accept, "Remove 3");
+        let one = removal_confirm(2, &image_plan(&["a", "b", "c"], &["a", "b"]));
+        assert_eq!(one.title, "Remove image c:1?");
+        assert_eq!(one.accept, "Remove");
+        assert_eq!(removal_refusal(&image_plan(&["a", "b"], &["a"])), None);
+    }
+
+    #[test]
+    fn nothing_removable_is_said_up_front_without_a_question() {
+        let notice = removal_refusal(&image_plan(&["a", "b"], &["a", "b"])).unwrap();
+        assert_eq!(notice.title, "The 2 selected images are in use");
+        assert!(notice.message.starts_with("Containers use them"));
+        assert_eq!(notice.tone, view::Tone::Info);
+        let one = removal_refusal(&image_plan(&["a"], &["a"])).unwrap();
+        assert_eq!(one.title, "Image a:1 is in use");
+    }
+
+    #[test]
+    fn a_results_title_and_body_do_not_repeat_each_other() {
+        let plan = image_plan(&["a", "b"], &[]);
+        let failed = |name: &str| {
+            RemoveResult::failed(
+                ResourceKind::Image,
+                format!("sha256:{name}").as_str(),
+                RemoveFailure::InUse,
+                "conflict",
+            )
+        };
+        let report = RemoveReport {
+            results: vec![failed("a"), failed("b")],
+        };
+        let notice = removal_notice(&plan, &report);
+        assert_eq!(notice.title, "Nothing was removed");
+        assert_eq!(notice.message, "2 are in use: a:1, b:1.");
+        assert!(!notice.message.contains("Nothing was removed"));
+    }
+
     #[test]
     fn a_removal_that_left_something_names_each_failure() {
         let mut list = containers();
@@ -909,8 +1052,11 @@ mod tests {
             ],
         };
         let notice = removal_notice(&plan, &report);
-        assert_eq!(notice.title, "Not everything was removed");
-        assert!(notice.message.starts_with("Removed 2."));
+        assert_eq!(notice.title, "Removed 2 of 3 containers");
+        assert_eq!(
+            notice.message,
+            "1 failed: web. The engine said: driver failed"
+        );
         assert_eq!(notice.detail.as_deref(), Some("web: driver failed"));
         assert_eq!(notice.tone, view::Tone::Warning);
     }
