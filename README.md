@@ -22,10 +22,18 @@ Desktop required.
   for 10 minutes stops by itself and shows as `sleeping`; the next Docker
   command starts it again. `docklet config set idle-stop <minutes|off>` changes
   or disables this. See [Idle stop](#idle-stop).
-- **Desktop app** (`docklet-desktop.exe`; written, but nobody has run it yet):
-  a tray icon with Open, Start engine, Stop engine and Quit, and a window with
-  an install screen, Containers, Images, Volumes and Networks views, and a log
-  view for containers. Closing the window destroys the WebView.
+- **Native app** (`docklet-native.exe`, Win32, one 1.8 MiB executable): a tray
+  icon with Open, Start engine, Stop engine and Quit, and a window with the
+  install screen, Containers, Images, Volumes and Networks lists, image pull
+  and container logs. A strip shows what the engine uses (memory, CPU, GPU,
+  disk) and the Containers list shows CPU, memory and I/O per container. Rows
+  have check boxes with select-all in the header: the selection is removed in
+  one step after a confirmation, and each tab can remove what is unused and
+  report the space it got back. Closing the window leaves only the tray icon
+  and gives the memory back.
+- **Web app** (`docklet-desktop.exe`, Tauri 2 + WebView2): the earlier window
+  with the same lists and logs, without the usage figures and the bulk
+  removal. It stays until the native app has replaced it.
 
 ## What does not work yet
 
@@ -43,8 +51,10 @@ Desktop required.
   user, relayed into the distro's `/var/run/docker.sock`. The GUI and the Windows
   `docker` / `docker compose` CLIs use the same pipe.
 - **Kubernetes**: a single-node k3d cluster that is started and stopped on demand.
-- **App**: Tauri 2 (Rust core + WebView2). Closing the window destroys the WebView
-  and leaves only the tray process.
+- **App**: a native Win32 window and tray icon (`apps/native`) on top of
+  `docklet-app`, which holds everything that is not drawing. Measured on one
+  PC: about 30 MB with the window open against about 350 MB for the WebView2
+  window (see [docs/spikes.md](docs/spikes.md)).
 
 ## Engine bases
 
@@ -117,17 +127,19 @@ pnpm build      # NSIS installer in target/release/bundle/nsis
 
 ## Layout
 
-| Path                    | Contents                                                        |
-| ----------------------- | --------------------------------------------------------------- |
-| `apps/desktop`          | React UI and the Tauri shell (`src-tauri`)                      |
-| `crates/docklet-cli`    | The `docklet` command line                                      |
-| `crates/docklet-core`   | Platform-neutral logic: state machine, `wsl.exe` output parsing |
-| `crates/docklet-wsl`    | `wsl.exe` runner, registry lookup, keepalive                    |
-| `crates/docklet-proxy`  | Named pipe server and relay                                     |
-| `crates/docklet-engine` | Docker Engine API client (resources, events, logs, pulls)       |
-| `skills/docklet`        | Agent skill (`SKILL.md`), embedded in the CLI                   |
-| `distro`                | Root filesystem definition of the `docklet` distro              |
-| `docs/spikes.md`        | Results of technical spikes                                     |
+| Path                    | Contents                                                                 |
+| ----------------------- | ------------------------------------------------------------------------ |
+| `apps/desktop`          | React UI and the Tauri shell (`src-tauri`)                               |
+| `apps/native`           | The native Win32 app                                                     |
+| `crates/docklet-app`    | Application logic without a UI toolkit: control, lists, selection, usage |
+| `crates/docklet-cli`    | The `docklet` command line                                               |
+| `crates/docklet-core`   | Platform-neutral logic: state machine, `wsl.exe` output parsing          |
+| `crates/docklet-wsl`    | `wsl.exe` runner, registry lookup, keepalive                             |
+| `crates/docklet-proxy`  | Named pipe server and relay                                              |
+| `crates/docklet-engine` | Docker Engine API client (resources, events, logs, pulls)                |
+| `skills/docklet`        | Agent skill (`SKILL.md`), embedded in the CLI                            |
+| `distro`                | Root filesystem definition of the `docklet` distro                       |
+| `docs/spikes.md`        | Results of technical spikes                                              |
 
 ## License
 

@@ -247,3 +247,67 @@ Local PC (2026-11-15, release build, one run per base, idle time 20 s):
 - Not measured: a debian-13 wake from a VM that is fully gone, memory of the
   running engine per base in this build, and the desktop window on a sleeping
   engine.
+
+## Native Win32 window instead of WebView2
+
+Question: how much lighter is a window that is not a web page, with the same
+screens?
+
+Method (2026-11-15 and 16, one PC, release builds, 125% display scaling): the
+Tauri window, two throwaway prototypes of one screen (Win32 with the
+`windows` crate, and Slint), then the real native app. `docklet-native.exe`
+was measured in its demo mode (made-up data, a log of 10,000 lines per
+second) and against a real engine on the alpine base. Working set and
+private bytes of the app's own processes; CPU as a share of one core over
+5 to 15 s.
+
+| State                                   | Tauri + WebView2                     | Native app                    |
+| --------------------------------------- | ------------------------------------ | ----------------------------- |
+| Executable                              | 4.1 MB plus WebView2                 | 1.8 MiB                       |
+| Window open on a list                   | 357 MB (148 MB private), 7 processes | 28 MB (8 MB private)          |
+| Window closed, tray only                | 34 MB (7 MB private)                 | 0 to 1 MB (3 to 9 MB private) |
+| Started in the tray, window never shown | not measured                         | 12 MB (2 MB private)          |
+| Log at 10,000 lines per second, visible | about 20% (window in the background) | 3.0 to 3.8%                   |
+| Same log, window minimised              | not measured                         | about 1%                      |
+| Real log, about 20 lines per second     | not measured                         | 0.3 to 6.3%, five samples     |
+
+- The prototypes: Win32 14 MB with the list idle, Slint 37 MB with its
+  software renderer and 252 MB with OpenGL while following the log. egui,
+  iced and WinUI 3 were ruled out on paper (memory, an open Korean IME
+  defect, no tray or accessibility support).
+- Private bytes do not return to the 2 MB of a fresh start after the window
+  was open once: reading the GPU counters (PDH) keeps about 5 MB for the
+  life of the process.
+- On the real engine: the lists, usage strip and per-container columns,
+  select-all with a filter (hidden rows were kept), bulk removal with its
+  confirmation and report, prune with the reclaimed size, disk usage, pull,
+  logs, open port, the tray menu and single instance all worked.
+- Not verified: typing Hangul through the IME (text was set, not typed), a
+  screen reader (only the UI Automation names were read), a click on the
+  real tray icon (its notification was sent to the window instead), and the
+  sleeping screen on a real engine.
+
+## Idle stop with a watcher on the pipe
+
+Docker Desktop's app, with its own engine stopped, opens a build-history
+listener on every Docker context, Docklet's included
+(`com.docker.build.exe`: "starting listener for docklet/docklet"). With
+"no open connection" as the idle rule that one connection kept the engine
+awake indefinitely: 106 s with a 20 s idle time and no container, on a PC
+where it had slept the day before while that listener happened to be down.
+
+The rule is now traffic: an engine sleeps when no connection carried data
+and no container ran for the idle time, silent connections are closed at
+that point, and a program that was cut off and reconnects only to check or
+listen is held without waking the engine.
+
+- Runner (alpine): asleep after about 21 s with `docker events` and a
+  reconnecting watcher attached; the held reconnect cost no CPU in 30 s;
+  `docker version` woke the engine in 5.7 s and the held watcher was then
+  served.
+- Local PC: asleep 26 s after start with `docker events` attached, which
+  ended with "unexpected EOF"; still asleep after 3.5 minutes; woken by
+  `docker version` in 2.2 s.
+- Not verified: Docker Desktop itself reconnecting to a sleeping engine. Its
+  listener did not reconnect during the test, so what its first request is,
+  and whether it is held, is unknown.
