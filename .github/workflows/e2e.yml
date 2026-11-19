@@ -133,7 +133,15 @@ jobs:
             Step "install (default base, no wslconfig)" { & $docklet install --no-wslconfig }
             for ($i = 1; $i -le 6; $i++) { Start-Sleep -Seconds 3; StillStopped "install --no-wslconfig, then $($i * 3) s" }
             Report "notice" "diagnostic" "no start in 18 s after an install that left .wslconfig alone"
+            Step "status (diagnostic)" { & $docklet status }
+            for ($i = 1; $i -le 6; $i++) { Start-Sleep -Seconds 3; StillStopped "status, then $($i * 3) s" }
+            Report "notice" "diagnostic" "no start in 18 s after docklet status"
+            Add-Content "$env:USERPROFILE\.wslconfig" "# a comment written by the test, not by Docklet"
+            for ($i = 1; $i -le 6; $i++) { Start-Sleep -Seconds 3; StillStopped "a comment appended to .wslconfig by hand, then $($i * 3) s" }
+            Report "notice" "diagnostic" "no start in 18 s after a hand-written .wslconfig change"
             Step "wslconfig apply (diagnostic)" { & $docklet wslconfig apply }
+            for ($i = 1; $i -le 6; $i++) { Start-Sleep -Seconds 3; StillStopped "docklet wslconfig apply, then $($i * 3) s" }
+            Report "notice" "diagnostic" "no start in 18 s after docklet wslconfig apply"
           } else {
             Step "install" { & $docklet install --base "${{ matrix.base }}" }
           }
