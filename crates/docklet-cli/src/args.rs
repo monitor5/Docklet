@@ -7,26 +7,43 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use docklet_core::settings::{self, IdleStop, Watchers};
+use docklet_core::settings::{self, IdleStop, MemorySize, Watchers, WslconfigMode};
 
 use crate::failure::{ErrorCode, Failure};
 
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(120);
+
+/// The flag of `install` and `up` that leaves `.wslconfig` alone.
+pub const NO_WSLCONFIG: &str = "--no-wslconfig";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
     Bases,
+    /// The installed base and the ones available.
+    Base,
+    /// Reinstall on another base. Without `confirmed` (`--yes`) it only
+    /// says what would be deleted, and fails with `confirmation_required`.
+    BaseSet {
+        name: String,
+        confirmed: bool,
+    },
     Status,
-    Install(InstallSource),
+    Install {
+        source: InstallSource,
+        /// `--no-wslconfig`: leave `.wslconfig` alone this time.
+        no_wslconfig: bool,
+    },
     Start,
     Stop,
     /// Only parsed with `--yes`.
     Uninstall,
     Up {
         base: Option<String>,
+        no_wslconfig: bool,
     },
+    Wslconfig(WslconfigAction),
     Wait {
         timeout: Duration,
     },
@@ -52,7 +69,16 @@ pub enum Command {
 pub enum InstallSource {
     DefaultBase,
     Base(String),
-    File(PathBuf),
+    /// `--rootfs` with `--sha256`: a local file.
+    File {
+        path: PathBuf,
+        sha256: String,
+    },
+    /// `--rootfs https://...` with `--sha256`.
+    Url {
+        url: String,
+        sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,20 +88,36 @@ pub enum SkillsAction {
     Uninstall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslconfigAction {
+    Status,
+    Apply,
+    Revert,
+}
+
 /// A setting `docklet config` knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {
     IdleStop,
     Watchers,
+    Wslconfig,
+    VmMemory,
 }
 
 impl ConfigKey {
-    pub const ALL: [Self; 2] = [Self::IdleStop, Self::Watchers];
+    pub const ALL: [Self; 4] = [
+        Self::IdleStop,
+        Self::Watchers,
+        Self::Wslconfig,
+        Self::VmMemory,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::IdleStop => settings::IDLE_STOP_KEY,
             Self::Watchers => settings::WATCHERS_KEY,
+            Self::Wslconfig => settings::WSLCONFIG_KEY,
+            Self::VmMemory => settings::VM_MEMORY_KEY,
         }
     }
 
@@ -98,6 +140,9 @@ impl ConfigKey {
 pub enum ConfigChange {
     IdleStop(IdleStop),
     Watchers(Watchers),
+    Wslconfig(WslconfigMode),
+    /// `None` is `off`.
+    VmMemory(Option<MemorySize>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +182,20 @@ pub fn parse(args: Vec<OsString>) -> Invocation {
         [] | ["help" | "-h" | "--help"] => ("help", Ok(Command::Help)),
         ["version" | "-V" | "--version"] => ("version", Ok(Command::Version)),
         ["bases"] => ("bases", Ok(Command::Bases)),
+        ["base"] => ("base", Ok(Command::Base)),
+        ["base", "set", options @ ..] => ("base set", base_set(options)),
+        ["wslconfig", "status"] => (
+            "wslconfig status",
+            Ok(Command::Wslconfig(WslconfigAction::Status)),
+        ),
+        ["wslconfig", "apply"] => (
+            "wslconfig apply",
+            Ok(Command::Wslconfig(WslconfigAction::Apply)),
+        ),
+        ["wslconfig", "revert"] => (
+            "wslconfig revert",
+            Ok(Command::Wslconfig(WslconfigAction::Revert)),
+        ),
         ["status"] => ("status", Ok(Command::Status)),
         ["install", options @ ..] => ("install", install(options)),
         ["start"] => ("start", Ok(Command::Start)),
@@ -184,28 +243,124 @@ pub fn parse(args: Vec<OsString>) -> Invocation {
     }
 }
 
-fn install(options: &[&str]) -> Result<Command, Failure> {
-    let source = match options {
-        [] => InstallSource::DefaultBase,
-        ["--base", base] => InstallSource::Base(base.to_string()),
-        ["--rootfs", file] => InstallSource::File(PathBuf::from(file)),
-        _ => {
-            return Err(Failure::usage(
-                "usage: docklet install [--base NAME | --rootfs FILE]",
-            ));
+pub const INSTALL_USAGE: &str = "usage: docklet install [--base NAME | --rootfs FILE|URL --sha256 HASH] \
+     [--no-wslconfig]";
+const UP_USAGE: &str = "usage: docklet up [--base NAME] [--no-wslconfig]";
+
+/// Options that take a value, and flags, in any order, each at most once.
+/// `None` when anything else is there.
+fn options<'a>(
+    words: &[&'a str],
+    with_value: &[&str],
+    flags: &[&str],
+) -> Option<Vec<(&'a str, Option<&'a str>)>> {
+    let mut found: Vec<(&str, Option<&str>)> = Vec::new();
+    let mut words = words.iter();
+    while let Some(&word) = words.next() {
+        if found.iter().any(|(name, _)| *name == word) {
+            return None;
         }
-    };
-    Ok(Command::Install(source))
+        if with_value.contains(&word) {
+            found.push((word, Some(*words.next()?)));
+        } else if flags.contains(&word) {
+            found.push((word, None));
+        } else {
+            return None;
+        }
+    }
+    Some(found)
 }
 
-fn up(options: &[&str]) -> Result<Command, Failure> {
-    match options {
-        [] => Ok(Command::Up { base: None }),
-        ["--base", base] => Ok(Command::Up {
-            base: Some(base.to_string()),
-        }),
-        _ => Err(Failure::usage("usage: docklet up [--base NAME]")),
+fn value<'a>(found: &[(&str, Option<&'a str>)], name: &str) -> Option<&'a str> {
+    found
+        .iter()
+        .find(|(option, _)| *option == name)
+        .and_then(|(_, value)| *value)
+}
+
+fn has(found: &[(&str, Option<&str>)], name: &str) -> bool {
+    found.iter().any(|(option, _)| *option == name)
+}
+
+fn install(words: &[&str]) -> Result<Command, Failure> {
+    let usage = || Failure::usage(INSTALL_USAGE);
+    let found =
+        options(words, &["--base", "--rootfs", "--sha256"], &[NO_WSLCONFIG]).ok_or_else(usage)?;
+    let source = match (
+        value(&found, "--base"),
+        value(&found, "--rootfs"),
+        value(&found, "--sha256"),
+    ) {
+        (None, None, None) => InstallSource::DefaultBase,
+        (Some(base), None, None) => InstallSource::Base(base.to_string()),
+        (None, Some(rootfs), Some(sha256)) => rootfs_source(rootfs, sha256)?,
+        (None, Some(_), None) => {
+            return Err(Failure::usage(
+                "--rootfs needs --sha256 HASH, the SHA-256 the file must have",
+            ));
+        }
+        _ => return Err(usage()),
+    };
+    Ok(Command::Install {
+        source,
+        no_wslconfig: has(&found, NO_WSLCONFIG),
+    })
+}
+
+/// A rootfs of the user's: a path, or an `https://` URL, and the hash it
+/// must have.
+fn rootfs_source(rootfs: &str, sha256: &str) -> Result<InstallSource, Failure> {
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Failure::usage(format!(
+            "--sha256 takes the 64 hex digits of a SHA-256; got `{sha256}`"
+        )));
     }
+    let sha256 = sha256.to_ascii_lowercase();
+    let lower = rootfs.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(InstallSource::Url {
+            url: rootfs.to_string(),
+            sha256,
+        });
+    }
+    if lower.contains("://") {
+        return Err(Failure::usage(format!(
+            "--rootfs takes a file or an https:// URL; got `{rootfs}`"
+        )));
+    }
+    Ok(InstallSource::File {
+        path: PathBuf::from(rootfs),
+        sha256,
+    })
+}
+
+fn up(words: &[&str]) -> Result<Command, Failure> {
+    let found =
+        options(words, &["--base"], &[NO_WSLCONFIG]).ok_or_else(|| Failure::usage(UP_USAGE))?;
+    Ok(Command::Up {
+        base: value(&found, "--base").map(str::to_string),
+        no_wslconfig: has(&found, NO_WSLCONFIG),
+    })
+}
+
+/// `base set NAME [--yes]`. Without `--yes` the command still runs, to say
+/// what the reinstall would delete, and then fails.
+fn base_set(words: &[&str]) -> Result<Command, Failure> {
+    let usage = || Failure::usage("usage: docklet base set <name> --yes");
+    let (names, flags): (Vec<&str>, Vec<&str>) =
+        words.iter().partition(|word| !word.starts_with('-'));
+    let [name] = names.as_slice() else {
+        return Err(usage());
+    };
+    let confirmed = match flags.as_slice() {
+        [] => false,
+        ["--yes"] => true,
+        _ => return Err(usage()),
+    };
+    Ok(Command::BaseSet {
+        name: name.to_string(),
+        confirmed,
+    })
 }
 
 fn wait(options: &[&str]) -> Result<Command, Failure> {
@@ -247,6 +402,23 @@ fn config_set(options: &[&str]) -> Result<Command, Failure> {
                 Failure::usage(format!(
                     "{} takes `yes` or `no`; got `{value}`",
                     settings::WATCHERS_KEY
+                ))
+            })?,
+        ConfigKey::Wslconfig => WslconfigMode::parse(value)
+            .map(ConfigChange::Wslconfig)
+            .ok_or_else(|| {
+                Failure::usage(format!(
+                    "{} takes `light` or `keep`; got `{value}`",
+                    settings::WSLCONFIG_KEY
+                ))
+            })?,
+        ConfigKey::VmMemory => MemorySize::parse_setting(value)
+            .map(ConfigChange::VmMemory)
+            .ok_or_else(|| {
+                Failure::usage(format!(
+                    "{} takes a size from 1GB to 1024GB, such as `4GB` or `3072MB`, or `off`; \
+                     got `{value}`",
+                    settings::VM_MEMORY_KEY
                 ))
             })?,
     };
@@ -325,19 +497,64 @@ mod tests {
         assert_eq!(command("cli setup"), Command::CliSetup);
     }
 
+    const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn install(source: InstallSource) -> Command {
+        Command::Install {
+            source,
+            no_wslconfig: false,
+        }
+    }
+
     #[test]
     fn install_sources() {
-        assert_eq!(
-            command("install"),
-            Command::Install(InstallSource::DefaultBase)
-        );
+        assert_eq!(command("install"), install(InstallSource::DefaultBase));
         assert_eq!(
             command("install --base ubuntu-26.04"),
-            Command::Install(InstallSource::Base("ubuntu-26.04".to_string()))
+            install(InstallSource::Base("ubuntu-26.04".to_string()))
         );
         assert_eq!(
-            command("install --rootfs C:\\r.tar.gz"),
-            Command::Install(InstallSource::File(PathBuf::from("C:\\r.tar.gz")))
+            command(&format!("install --rootfs C:\\r.tar.gz --sha256 {HASH}")),
+            install(InstallSource::File {
+                path: PathBuf::from("C:\\r.tar.gz"),
+                sha256: HASH.to_string()
+            })
+        );
+        // In any order; the hash in any case, kept in lower case.
+        assert_eq!(
+            command(&format!(
+                "install --sha256 {} --rootfs https://example.com/r.tar.gz",
+                HASH.to_ascii_uppercase()
+            )),
+            install(InstallSource::Url {
+                url: "https://example.com/r.tar.gz".to_string(),
+                sha256: HASH.to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn install_and_up_can_leave_wslconfig_alone() {
+        assert_eq!(
+            command("install --no-wslconfig --base alpine"),
+            Command::Install {
+                source: InstallSource::Base("alpine".to_string()),
+                no_wslconfig: true
+            }
+        );
+        assert_eq!(
+            command("up --no-wslconfig"),
+            Command::Up {
+                base: None,
+                no_wslconfig: true
+            }
+        );
+        assert_eq!(
+            command("up --base debian-13 --no-wslconfig"),
+            Command::Up {
+                base: Some("debian-13".to_string()),
+                no_wslconfig: true
+            }
         );
     }
 
@@ -347,17 +564,125 @@ mod tests {
             "install --base",
             "install --rootfs",
             "install debian-13",
-            "install --base a --rootfs b",
+            "install --base a --rootfs b --sha256 c",
             "install --base a b",
             "install --yes",
+            "install --base a --base b",
+            "install --no-wslconfig --no-wslconfig",
+            "install --sha256 abc",
         ] {
             let failure = failure(line);
             assert_eq!(failure.code, ErrorCode::Usage, "{line}");
             assert_eq!(
                 failure.message,
-                "usage: docklet install [--base NAME | --rootfs FILE]"
+                "usage: docklet install [--base NAME | --rootfs FILE|URL --sha256 HASH] \
+                 [--no-wslconfig]",
+                "{line}"
             );
             assert_eq!(parse_line(line).name, Some("install"));
+        }
+    }
+
+    #[test]
+    fn a_rootfs_of_ones_own_needs_its_hash() {
+        assert_eq!(
+            failure("install --rootfs C:\\r.tar.gz").message,
+            "--rootfs needs --sha256 HASH, the SHA-256 the file must have"
+        );
+        for hash in ["abc", &HASH[1..], &format!("{}g", &HASH[1..])] {
+            let line = format!("install --rootfs r.tar.gz --sha256 {hash}");
+            assert_eq!(failure(&line).code, ErrorCode::Usage, "{line}");
+            assert!(failure(&line).message.contains("64 hex digits"), "{line}");
+        }
+        let plain_http = format!("install --rootfs http://example.com/r.tar.gz --sha256 {HASH}");
+        assert!(failure(&plain_http).message.contains("https://"));
+    }
+
+    #[test]
+    fn base_shows_and_base_set_needs_a_name() {
+        assert_eq!(command("base"), Command::Base);
+        assert_eq!(
+            command("base set alpine --yes"),
+            Command::BaseSet {
+                name: "alpine".to_string(),
+                confirmed: true
+            }
+        );
+        assert_eq!(
+            command("base set --yes ubuntu-26.04"),
+            Command::BaseSet {
+                name: "ubuntu-26.04".to_string(),
+                confirmed: true
+            }
+        );
+        // Without --yes it parses, to report what would be lost, unconfirmed.
+        assert_eq!(
+            command("base set debian-13"),
+            Command::BaseSet {
+                name: "debian-13".to_string(),
+                confirmed: false
+            }
+        );
+        assert_eq!(parse_line("base set alpine").name, Some("base set"));
+        for line in [
+            "base set",
+            "base set a b",
+            "base set a --force",
+            "base set a --yes --yes",
+        ] {
+            let failure = failure(line);
+            assert_eq!(failure.code, ErrorCode::Usage, "{line}");
+            assert_eq!(failure.message, "usage: docklet base set <name> --yes");
+        }
+        assert_eq!(failure("base now").message, "unknown command `base now`");
+    }
+
+    #[test]
+    fn wslconfig_actions() {
+        for (line, action) in [
+            ("wslconfig status", WslconfigAction::Status),
+            ("wslconfig apply", WslconfigAction::Apply),
+            ("wslconfig revert", WslconfigAction::Revert),
+        ] {
+            assert_eq!(command(line), Command::Wslconfig(action));
+            assert_eq!(parse_line(line).name, Some(line));
+        }
+        assert_eq!(failure("wslconfig").message, "unknown command `wslconfig`");
+        assert_eq!(
+            failure("wslconfig edit").message,
+            "unknown command `wslconfig edit`"
+        );
+    }
+
+    #[test]
+    fn config_set_takes_the_wslconfig_settings() {
+        assert_eq!(
+            command("config set wslconfig keep"),
+            Command::ConfigSet(ConfigChange::Wslconfig(WslconfigMode::Keep))
+        );
+        assert_eq!(
+            command("config set wslconfig light"),
+            Command::ConfigSet(ConfigChange::Wslconfig(WslconfigMode::Light))
+        );
+        assert_eq!(
+            command("config set vm-memory 4GB"),
+            Command::ConfigSet(ConfigChange::VmMemory(MemorySize::parse("4GB")))
+        );
+        assert_eq!(
+            command("config set vm-memory off"),
+            Command::ConfigSet(ConfigChange::VmMemory(None))
+        );
+        assert_eq!(
+            failure("config set wslconfig off").message,
+            "wslconfig takes `light` or `keep`; got `off`"
+        );
+        for value in ["4", "512MB", "4G", "lots"] {
+            let failure = failure(&format!("config set vm-memory {value}"));
+            assert_eq!(failure.code, ErrorCode::Usage);
+            assert!(
+                failure.message.starts_with("vm-memory takes a size"),
+                "{value}"
+            );
         }
     }
 
@@ -377,23 +702,38 @@ mod tests {
         assert_eq!(parse_line("uninstall").name, Some("uninstall"));
     }
 
+    /// A command line for the entry with its required positionals filled
+    /// in, and without `--yes`.
+    fn without_yes(entry: &crate::catalog::Entry) -> String {
+        let mut line = entry.name.to_string();
+        for arg in entry.args.iter().filter(|arg| arg.required) {
+            match arg.name {
+                "--yes" => {}
+                "name" => line.push_str(" debian-13"),
+                "key" => line.push_str(" idle-stop"),
+                "value" => line.push_str(" 5"),
+                other => line.push_str(&format!(" {other}")),
+            }
+        }
+        line
+    }
+
+    /// Deleting data needs `--yes`: `uninstall` is refused when the line is
+    /// parsed, `base set` parses unconfirmed and is refused before it
+    /// deletes anything (it first says what would be lost).
     #[test]
-    fn nothing_that_deletes_data_parses_without_yes() {
+    fn nothing_that_deletes_data_parses_as_confirmed_without_yes() {
         for entry in COMMANDS.iter().filter(|entry| entry.deletes_data) {
-            let failure = failure(entry.name);
-            assert_eq!(
-                failure.code,
-                ErrorCode::ConfirmationRequired,
-                "{}",
-                entry.name
-            );
-            assert!(failure.message.contains("--yes"));
-            // `--json` does not stand in for the confirmation.
-            let with_json = parse_line(&format!("{} --json", entry.name));
-            assert_eq!(
-                with_json.command.unwrap_err().code,
-                ErrorCode::ConfirmationRequired
-            );
+            for line in [without_yes(entry), format!("{} --json", without_yes(entry))] {
+                match parse_line(&line).command {
+                    Err(failure) => {
+                        assert_eq!(failure.code, ErrorCode::ConfirmationRequired, "{line}");
+                        assert!(failure.message.contains("--yes"));
+                    }
+                    Ok(Command::BaseSet { confirmed, .. }) => assert!(!confirmed, "{line}"),
+                    Ok(other) => panic!("`{line}` parsed as {other:?}"),
+                }
+            }
         }
     }
 
@@ -431,7 +771,8 @@ mod tests {
         assert_eq!(unknown.code, ErrorCode::Usage);
         assert_eq!(
             unknown.message,
-            "unknown setting `memory`; the settings are: idle-stop, watchers-keep-awake"
+            "unknown setting `memory`; the settings are: idle-stop, watchers-keep-awake, \
+             wslconfig, vm-memory"
         );
         assert_eq!(
             failure("config get idle-stop now").message,
@@ -514,7 +855,8 @@ mod tests {
         }
         assert_eq!(
             failure("config set memory 4G").message,
-            "unknown setting `memory`; the settings are: idle-stop, watchers-keep-awake"
+            "unknown setting `memory`; the settings are: idle-stop, watchers-keep-awake, \
+             wslconfig, vm-memory"
         );
         // `config` alone names no command.
         let bare = parse_line("config");
@@ -538,17 +880,27 @@ mod tests {
 
     #[test]
     fn up_takes_an_optional_base() {
-        assert_eq!(command("up"), Command::Up { base: None });
+        assert_eq!(
+            command("up"),
+            Command::Up {
+                base: None,
+                no_wslconfig: false
+            }
+        );
         assert_eq!(
             command("up --base debian-13"),
             Command::Up {
-                base: Some("debian-13".to_string())
+                base: Some("debian-13".to_string()),
+                no_wslconfig: false
             }
         );
         for line in ["up --base", "up --rootfs x", "up now", "up --base a b"] {
             let failure = failure(line);
             assert_eq!(failure.code, ErrorCode::Usage, "{line}");
-            assert_eq!(failure.message, "usage: docklet up [--base NAME]");
+            assert_eq!(
+                failure.message,
+                "usage: docklet up [--base NAME] [--no-wslconfig]"
+            );
         }
     }
 
@@ -752,8 +1104,7 @@ mod tests {
             // With their required arguments, where they have some.
             let line = match entry.name {
                 "uninstall" => "uninstall --yes".to_string(),
-                "config set" => "config set idle-stop 5".to_string(),
-                name => name.to_string(),
+                _ => without_yes(entry).replace("base set debian-13", "base set debian-13 --yes"),
             };
             let invocation = parse_line(&line);
             assert!(invocation.command.is_ok(), "{line}");
@@ -768,11 +1119,16 @@ mod tests {
     #[test]
     fn every_option_in_the_catalogue_parses() {
         for entry in COMMANDS {
+            let base = without_yes(entry);
             for arg in entry.args.iter().filter(|arg| arg.name.starts_with('-')) {
-                let line = match arg.value {
-                    Some("SECONDS") => format!("{} {} 5", entry.name, arg.name),
-                    Some(_) => format!("{} {} value", entry.name, arg.name),
-                    None => format!("{} {}", entry.name, arg.name),
+                let line = match (arg.name, arg.value) {
+                    // The two only come together.
+                    ("--rootfs" | "--sha256", _) => {
+                        format!("{base} --rootfs r.tar.gz --sha256 {HASH}")
+                    }
+                    (_, Some("SECONDS")) => format!("{base} {} 5", arg.name),
+                    (_, Some(_)) => format!("{base} {} value", arg.name),
+                    (_, None) => format!("{base} {}", arg.name),
                 };
                 assert!(parse_line(&line).command.is_ok(), "{line}");
             }

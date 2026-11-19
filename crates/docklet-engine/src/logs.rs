@@ -49,7 +49,7 @@ impl LineSplitter {
     }
 }
 
-/// Most lines and bytes in one batch. A receiver such as the webview queues
+/// Most lines and bytes in one batch. A receiver such as a window queues
 /// whatever it is sent, so without a limit a container that prints as fast as
 /// it can (`yes`) would queue data faster than anything can show it.
 const MAX_BATCH_LINES: usize = 5_000;

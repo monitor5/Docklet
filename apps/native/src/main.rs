@@ -3,6 +3,7 @@
 //! Flags: `--tray` starts with only the tray icon, `--light` skips dark
 //! mode, `--proxy` serves the Docker pipe instead of showing anything.
 //! `--demo` runs on a made-up engine (`--logs` opens a log at once,
+//! `--rate N` makes that log print N lines a second instead of 10,000,
 //! `--screen NAME` starts in the state of a message screen).
 
 #![windows_subsystem = "windows"]
@@ -46,6 +47,7 @@ fn main() {
     if has("--demo") {
         let options = DemoOptions {
             screen: value("--screen"),
+            lines_per_second: value("--rate").and_then(|rate| rate.parse().ok()),
         };
         let start = Start {
             window,

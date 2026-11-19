@@ -7,6 +7,7 @@ use crate::docker_client::ContextState;
 use crate::engine::{self, DISTRO_NAME, ENGINE_PIPE};
 use crate::state::{EngineState, ProxyMode};
 use crate::wsl::{Wsl, WslRunner, WslVersion};
+use crate::wslconfig::{self, Effect};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// Below this an install, a pull or a build is likely to run out of space.
@@ -121,6 +122,8 @@ pub struct Facts {
     pub compose_plugin: bool,
     pub docker_context: ContextState,
     pub mirrored_networking: bool,
+    /// Docklet's keys in `.wslconfig` and whether they are in effect.
+    pub wslconfig: wslconfig::Status,
     /// Where Docklet stores the distro disk and its downloads.
     pub data_dir: String,
     /// Bytes free on the drive of `data_dir`, or why that is unknown.
@@ -290,6 +293,7 @@ pub fn report(facts: &Facts) -> Vec<Check> {
                 (Level::Ok, "not mirrored".to_string(), None)
             },
         ),
+        check("wslconfig", "WSL VM settings", light_vm(&facts.wslconfig)),
         check("disk_space", "Disk space", disk_space(facts)),
     ]
 }
@@ -362,6 +366,102 @@ fn pipe_proxy(facts: &Facts) -> Verdict {
             "not running; it starts together with the engine".to_string(),
             None,
         )
+    }
+}
+
+/// Docklet's light keys in `.wslconfig`. Never a failure: Docker works
+/// either way. There is no fix to run: `wsl --shutdown` stops every distro
+/// of the user, which is the user's call, not an agent's.
+fn light_vm(status: &wslconfig::Status) -> Verdict {
+    let assignments = |entries: &[wslconfig::Entry]| {
+        entries
+            .iter()
+            .map(wslconfig::Entry::assignment)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let kept: Vec<String> = status
+        .kept
+        .iter()
+        .map(|(entry, value)| format!("{} is set to {value} in .wslconfig; kept", entry.key))
+        .collect();
+    let kept = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", kept.join("; "))
+    };
+    if !status.written.is_empty() {
+        let written = assignments(&status.written);
+        let others = if status.others.is_empty() {
+            "run `docklet stop`, wait a minute, then `docklet start`".to_string()
+        } else {
+            format!(
+                "run `wsl --shutdown` once the other distros ({}) are idle",
+                status.others.join(", ")
+            )
+        };
+        return match status.effect {
+            Some(Effect::Pending) => (
+                Level::Warn,
+                format!(
+                    "light settings written but not yet in effect ({written}): the WSL VM \
+                     started before the change; {others}{kept}"
+                ),
+                None,
+            ),
+            Some(Effect::InEffect) => (
+                Level::Ok,
+                format!("light settings in effect ({written}){kept}"),
+                None,
+            ),
+            Some(Effect::Unknown) => (
+                Level::Ok,
+                format!(
+                    "light settings written ({written}); whether the running WSL VM uses \
+                     them is unknown{kept}"
+                ),
+                None,
+            ),
+            Some(Effect::NextStart) | None => (
+                Level::Ok,
+                format!("light settings written ({written}); WSL reads them when it starts{kept}"),
+                None,
+            ),
+        };
+    }
+    if status.keep {
+        return (
+            Level::Ok,
+            format!("left alone (wslconfig = keep){kept}"),
+            None,
+        );
+    }
+    if let Some(problem) = &status.problem {
+        return (
+            Level::Warn,
+            format!(".wslconfig cannot be changed: {problem}{kept}"),
+            None,
+        );
+    }
+    if !status.missing.is_empty() {
+        return (
+            Level::Ok,
+            format!(
+                "light settings not written yet ({}); `docklet up` or `docklet wslconfig \
+                 apply` writes them{kept}",
+                assignments(&status.missing)
+            ),
+            None,
+        );
+    }
+    if kept.is_empty() {
+        (
+            Level::Ok,
+            "light settings already set by the user".to_string(),
+            None,
+        )
+    } else {
+        (Level::Ok, kept.trim_start_matches("; ").to_string(), None)
     }
 }
 
@@ -451,6 +551,11 @@ mod tests {
             compose_plugin: true,
             docker_context: ContextState::Present,
             mirrored_networking: false,
+            wslconfig: wslconfig::Status {
+                written: wslconfig::light_entries(None),
+                effect: Some(Effect::InEffect),
+                ..wslconfig::Status::default()
+            },
             data_dir: r"C:\Users\me\AppData\Local\Docklet".to_string(),
             free_space: Ok(80 * GIB),
         }
@@ -521,7 +626,7 @@ mod tests {
     #[test]
     fn a_healthy_machine_passes_every_check() {
         let checks = report(&healthy());
-        assert_eq!(checks.len(), 10);
+        assert_eq!(checks.len(), 11);
         for check in &checks {
             assert_eq!(check.level, Level::Ok, "{check:?}");
             assert_eq!(check.fix, None, "{check:?}");
@@ -543,6 +648,7 @@ mod tests {
             "compose_plugin",
             "docker_context",
             "mirrored_networking",
+            "wslconfig",
             "disk_space",
         ];
         assert_eq!(ids(&healthy()), expected);
@@ -745,6 +851,100 @@ mod tests {
         assert_eq!(check.level, Level::Warn);
         // Docklet never edits .wslconfig and does not tell anyone to.
         assert_eq!(check.fix, None);
+    }
+
+    fn light_vm_check(status: wslconfig::Status) -> Check {
+        let mut facts = healthy();
+        facts.wslconfig = status;
+        let checks = report(&facts);
+        checks
+            .into_iter()
+            .find(|check| check.id == "wslconfig")
+            .unwrap()
+    }
+
+    #[test]
+    fn light_settings_written_but_not_in_effect_is_a_warning_without_a_fix() {
+        let check = light_vm_check(wslconfig::Status {
+            written: wslconfig::light_entries(None),
+            effect: Some(Effect::Pending),
+            others: vec!["Ubuntu".to_string()],
+            ..wslconfig::Status::default()
+        });
+        assert_eq!(check.title, "WSL VM settings");
+        assert_eq!(check.level, Level::Warn);
+        assert_eq!(check.fix, None);
+        assert_eq!(
+            check.detail,
+            "light settings written but not yet in effect (guiApplications=false): the WSL \
+             VM started before the change; run `wsl --shutdown` once the other distros \
+             (Ubuntu) are idle"
+        );
+        // With only Docklet's distro up, Docklet's own commands do it.
+        let alone = light_vm_check(wslconfig::Status {
+            written: wslconfig::light_entries(None),
+            effect: Some(Effect::Pending),
+            ..wslconfig::Status::default()
+        });
+        assert!(!alone.detail.contains("--shutdown"), "{}", alone.detail);
+    }
+
+    #[test]
+    fn the_light_vm_check_never_fails() {
+        let entries = wslconfig::light_entries(None);
+        let statuses = [
+            wslconfig::Status::default(),
+            wslconfig::Status {
+                keep: true,
+                ..wslconfig::Status::default()
+            },
+            wslconfig::Status {
+                missing: entries.clone(),
+                ..wslconfig::Status::default()
+            },
+            wslconfig::Status {
+                problem: Some("it is read-only".to_string()),
+                missing: entries.clone(),
+                ..wslconfig::Status::default()
+            },
+            wslconfig::Status {
+                kept: vec![(entries[0].clone(), "true".to_string())],
+                ..wslconfig::Status::default()
+            },
+            wslconfig::Status {
+                written: entries.clone(),
+                effect: Some(Effect::Unknown),
+                ..wslconfig::Status::default()
+            },
+            wslconfig::Status {
+                written: entries.clone(),
+                effect: Some(Effect::NextStart),
+                ..wslconfig::Status::default()
+            },
+        ];
+        let details: Vec<(Level, String)> = statuses
+            .into_iter()
+            .map(|status| {
+                let check = light_vm_check(status);
+                assert_ne!(check.level, Level::Fail);
+                assert_eq!(check.fix, None);
+                (check.level, check.detail)
+            })
+            .collect();
+        assert_eq!(details[1].1, "left alone (wslconfig = keep)");
+        assert!(details[2].1.starts_with("light settings not written yet"));
+        assert_eq!(details[2].0, Level::Ok);
+        assert_eq!(details[3].0, Level::Warn);
+        assert!(details[3].1.contains("read-only"));
+        assert_eq!(
+            details[4].1,
+            "guiApplications is set to true in .wslconfig; kept"
+        );
+        assert!(details[5].1.contains("unknown"));
+        assert_eq!(
+            light_vm_check(healthy().wslconfig).detail,
+            "light settings in effect (guiApplications=false)"
+        );
     }
 
     #[test]

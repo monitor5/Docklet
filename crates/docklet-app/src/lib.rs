@@ -16,7 +16,7 @@
 //! - [`removal`]: the question before a bulk removal or a prune, and the
 //!   sentence after it.
 //! - [`usage`]: the strip of meters, with every "not known" as a state.
-//! - [`logs`]: the bounded log buffer; [`pull`]: the pull box.
+//! - [`logs`]: the bounded log buffer; [`pull`]: what may be pulled.
 //! - [`policy`]: when the engine is polled and sampled, and when it must
 //!   not be touched.
 //! - [`view`]: the plain data a window draws and the events it reports;
@@ -31,11 +31,9 @@
 //!   transition at a time. Blocking calls.
 //! - [`streams`]: Docker's event stream with its reconnect backoff,
 //!   followed logs, container stats and host usage, delivered to a sink.
-//! - [`backend::Backend`]: the two together, for a shell that has its own
-//!   way of running blocking work (the Tauri app).
-//! - [`app::App`]: the whole application behind one handle, for a shell
-//!   with a message loop: methods that return at once, results as
-//!   [`app::Message`]s posted through a [`app::Sink`].
+//! - [`app::App`]: the two together and the whole application behind one
+//!   handle, for a shell with a message loop: methods that return at once,
+//!   results as [`app::Message`]s posted through a [`app::Sink`].
 //!
 //! # Threads, with `App`
 //!
@@ -53,7 +51,6 @@
 //! and the host's figures are read from Windows alone. Only `start` wakes.
 
 pub mod app;
-pub mod backend;
 pub mod control;
 pub mod controller;
 pub mod format;
@@ -71,15 +68,13 @@ pub mod usage;
 pub mod view;
 
 pub use app::{App, List, Message, Sink};
-pub use backend::Backend;
 pub use control::{
     EngineControl, EngineHost, EngineStatus, Supervisor, SystemHost, Transition, reachable,
 };
 pub use controller::{Controller, Engine, Ui};
 pub use list::{Item, ListModel};
-pub use logs::{LOG_BUFFER_CAP, LogBuffer, LogSource, SharedLog, strip_ansi};
+pub use logs::{LOG_BUFFER_CAP, LogBuffer, LogSource, SharedLog};
 pub use policy::WindowState;
-pub use pull::PullProgress;
 pub use removal::{PruneTarget, RemovalPlan, prune_summary, removal_summary};
 pub use selection::{Coverage, Selection};
 pub use streams::{DockerEvent, HostReading, LogMessage, StreamSink, Streams};

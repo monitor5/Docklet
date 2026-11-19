@@ -140,10 +140,6 @@ impl Streams {
         self.apply_sampling(&mut state);
     }
 
-    pub fn window(&self) -> WindowState {
-        self.state().window
-    }
-
     /// Subscribes to Docker's event stream and forwards each event to the
     /// sink, so the UI can reload the affected list. The subscription is
     /// renewed when it ends, until `stop_all`. Idempotent. Does nothing
@@ -171,27 +167,17 @@ impl Streams {
         state.events = Some(self.runtime.spawn(forward));
     }
 
-    /// Follows a container's logs into `output`, starting with its last 500
-    /// lines. Returns a token for `stop_logs`. `output` ends the following
-    /// by breaking; its last message is always `LogMessage::Ended`, unless
-    /// the log is stopped from here.
-    pub fn follow_logs(
-        &self,
-        client: Client,
-        id: String,
-        output: impl FnMut(LogMessage) -> ControlFlow<()> + Send + 'static,
-    ) -> u32 {
-        let token = self.log_token();
-        self.follow_logs_as(token, client, id, output);
-        token
-    }
-
-    /// A token no log of these streams has had.
-    pub(crate) fn log_token(&self) -> u32 {
+    /// A token no log of these streams has had: the name of a log in
+    /// `follow_logs` and `stop_logs`.
+    pub fn log_token(&self) -> u32 {
         self.next_log.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub(crate) fn follow_logs_as(
+    /// Follows a container's logs into `output` under the name `token`,
+    /// starting with its last 500 lines. `output` ends the following by
+    /// breaking; its last message is always `LogMessage::Ended`, unless the
+    /// log is stopped from here.
+    pub fn follow_logs(
         &self,
         token: u32,
         client: Client,
@@ -221,16 +207,6 @@ impl Streams {
 
     pub fn stop_logs(&self, token: u32) {
         if let Some(task) = self.state().logs.remove(&token) {
-            task.abort();
-        }
-    }
-
-    /// Ends every followed log.
-    ///
-    /// The view that asked for them cannot be relied on to stop them: a
-    /// window that closes or reloads runs no cleanup.
-    pub fn stop_all_logs(&self) {
-        for (_, task) in self.state().logs.drain() {
             task.abort();
         }
     }
@@ -691,7 +667,7 @@ mod tests {
         streams.watch_events();
         streams.stop_all();
         assert!(streams.state().events.is_none());
-        assert_eq!(streams.window(), WindowState::Visible);
+        assert_eq!(streams.state().window, WindowState::Visible);
         streams.watch_events();
         assert!(streams.state().events.is_some());
     }

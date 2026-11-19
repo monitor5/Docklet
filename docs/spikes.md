@@ -311,3 +311,52 @@ listen is held without waking the engine.
 - Not verified: Docker Desktop itself reconnecting to a sleeping engine. Its
   listener did not reconnect during the test, so what its first request is,
   and whether it is held, is unknown.
+
+## A light WSL VM and Alpine by default
+
+Question: what does the WSL VM cost with each base and each `.wslconfig`
+setting, and what should a new install get?
+
+Method: host memory of the WSL VM process on the owner's PC, one run each,
+cold VM, no container.
+
+| Configuration                           | Host memory of the WSL VM |
+| --------------------------------------- | ------------------------- |
+| Debian 13 + systemd, default settings   | 1402 MB                   |
+| Alpine, default settings                | 1168 MB                   |
+| Alpine, WSLg off                        | 776 MB                    |
+| Alpine, WSLg off, memory capped at 4 GB | 634 MB                    |
+| Alpine, WSLg off, memory capped at 2 GB | 581 MB                    |
+
+WSLg (`guiApplications`) is about 390 MB and the largest single item; Alpine
+instead of Debian with systemd is about 230 MB; a memory cap saves about
+140 MB more but can break large builds and containers.
+
+Decision (owner): light by default, with room to switch.
+
+- `alpine` is the first row of `distro/bases.txt`, so a new install gets it.
+  An existing install keeps its base. `docklet base set <name> --yes`
+  reinstalls on another base; it deletes the engine's data, and carrying
+  images or volumes across is not offered (saving gigabytes to Windows and
+  loading them back can fail half-way; `docker save` does it by hand).
+- `docklet install` and `docklet up` add `[wsl2] guiApplications=false` to
+  `%USERPROFILE%\.wslconfig`. That file is global, so Docklet only ever adds
+  keys that are absent, keeps everything else byte for byte, backs the file
+  up first and records what it added, so that `docklet wslconfig revert` and
+  `docklet uninstall` take out exactly that. `--no-wslconfig` or
+  `docklet config set wslconfig keep` opts out.
+- The memory cap is a setting, `docklet config set vm-memory <size|off>`,
+  off by default.
+- Left out, after Microsoft's `.wslconfig` documentation (October 2026,
+  WSL 3.0.5 here): `[experimental] autoMemoryReclaim`, whose default is
+  already `dropCache`; `[experimental] sparseVhd`, which only affects disks
+  created later and saves disk, not memory; and `[wsl2] vmIdleTimeout`,
+  which would make the VM of every distro restart more often to return its
+  memory a few seconds sooner.
+- Docklet never runs `wsl --shutdown`. WSL reads the file when the VM boots;
+  whether a change is in effect is told by comparing the VM's boot (now minus
+  the docklet distro's `/proc/uptime`, shared by all distros) with the
+  file's last write. With only other distros running it is unknown, because
+  Docklet runs nothing in them. A host that slept since the boot can make
+  the boot look later than it was.
+- Not measured: the combinations on the runner, and Debian with WSLg off.

@@ -12,7 +12,8 @@ use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use docklet_core::{EngineState, ProxyMode, engine};
+use docklet_core::settings::{self, WslconfigMode};
+use docklet_core::{EngineState, ProxyMode, engine, wslconfig_file};
 use docklet_wsl::{Engine, RootfsSource};
 
 /// A change of engine state that takes a while.
@@ -136,24 +137,14 @@ mod proxy {
     }
 }
 
-/// The real WSL, distro and pipe proxy of this user.
+/// The real WSL, distro and pipe proxy of this user. The pipe proxy is
+/// this same executable in `--proxy` mode.
 #[derive(Debug, Clone, Default)]
-pub struct SystemHost {
-    proxy_command: Option<String>,
-}
+pub struct SystemHost;
 
 impl SystemHost {
-    /// A host whose pipe proxy is this same executable in `--proxy` mode.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A host whose pipe proxy is started with `command_line`, for a shell
-    /// that has no `--proxy` mode of its own (`"C:\...\docklet.exe" proxy`).
-    pub fn with_proxy_command(command_line: impl Into<String>) -> Self {
-        Self {
-            proxy_command: Some(command_line.into()),
-        }
+        Self
     }
 }
 
@@ -184,10 +175,7 @@ impl EngineHost for SystemHost {
     fn spawn_proxy(&self) -> io::Result<()> {
         // Detached, so the Windows docker CLI keeps working when the app
         // exits.
-        let command_line = match &self.proxy_command {
-            Some(command_line) => command_line.clone(),
-            None => format!("\"{}\" --proxy", std::env::current_exe()?.display()),
-        };
+        let command_line = format!("\"{}\" --proxy", std::env::current_exe()?.display());
         docklet_wsl::spawn_detached(&command_line)
     }
 
@@ -200,11 +188,50 @@ impl EngineHost for SystemHost {
     }
 
     fn install(&self, base: &str, progress: &mut dyn FnMut(&str)) -> io::Result<()> {
-        Engine::system()?.install(&RootfsSource::Base(base.to_string()), progress)
+        Engine::system()?.install(&RootfsSource::Base(base.to_string()), progress)?;
+        light_vm_settings(progress);
+        Ok(())
     }
 
     fn mirrored_networking(&self) -> bool {
         docklet_wsl::mirrored_networking()
+    }
+}
+
+/// Adds Docklet's light keys to the user's `.wslconfig` after an install, as
+/// `docklet install` does, unless the `wslconfig` setting is `keep`. The
+/// file belongs to the user and the engine works without the keys, so a
+/// refusal or an error is reported as a progress line and never fails the
+/// install. Nothing restarts WSL: the keys count from its next start.
+fn light_vm_settings(progress: &mut dyn FnMut(&str)) {
+    let applied = docklet_wsl::data_dir().and_then(|dir| {
+        let (settings, _) = settings::load(&dir)?;
+        if settings.wslconfig == WslconfigMode::Keep {
+            return Ok(None);
+        }
+        let paths = docklet_wsl::wslconfig_paths()?;
+        wslconfig_file::apply(&paths, &settings.wslconfig_entries()).map(Some)
+    });
+    match applied {
+        Ok(None) => {}
+        Ok(Some(outcome)) => {
+            if let Some(line) = light_vm_line(outcome.changed, outcome.refused.as_deref()) {
+                progress(&line);
+            }
+        }
+        Err(err) => progress(&format!(".wslconfig was left as it is: {err}")),
+    }
+}
+
+/// The progress line for what happened to `.wslconfig`, if anything did.
+fn light_vm_line(changed: bool, refused: Option<&str>) -> Option<String> {
+    match refused {
+        Some(reason) => Some(format!(".wslconfig was left as it is: {reason}")),
+        None if changed => Some(
+            "Light WSL settings written to .wslconfig (Linux GUI apps off in every distro);              they count from the next WSL start. Undo: docklet wslconfig revert"
+                .to_string(),
+        ),
+        None => None,
     }
 }
 
@@ -250,10 +277,6 @@ impl EngineControl {
         }
     }
 
-    pub fn host(&self) -> &Arc<dyn EngineHost> {
-        &self.host
-    }
-
     /// The transition this process runs now, if any.
     pub fn in_flight(&self) -> Option<Transition> {
         self.supervisor.in_flight()
@@ -278,11 +301,6 @@ impl EngineControl {
             bases: engine::bases(),
             mirrored_networking: self.host.mirrored_networking(),
         })
-    }
-
-    /// See [`reachable`].
-    pub fn reachable(&self) -> bool {
-        reachable(self.host.as_ref())
     }
 
     /// Installs the distro from the published rootfs for `base`, or for the
@@ -343,6 +361,18 @@ impl EngineControl {
 
 #[cfg(test)]
 pub(crate) mod testing {
+    #[test]
+    fn the_install_only_mentions_wslconfig_when_something_happened() {
+        assert_eq!(super::light_vm_line(false, None), None);
+        assert!(
+            super::light_vm_line(true, None)
+                .unwrap()
+                .contains("docklet wslconfig revert")
+        );
+        let refused = super::light_vm_line(false, Some("the file is read-only")).unwrap();
+        assert!(refused.ends_with("the file is read-only"));
+    }
+
     use std::sync::Mutex;
 
     use super::*;
@@ -543,12 +573,12 @@ mod tests {
     fn a_sleeping_engine_is_not_reachable_whichever_proxy_runs() {
         for proxy in [ProxyMode::Plain, ProxyMode::IdleStop] {
             let host = FakeHost::new(EngineState::Stopped, proxy);
-            assert!(!EngineControl::new(host).reachable());
+            assert!(!reachable(host.as_ref()));
         }
         let no_proxy = FakeHost::new(EngineState::Running, ProxyMode::Down);
-        assert!(!EngineControl::new(no_proxy).reachable());
+        assert!(!reachable(no_proxy.as_ref()));
         let up = FakeHost::new(EngineState::Running, ProxyMode::Plain);
-        assert!(EngineControl::new(up).reachable());
+        assert!(reachable(up.as_ref()));
     }
 
     #[test]

@@ -128,6 +128,13 @@ impl Failure {
         self
     }
 
+    /// A hint made up at run time, such as `docklet base set alpine --yes`.
+    /// The process prints it once and exits, so it is leaked rather than
+    /// giving every hint an owned string.
+    pub fn hint_owned(self, hint: String) -> Self {
+        self.hint(Box::leak(hint.into_boxed_str()))
+    }
+
     pub fn with_data(mut self, data: Json) -> Self {
         self.data = Some(data);
         self

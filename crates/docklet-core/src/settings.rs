@@ -7,7 +7,7 @@
 //! ```
 //!
 //! One `key = value` per line; a line that starts with `#` is a comment. The
-//! file has two settings today, so it is parsed by hand rather than with a
+//! file has a handful of settings, so it is parsed by hand rather than with a
 //! TOML or JSON dependency. Lines this version does not understand are kept
 //! when the file is rewritten: a newer Docklet may have written them.
 
@@ -31,6 +31,13 @@ pub const IDLE_STOP_KEY: &str = "idle-stop";
 /// Key of the setting that says whether a connection that carries nothing
 /// (a watcher) keeps the engine awake: `yes` or `no`.
 pub const WATCHERS_KEY: &str = "watchers-keep-awake";
+
+/// Key of the setting that says whether `install`, `up` and `uninstall`
+/// change `.wslconfig`: `light` or `keep`.
+pub const WSLCONFIG_KEY: &str = "wslconfig";
+
+/// Key of the memory cap Docklet writes into `.wslconfig`: a size or `off`.
+pub const VM_MEMORY_KEY: &str = "vm-memory";
 
 /// Environment variable that gives the pipe proxy an idle time in seconds,
 /// whatever the setting says. It exists for the end-to-end tests: the setting
@@ -94,6 +101,99 @@ impl fmt::Display for IdleStop {
     }
 }
 
+/// Whether Docklet changes `.wslconfig` by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WslconfigMode {
+    /// `install` and `up` add Docklet's light keys, `uninstall` removes them.
+    #[default]
+    Light,
+    /// Docklet leaves the file alone unless `docklet wslconfig` is run.
+    Keep,
+}
+
+impl WslconfigMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("light") {
+            Some(Self::Light)
+        } else if value.eq_ignore_ascii_case("keep") {
+            Some(Self::Keep)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Keep => "keep",
+        }
+    }
+}
+
+impl fmt::Display for WslconfigMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A memory size as `.wslconfig` takes it: whole megabytes or gigabytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySize {
+    amount: u32,
+    gigabytes: bool,
+}
+
+impl MemorySize {
+    /// Less than this and dockerd hardly fits next to a container.
+    pub const MIN_MB: u64 = 1024;
+    pub const MAX_MB: u64 = 1024 * 1024;
+
+    /// Parses `4GB` or `3072MB` (the unit in any case), from 1 GB to 1 TB.
+    /// A bare number is refused: `.wslconfig` reads it as bytes.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+        let (number, unit) = value.split_at(digits);
+        let gigabytes = if unit.eq_ignore_ascii_case("GB") {
+            true
+        } else if unit.eq_ignore_ascii_case("MB") {
+            false
+        } else {
+            return None;
+        };
+        let amount: u32 = number.parse().ok()?;
+        let size = Self { amount, gigabytes };
+        (Self::MIN_MB..=Self::MAX_MB)
+            .contains(&size.megabytes())
+            .then_some(size)
+    }
+
+    pub fn megabytes(self) -> u64 {
+        u64::from(self.amount) * if self.gigabytes { 1024 } else { 1 }
+    }
+
+    /// `off` for no cap, or the size; what `config set vm-memory` takes.
+    pub fn parse_setting(value: &str) -> Option<Option<Self>> {
+        if value.trim().eq_ignore_ascii_case("off") {
+            return Some(None);
+        }
+        Self::parse(value).map(Some)
+    }
+
+    pub fn setting(value: Option<Self>) -> String {
+        value.map_or_else(|| "off".to_string(), |size| size.to_string())
+    }
+}
+
+/// `4GB` or `3072MB`, as `.wslconfig` takes it.
+impl fmt::Display for MemorySize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let unit = if self.gigabytes { "GB" } else { "MB" };
+        write!(f, "{}{unit}", self.amount)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settings {
     pub idle_stop: IdleStop,
@@ -101,6 +201,18 @@ pub struct Settings {
     /// `no`, is what lets the engine sleep while Docker Desktop or an IDE
     /// watches it.
     pub watchers: Watchers,
+    /// Whether `install`, `up` and `uninstall` change `.wslconfig`.
+    pub wslconfig: WslconfigMode,
+    /// The memory cap Docklet writes into `.wslconfig`; none by default.
+    pub vm_memory: Option<MemorySize>,
+}
+
+impl Settings {
+    /// The keys Docklet wants in `.wslconfig` with these settings.
+    pub fn wslconfig_entries(&self) -> Vec<crate::wslconfig::Entry> {
+        let memory = self.vm_memory.map(|size| size.to_string());
+        crate::wslconfig::light_entries(memory.as_deref())
+    }
 }
 
 impl Settings {
@@ -141,6 +253,24 @@ impl Settings {
                         value.trim()
                     )),
                 }
+            } else if is_key(key, WSLCONFIG_KEY) {
+                match WslconfigMode::parse(value) {
+                    Some(mode) => settings.wslconfig = mode,
+                    None => problems.push(format!(
+                        "line {number}: {WSLCONFIG_KEY} is `{}`, which is neither `light` nor \
+                         `keep`",
+                        value.trim()
+                    )),
+                }
+            } else if is_key(key, VM_MEMORY_KEY) {
+                match MemorySize::parse_setting(value) {
+                    Some(size) => settings.vm_memory = size,
+                    None => problems.push(format!(
+                        "line {number}: {VM_MEMORY_KEY} is `{}`, which is neither `off` nor a \
+                         size from 1GB to 1024GB such as `4GB`",
+                        value.trim()
+                    )),
+                }
             }
         }
         (settings, problems)
@@ -160,6 +290,16 @@ pub fn with_idle_stop(text: &str, value: IdleStop) -> String {
 /// The file's text with the watchers setting changed to `value`.
 pub fn with_watchers(text: &str, value: Watchers) -> String {
     with_setting(text, WATCHERS_KEY, value.as_str())
+}
+
+/// The file's text with the `.wslconfig` setting changed to `value`.
+pub fn with_wslconfig(text: &str, value: WslconfigMode) -> String {
+    with_setting(text, WSLCONFIG_KEY, value.as_str())
+}
+
+/// The file's text with the memory cap changed to `value`.
+pub fn with_vm_memory(text: &str, value: Option<MemorySize>) -> String {
+    with_setting(text, VM_MEMORY_KEY, &MemorySize::setting(value))
 }
 
 /// The file's text with `key` set to `value`: its line replaced, or added at
@@ -215,6 +355,16 @@ pub fn save_idle_stop(data_dir: &Path, value: IdleStop) -> io::Result<()> {
 /// Changes the watchers setting in the file, creating it if needed.
 pub fn save_watchers(data_dir: &Path, value: Watchers) -> io::Result<()> {
     save(data_dir, |text| with_watchers(text, value))
+}
+
+/// Changes the `.wslconfig` setting in the file, creating it if needed.
+pub fn save_wslconfig(data_dir: &Path, value: WslconfigMode) -> io::Result<()> {
+    save(data_dir, |text| with_wslconfig(text, value))
+}
+
+/// Changes the memory cap in the file, creating it if needed.
+pub fn save_vm_memory(data_dir: &Path, value: Option<MemorySize>) -> io::Result<()> {
+    save(data_dir, |text| with_vm_memory(text, value))
 }
 
 fn save(data_dir: &Path, change: impl FnOnce(&str) -> String) -> io::Result<()> {
@@ -508,6 +658,7 @@ mod tests {
             Settings {
                 idle_stop: IdleStop::Off,
                 watchers: Watchers::Ignored,
+                ..Settings::default()
             }
         );
     }
@@ -528,6 +679,7 @@ mod tests {
         let settings = Settings {
             idle_stop: IdleStop::After(10),
             watchers: Watchers::KeepAwake,
+            ..Settings::default()
         };
         let policy = settings.idle_policy(None).unwrap();
         assert_eq!(policy.watchers(), Watchers::KeepAwake);
@@ -539,12 +691,99 @@ mod tests {
         let off = Settings {
             idle_stop: IdleStop::Off,
             watchers: Watchers::KeepAwake,
+            ..Settings::default()
         };
         assert_eq!(off.idle_policy(None), None);
         assert_eq!(
             Settings::default().idle_policy(None).unwrap().watchers(),
             Watchers::Ignored
         );
+    }
+
+    #[test]
+    fn the_wslconfig_setting_is_light_by_default_and_keep_on_request() {
+        assert_eq!(Settings::default().wslconfig, WslconfigMode::Light);
+        assert_eq!(Settings::default().vm_memory, None);
+        let (settings, problems) = Settings::parse("WSLConfig = KEEP\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(settings.wslconfig, WslconfigMode::Keep);
+        let (settings, problems) = Settings::parse("wslconfig = off\n");
+        assert_eq!(settings.wslconfig, WslconfigMode::Light);
+        assert_eq!(
+            problems,
+            ["line 1: wslconfig is `off`, which is neither `light` nor `keep`"]
+        );
+        assert_eq!(WslconfigMode::Keep.to_string(), "keep");
+    }
+
+    #[test]
+    fn memory_sizes_are_whole_megabytes_or_gigabytes() {
+        let size = |value: &str| MemorySize::parse(value).map(|size| size.to_string());
+        assert_eq!(size("4GB").as_deref(), Some("4GB"));
+        assert_eq!(size(" 4gb ").as_deref(), Some("4GB"));
+        assert_eq!(size("3072mb").as_deref(), Some("3072MB"));
+        assert_eq!(size("1GB").as_deref(), Some("1GB"));
+        assert_eq!(size("1024GB").as_deref(), Some("1024GB"));
+        assert_eq!(MemorySize::parse("2GB").unwrap().megabytes(), 2048);
+        for wrong in [
+            "",
+            "4",
+            "4G",
+            "4 GB",
+            "0GB",
+            "512MB",
+            "1025GB",
+            "-4GB",
+            "+4GB",
+            "4.5GB",
+            "4TB",
+            "GB",
+            "99999999999GB",
+        ] {
+            assert_eq!(MemorySize::parse(wrong), None, "{wrong:?}");
+        }
+        assert_eq!(MemorySize::parse_setting("OFF"), Some(None));
+        assert_eq!(
+            MemorySize::parse_setting("8GB"),
+            Some(MemorySize::parse("8GB"))
+        );
+        assert_eq!(MemorySize::parse_setting("8"), None);
+        assert_eq!(MemorySize::setting(None), "off");
+    }
+
+    #[test]
+    fn the_new_settings_are_written_and_read_back() {
+        let text = with_wslconfig("idle-stop = 5\n", WslconfigMode::Keep);
+        let text = with_vm_memory(&text, MemorySize::parse("4GB"));
+        assert_eq!(text, "idle-stop = 5\nwslconfig = keep\nvm-memory = 4GB\n");
+        let (settings, problems) = Settings::parse(&text);
+        assert!(problems.is_empty());
+        assert_eq!(settings.wslconfig, WslconfigMode::Keep);
+        assert_eq!(settings.vm_memory, MemorySize::parse("4GB"));
+        assert_eq!(settings.idle_stop, IdleStop::After(5));
+        let text = with_vm_memory(&text, None);
+        assert!(text.ends_with("vm-memory = off\n"));
+        let (settings, problems) = Settings::parse("vm-memory = 4\n");
+        assert_eq!(settings.vm_memory, None);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("such as `4GB`"), "{problems:?}");
+    }
+
+    #[test]
+    fn the_wslconfig_entries_follow_the_settings() {
+        let entries = Settings::default().wslconfig_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].assignment(), "guiApplications=false");
+        let capped = Settings {
+            vm_memory: MemorySize::parse("4GB"),
+            ..Settings::default()
+        };
+        let entries: Vec<String> = capped
+            .wslconfig_entries()
+            .iter()
+            .map(|entry| entry.assignment())
+            .collect();
+        assert_eq!(entries, ["guiApplications=false", "memory=4GB"]);
     }
 
     #[test]
