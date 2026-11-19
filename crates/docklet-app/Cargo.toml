@@ -1,0 +1,19 @@
+[package]
+name = "docklet-app"
+description = "Docklet's application layer without a UI toolkit: engine control, streams, tables, selection, usage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+docklet-core = { workspace = true }
+docklet-engine = { workspace = true }
+docklet-proxy = { workspace = true }
+docklet-wsl = { workspace = true }
+# `rt-multi-thread` for the runtime `App::new` owns when the shell has none.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

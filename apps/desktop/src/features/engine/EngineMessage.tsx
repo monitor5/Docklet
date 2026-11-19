@@ -10,7 +10,7 @@ type Props = {
   children?: ReactNode;
 };
 
-/** Stopped, starting/stopping and error screens share this shell. */
+/** Stopped, sleeping, starting/stopping and error screens share this shell. */
 export function EngineMessage({ title, detail, hint, busy, children }: Props) {
   return (
     <section className="panel" aria-live="polite">

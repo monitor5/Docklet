@@ -2,7 +2,7 @@ import { useState } from "react";
 import { api } from "./api";
 import { ErrorBanner } from "./components/ErrorBanner";
 import { useNotice } from "./components/useNotice";
-import { ENGINE_STATE_LABEL } from "./engine";
+import { ENGINE_STATE_LABEL, usesDockerApi } from "./engine";
 import { ContainersView } from "./features/containers/ContainersView";
 import { EngineMessage } from "./features/engine/EngineMessage";
 import { InstallScreen } from "./features/engine/InstallScreen";
@@ -23,8 +23,10 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 export default function App() {
-  const engine = useEngine();
   const notice = useNotice();
+  // One engine request at a time; the backend would refuse a second one.
+  const acting = notice.busy.has("start") || notice.busy.has("stop");
+  const engine = useEngine(acting);
   const [tab, setTab] = useState<TabId>("containers");
   const [mirroredDismissed, setMirroredDismissed] = useState(false);
   const { status } = engine;
@@ -48,8 +50,6 @@ export default function App() {
     });
 
   const screen = screenFor(status.state);
-  // One engine request at a time; the backend would refuse a second one.
-  const acting = notice.busy.has("start") || notice.busy.has("stop");
   const errors = (
     <ErrorBanner
       message={notice.error ?? engine.error}
@@ -121,6 +121,30 @@ export default function App() {
           </button>
         </EngineMessage>
       )}
+      {screen === "sleeping" && (
+        // No list is shown here on purpose: fetching one is a Docker
+        // connection, and any connection wakes the engine.
+        <EngineMessage
+          title="The engine is asleep"
+          hint="Nothing was using Docker, so Docklet stopped the engine to free its memory. It starts again when you start it here, and by itself with the next Docker command from anywhere. Stopping it keeps it off until you start it."
+        >
+          <button
+            type="button"
+            className="primary"
+            disabled={acting}
+            onClick={() => control("start", api.engineStart)}
+          >
+            Start engine
+          </button>
+          <button
+            type="button"
+            disabled={acting}
+            onClick={() => control("stop", api.engineStop)}
+          >
+            Stop engine
+          </button>
+        </EngineMessage>
+      )}
       {screen === "busy" && (
         <EngineMessage
           title={
@@ -160,7 +184,8 @@ export default function App() {
           </button>
         </EngineMessage>
       )}
-      {screen === "running" && (
+      {/* The lists are what talks to Docker; nothing else in the window does. */}
+      {usesDockerApi(status.state) && (
         <>
           <div
             className="tabs"

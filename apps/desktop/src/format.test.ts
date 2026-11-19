@@ -5,6 +5,7 @@ import {
   formatBytes,
   publishedPorts,
   shortId,
+  stateLabel,
 } from "./format";
 
 test("formats byte sizes", () => {
@@ -47,4 +48,17 @@ test("compose project comes from the label", () => {
     }),
   ).toBe("shop");
   expect(composeProject({ Id: "a" })).toBeUndefined();
+});
+
+test("stateLabel shows the state without its age", () => {
+  const make = (State: string, Status: string) => ({ Id: "a", State, Status });
+  expect(stateLabel(make("running", "Up 13 seconds"))).toBe("running");
+  expect(stateLabel(make("exited", "Exited (1) 2 hours ago"))).toBe(
+    "exited (1)",
+  );
+  expect(stateLabel(make("exited", ""))).toBe("exited");
+  expect(stateLabel(make("running", "Up 5 minutes (unhealthy)"))).toBe(
+    "running (unhealthy)",
+  );
+  expect(stateLabel({ Id: "a" })).toBe("unknown");
 });

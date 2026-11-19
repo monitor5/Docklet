@@ -1,6 +1,6 @@
 import type { Container, ContainerAction } from "../../api";
 import { ConfirmButton } from "../../components/ConfirmButton";
-import { containerName, publishedPorts } from "../../format";
+import { containerName, publishedPorts, stateLabel } from "../../format";
 import { isRunning } from "./grouping";
 
 type Props = {
@@ -43,7 +43,7 @@ export function ContainerRow({
       <span className="muted ellipsis" title={container.Image}>
         {container.Image}
       </span>
-      <span className="muted">{container.Status ?? container.State}</span>
+      <span className="muted">{stateLabel(container)}</span>
       <span className="ports">
         {ports.map((port) => (
           <button

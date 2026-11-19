@@ -1,27 +1,20 @@
-//! Long-lived Docker streams, adapted from `docklet-engine` callbacks to the
-//! webview: events become Tauri events, log lines go through a channel.
+//! Long-lived Docker streams, adapted from `docklet-app` to the webview:
+//! events become Tauri events, log lines go through a channel.
 
-use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-use docklet_engine::{Backoff, Client};
+use docklet_app::{Backend, DockerEvent, StreamSink, WindowState};
+use docklet_engine::Client;
 use serde::Serialize;
-use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
-use crate::supervisor;
+use crate::state::AppState;
 
 /// Event sent to the UI whenever Docker reports a change, when the event
 /// stream ends and when it is about to be opened again.
 const DOCKER_EVENT: &str = "docker-event";
-
-/// An event stream that lasted this long was working, so the next reconnect
-/// starts with the shortest wait again.
-const STABLE_STREAM: Duration = Duration::from_secs(30);
 
 /// What a followed log sends to the webview.
 #[derive(Clone, Serialize)]
@@ -37,114 +30,98 @@ pub enum LogMessage {
     },
 }
 
-/// The background tasks that feed the UI.
-#[derive(Default)]
-pub struct Streams {
-    events: Mutex<Option<JoinHandle<()>>>,
-    logs: Mutex<HashMap<u32, JoinHandle<()>>>,
-    next_log: AtomicU32,
-}
-
-impl Streams {
-    /// Subscribes to Docker's event stream and forwards each event to the UI,
-    /// which refetches the affected list. The subscription is renewed when it
-    /// ends, until `stop_all`. Idempotent.
-    pub fn watch_events(&self, app: &AppHandle) {
-        let mut slot = self.events.lock().expect("events lock");
-        if slot
-            .as_ref()
-            .is_some_and(|task| !task.inner().is_finished())
-        {
-            return;
+impl From<docklet_app::LogMessage> for LogMessage {
+    fn from(message: docklet_app::LogMessage) -> Self {
+        match message {
+            docklet_app::LogMessage::Lines(lines) => Self::Lines { lines },
+            docklet_app::LogMessage::Ended { error } => Self::Ended { error },
         }
-        *slot = Some(tauri::async_runtime::spawn(forward_events(app.clone())));
-    }
-
-    /// Follows a container's logs into `output`. Returns a token for
-    /// `stop_logs`.
-    pub fn follow_logs(&self, client: Client, id: String, output: Channel<LogMessage>) -> u32 {
-        let token = self.next_log.fetch_add(1, Ordering::Relaxed);
-        let task = tauri::async_runtime::spawn(async move {
-            let sink = |lines: Vec<String>| match output.send(LogMessage::Lines { lines }) {
-                Ok(()) => ControlFlow::Continue(()),
-                Err(_) => ControlFlow::Break(()),
-            };
-            let outcome = client.follow_logs(&id, sink).await;
-            // Without this a log that ended, or never started, looks like
-            // one that is merely quiet.
-            let error = outcome.err().map(|err| err.to_string());
-            let _ = output.send(LogMessage::Ended { error });
-        });
-        let mut logs = self.logs.lock().expect("logs lock");
-        // A log that ended on its own, because its container was removed,
-        // would otherwise stay here until the UI stops it.
-        logs.retain(|_, running| !running.inner().is_finished());
-        logs.insert(token, task);
-        token
-    }
-
-    pub fn stop_logs(&self, token: u32) {
-        if let Some(task) = self.logs.lock().expect("logs lock").remove(&token) {
-            task.abort();
-        }
-    }
-
-    /// Ends every followed log.
-    ///
-    /// The page that asked for them cannot be relied on to stop them: a
-    /// window that closes or reloads runs no cleanup, and sending to its
-    /// channel keeps succeeding after the webview is gone.
-    pub fn stop_all_logs(&self) {
-        for (_, task) in self.logs.lock().expect("logs lock").drain() {
-            task.abort();
-        }
-    }
-
-    /// Ends the event subscription and every followed log.
-    pub fn stop_all(&self) {
-        if let Some(task) = self.events.lock().expect("events lock").take() {
-            task.abort();
-        }
-        self.stop_all_logs();
     }
 }
 
-/// Forwards Docker's events to the UI and opens the stream again whenever it
-/// ends, which it does when the engine is restarted from the CLI, the pipe
-/// hiccups or an event cannot be decoded. Runs until it is aborted.
-///
-/// Every round ends in a sleep of at least a second, whether the stream ran,
-/// failed at once or was not tried.
-async fn forward_events(app: AppHandle) {
-    let mut backoff = Backoff::default();
-    let mut connected_before = false;
-    loop {
-        if engine_reachable().await
-            && let Ok(client) = Client::connect()
-        {
-            if connected_before {
-                // Changes made while nothing was listening were missed.
-                let _ = app.emit(DOCKER_EVENT, "reconnecting");
-            }
-            connected_before = true;
-            let opened = Instant::now();
-            let forward = |kind: String| {
-                let _ = app.emit(DOCKER_EVENT, kind);
-            };
-            let _ = client.watch_events(forward).await;
-            // The stream ended: the engine stopped or the pipe went away.
-            let _ = app.emit(DOCKER_EVENT, "disconnected");
-            if opened.elapsed() >= STABLE_STREAM {
-                backoff.reset();
-            }
-        }
-        backoff.wait().await;
+/// Sends what the event stream says to the webview: the kind of a Docker
+/// event, `disconnected` or `reconnecting`.
+struct Events(AppHandle);
+
+impl StreamSink for Events {
+    fn docker_event(&self, event: DockerEvent) {
+        let _ = self.0.emit(DOCKER_EVENT, event.name());
     }
 }
 
-/// See `supervisor::reachable`. Counts as unreachable if the check fails.
-async fn engine_reachable() -> bool {
-    tauri::async_runtime::spawn_blocking(supervisor::reachable)
-        .await
-        .unwrap_or(false)
+/// The engine control and streams of this app, on Tauri's own runtime.
+pub fn backend(app: &AppHandle) -> Backend {
+    let runtime = tauri::async_runtime::handle().inner().clone();
+    Backend::system(runtime, Arc::new(Events(app.clone())))
+}
+
+/// Tells the streams whether there is a window right now. They start
+/// nothing without one: nobody would listen, and nothing would stop them
+/// when the window is already gone.
+pub fn sync_window(app: &AppHandle) {
+    let window = match app.get_webview_window(crate::MAIN_WINDOW) {
+        Some(_) => WindowState::Visible,
+        None => WindowState::Gone,
+    };
+    app.state::<AppState>().backend.streams().set_window(window);
+}
+
+/// Subscribes to Docker's event stream and forwards each event to the UI,
+/// which refetches the affected list. The subscription is renewed when it
+/// ends, until the engine is stopped or the window is gone. Idempotent.
+/// Does nothing without a window; the next list view asks again.
+pub fn watch_events(app: &AppHandle) {
+    sync_window(app);
+    app.state::<AppState>().backend.streams().watch_events();
+}
+
+/// Follows a container's logs into `output`. Returns a token for
+/// `Streams::stop_logs`.
+pub fn follow_logs(
+    app: &AppHandle,
+    client: Client,
+    id: String,
+    output: Channel<LogMessage>,
+) -> u32 {
+    // The page that asks is the window.
+    sync_window(app);
+    let send = move |message: docklet_app::LogMessage| match output.send(message.into()) {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(_) => ControlFlow::Break(()),
+    };
+    let state = app.state::<AppState>();
+    state.backend.streams().follow_logs(client, id, send)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn json(message: docklet_app::LogMessage) -> serde_json::Value {
+        serde_json::to_value(LogMessage::from(message)).unwrap()
+    }
+
+    /// The shapes the TypeScript `LogMessage` type is written against.
+    #[test]
+    fn the_window_gets_log_messages_tagged_by_kind() {
+        let lines = json(docklet_app::LogMessage::Lines(vec!["a".to_string()]));
+        assert_eq!(lines["kind"], "lines");
+        assert_eq!(lines["lines"][0], "a");
+
+        let ended = json(docklet_app::LogMessage::Ended { error: None });
+        assert_eq!(ended["kind"], "ended");
+        assert!(ended["error"].is_null());
+
+        let error = Some("no such container".to_string());
+        let failed = json(docklet_app::LogMessage::Ended { error });
+        assert_eq!(failed["error"], "no such container");
+    }
+
+    /// The payloads `hooks.ts` and `engine.ts` compare against.
+    #[test]
+    fn the_window_gets_events_by_their_one_word_name() {
+        assert_eq!(DockerEvent::Changed("image".to_string()).name(), "image");
+        assert_eq!(DockerEvent::Disconnected.name(), "disconnected");
+        assert_eq!(DockerEvent::Reconnecting.name(), "reconnecting");
+    }
 }

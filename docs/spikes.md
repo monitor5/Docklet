@@ -154,3 +154,160 @@ Not measured yet:
   looked into.
 - The container list shows the status text from the last Docker event, so
   "Up 13 seconds" stays on screen until something else changes.
+
+## Alpine base without an init system
+
+Question: does the engine distro need systemd, and what does a smaller base
+save?
+
+What Docklet needs from a rootfs (the rootfs contract) is only:
+
+- dockerd running after the distro boots, listening on `/var/run/docker.sock`;
+- `/usr/local/bin/docklet-relay`;
+- a `docker` CLI inside the distro, because the engine probes readiness with
+  `docker info` and counts running containers with `docker ps -q`.
+
+How dockerd gets started is up to the base. On the Debian-family bases
+systemd does it; nothing else in the engine relies on systemd.
+
+Method (2026-11-15): an Alpine rootfs without an init system was built by hand,
+with Docker from Alpine 3.24's packages and a WSL `[boot]` command that starts
+dockerd. Both it and the Debian 13 rootfs were measured the same way on the
+same PC: a cold WSL VM for each start, no container running. Each number is from **one run on one PC**;
+treat them as an order of magnitude, not a benchmark.
+
+| Measurement                      | Debian 13 + systemd      | Alpine, no init system |
+| -------------------------------- | ------------------------ | ---------------------- |
+| Rootfs download (gzip)           | 169 MiB                  | 59 MiB                 |
+| Installed size                   | 598 MB                   | 174 MB                 |
+| Cold start until dockerd answers | 14.1 s (`docklet start`) | 2.6 s                  |
+| Host memory of the WSL VM, idle  | 1402 MB                  | 1168 MB                |
+| Processes in the distro          | 20                       | 11                     |
+
+In the Alpine distro, Docker 29.9.3 passed `docker run hello-world`, the stdin
+half-close (`echo hi | docker run -i --rm alpine cat`), a `--memory` limit
+(cgroup v2) and a published port reached from Windows on `localhost`.
+
+Consequence: `alpine` is a third base (`docklet install --base alpine`);
+`debian-13` stays the default. Its recipe in `distro/Dockerfile` differs from
+the hand-built experiment in a few points:
+
+- `distro/apk/docklet-boot` sets `PATH` (without it dockerd cannot find
+  `docker-proxy`), enables the cgroup v2 controllers for delegation as moby's
+  docker-in-docker script does, makes `/` a shared mount as systemd does on
+  the other bases, and logs through busybox `syslogd` to `/var/log/messages`,
+  rotated at 2 MiB with two old files kept, instead of a log file that grows
+  for as long as the distro runs.
+- The `docker` CLI and k3d are installed; the buildx and compose CLI plugins
+  are not. They would only serve a `docker` CLI run inside the distro; the
+  Windows-side `docker compose` is unaffected.
+- Nothing restarts dockerd if it exits; systemd would. `docklet stop` and
+  `docklet start` boot the distro again.
+
+The rootfs built by `distro.yml` is 75.5 MiB (gzip), larger than the hand-built
+one because it carries the `docker` CLI and k3d. Not measured yet: k3d clusters
+on it.
+
+## Idle stop and wake on connect
+
+Question: does stopping an unused engine give the memory back, and what does
+the next Docker command pay for it?
+
+GitHub-hosted runner (2026-11-15, E2E run 43709548713, idle time set to 20 s
+for the test):
+
+| Base         | `docklet start` | Wake by `docker version` | Wake by `docklet docker version` |
+| ------------ | --------------- | ------------------------ | -------------------------------- |
+| alpine       | 5.9 s           | 2.9 s                    | 2.9 s                            |
+| debian-13    | 19.7 s          | 14.0 s                   | 14.7 s                           |
+| ubuntu-26.04 | 15.4 s          | 14.0 s                   | 13.9 s                           |
+
+`docklet-desktop.exe --proxy` (debian-13) fell asleep after about 31 s and woke
+in 16.0 s.
+
+Local PC (2026-11-15, release build, one run per base, idle time 20 s):
+
+| Measurement                                | debian-13 | alpine |
+| ------------------------------------------ | --------- | ------ |
+| `docklet start`                            | 13.6 s    | 2.1 s  |
+| Wake by `docker --context docklet version` | 13.1 s    | 3.2 s  |
+| `docker ps` on a running engine            | 0.29 s    | 0.28 s |
+| `docklet stop`                             | 1.1 s     | 0.6 s  |
+
+- The host's `vmmemWSL` process does not shrink when the distro stops: WSL
+  keeps the VM for about a minute (it showed 685 to 966 MB in that window),
+  then the process is gone. With the proxy still listening, `vmmemWSL` was at
+  0 MB 75 s after the engine fell asleep.
+- While sleeping, the only Docklet process was the proxy (8 MB working set,
+  2 MB private) and no `wsl.exe` was left.
+- The two columns are not like for like. The alpine start began while the VM
+  was still up from the import. The alpine wake started from a VM that was
+  fully gone; the debian-13 wake came seconds after falling asleep, with the
+  VM still up.
+- Not measured: a debian-13 wake from a VM that is fully gone, memory of the
+  running engine per base in this build, and the desktop window on a sleeping
+  engine.
+
+## Native Win32 window instead of WebView2
+
+Question: how much lighter is a window that is not a web page, with the same
+screens?
+
+Method (2026-11-15 and 16, one PC, release builds, 125% display scaling): the
+Tauri window, two throwaway prototypes of one screen (Win32 with the
+`windows` crate, and Slint), then the real native app. `docklet-native.exe`
+was measured in its demo mode (made-up data, a log of 10,000 lines per
+second) and against a real engine on the alpine base. Working set and
+private bytes of the app's own processes; CPU as a share of one core over
+5 to 15 s.
+
+| State                                   | Tauri + WebView2                     | Native app                    |
+| --------------------------------------- | ------------------------------------ | ----------------------------- |
+| Executable                              | 4.1 MB plus WebView2                 | 1.8 MiB                       |
+| Window open on a list                   | 357 MB (148 MB private), 7 processes | 28 MB (8 MB private)          |
+| Window closed, tray only                | 34 MB (7 MB private)                 | 0 to 1 MB (3 to 9 MB private) |
+| Started in the tray, window never shown | not measured                         | 12 MB (2 MB private)          |
+| Log at 10,000 lines per second, visible | about 20% (window in the background) | 3.0 to 3.8%                   |
+| Same log, window minimised              | not measured                         | about 1%                      |
+| Real log, about 20 lines per second     | not measured                         | 0.3 to 6.3%, five samples     |
+
+- The prototypes: Win32 14 MB with the list idle, Slint 37 MB with its
+  software renderer and 252 MB with OpenGL while following the log. egui,
+  iced and WinUI 3 were ruled out on paper (memory, an open Korean IME
+  defect, no tray or accessibility support).
+- Private bytes do not return to the 2 MB of a fresh start after the window
+  was open once: reading the GPU counters (PDH) keeps about 5 MB for the
+  life of the process.
+- On the real engine: the lists, usage strip and per-container columns,
+  select-all with a filter (hidden rows were kept), bulk removal with its
+  confirmation and report, prune with the reclaimed size, disk usage, pull,
+  logs, open port, the tray menu and single instance all worked.
+- Not verified: typing Hangul through the IME (text was set, not typed), a
+  screen reader (only the UI Automation names were read), a click on the
+  real tray icon (its notification was sent to the window instead), and the
+  sleeping screen on a real engine.
+
+## Idle stop with a watcher on the pipe
+
+Docker Desktop's app, with its own engine stopped, opens a build-history
+listener on every Docker context, Docklet's included
+(`com.docker.build.exe`: "starting listener for docklet/docklet"). With
+"no open connection" as the idle rule that one connection kept the engine
+awake indefinitely: 106 s with a 20 s idle time and no container, on a PC
+where it had slept the day before while that listener happened to be down.
+
+The rule is now traffic: an engine sleeps when no connection carried data
+and no container ran for the idle time, silent connections are closed at
+that point, and a program that was cut off and reconnects only to check or
+listen is held without waking the engine.
+
+- Runner (alpine): asleep after about 21 s with `docker events` and a
+  reconnecting watcher attached; the held reconnect cost no CPU in 30 s;
+  `docker version` woke the engine in 5.7 s and the held watcher was then
+  served.
+- Local PC: asleep 26 s after start with `docker events` attached, which
+  ended with "unexpected EOF"; still asleep after 3.5 minutes; woken by
+  `docker version` in 2.2 s.
+- Not verified: Docker Desktop itself reconnecting to a sleeping engine. Its
+  listener did not reconnect during the test, so what its first request is,
+  and whether it is held, is unknown.

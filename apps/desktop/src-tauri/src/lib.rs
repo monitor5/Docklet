@@ -8,6 +8,7 @@ mod state;
 mod streams;
 mod supervisor;
 
+use docklet_app::WindowState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::PageLoadEvent;
@@ -108,22 +109,37 @@ pub fn run_proxy_mode() -> Option<std::io::Result<()>> {
     if !std::env::args().any(|arg| arg == "--proxy") {
         return None;
     }
-    Some(docklet_proxy::serve(docklet_proxy::PipeProxyConfig {
+    Some(serve_proxy())
+}
+
+/// Serves the pipe like `docklet proxy` does: with idle stop, as the setting
+/// shared with the CLI says (`docklet config set idle-stop`).
+fn serve_proxy() -> std::io::Result<()> {
+    let config = docklet_proxy::PipeProxyConfig {
         pipe_name: docklet_core::engine::ENGINE_PIPE.to_string(),
         message_mode: true,
         relay: docklet_proxy::RelayCommand::wsl_relay(docklet_wsl::DISTRO),
         trace: false,
-    }))
+    };
+    let data_dir = docklet_wsl::data_dir()?;
+    let engine = docklet_wsl::Engine::system()?;
+    docklet_proxy::serve_configured(config, &data_dir, engine)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(state::AppState::default())
+        // Registered first, as the plugin requires. A second launch lands here
+        // in the running instance and brings its window up instead. Proxy mode
+        // never reaches this builder, so it neither is nor blocks an instance.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window_detached(app);
+        }))
         // A page that reloads does not get to stop the logs it followed.
         .on_page_load(|webview, payload| {
             if webview.label() == MAIN_WINDOW && payload.event() == PageLoadEvent::Started {
-                webview.state::<state::AppState>().streams.stop_all_logs();
+                let state = webview.state::<state::AppState>();
+                state.backend.streams().stop_all_logs();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -146,6 +162,9 @@ pub fn run() {
             commands::logs_stop,
         ])
         .setup(|app| {
+            // Before the tray and the window, which are what uses it. It
+            // needs the handle, to send Docker's events to the window.
+            app.manage(state::AppState::new(app.handle()));
             build_tray(app.handle())?;
             show_main_window(app.handle())?;
             Ok(())
@@ -157,12 +176,16 @@ pub fn run() {
             // the core alive in the tray; `AppHandle::exit` (Quit) passes a code.
             RunEvent::ExitRequested { api, code, .. } if code.is_none() => api.prevent_exit(),
             // The window took its WebView along without running the page's
-            // cleanup. The event subscription stays for the next window.
+            // cleanup. Nothing stays open without a window: the next list
+            // view asks for the event stream again.
             RunEvent::WindowEvent {
                 label,
                 event: WindowEvent::Destroyed,
                 ..
-            } if label == MAIN_WINDOW => app.state::<state::AppState>().streams.stop_all_logs(),
+            } if label == MAIN_WINDOW => {
+                let state = app.state::<state::AppState>();
+                state.backend.streams().set_window(WindowState::Gone);
+            }
             _ => {}
         });
 }

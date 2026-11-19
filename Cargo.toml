@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/desktop/src-tauri", "crates/*"]
+members = ["apps/desktop/src-tauri", "apps/native", "crates/*"]
 # Built for Linux inside the distro image, with its own lockfile.
 exclude = ["distro/relay"]
 

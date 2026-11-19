@@ -1,4 +1,13 @@
 # Bases the docklet rootfs is built for. The first entry is the default.
-# name          base image          Docker apt repo   suite
-debian-13       debian:trixie-slim  debian            trixie
-ubuntu-26.04    ubuntu:26.04        ubuntu            resolute
+#
+# Columns: name, recipe, base image, then optional KEY=VALUE build arguments.
+# The recipe is a stage in distro/Dockerfile that says how the base is built:
+#   apt  Debian family: docker-ce from Docker's apt repository, systemd starts
+#        dockerd. Needs DOCKER_REPO and DOCKER_SUITE (Docker's repo and suite).
+#   apk  Alpine: Docker from Alpine's packages, no init system; WSL's boot
+#        command starts dockerd (distro/apk/docklet-boot).
+#
+# name          recipe  base image          build arguments
+debian-13       apt     debian:trixie-slim  DOCKER_REPO=debian DOCKER_SUITE=trixie
+ubuntu-26.04    apt     ubuntu:26.04        DOCKER_REPO=ubuntu DOCKER_SUITE=resolute
+alpine          apk     alpine:3.24
