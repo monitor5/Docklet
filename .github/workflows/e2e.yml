@@ -129,7 +129,11 @@ jobs:
           # Every base is installed by name, except alpine, which proves that
           # a plain install picks it.
           if ("${{ matrix.base }}" -eq "alpine") {
-            Step "install (default base)" { & $docklet install }
+            # Diagnostic: is it the import or the .wslconfig write that boots the distro?
+            Step "install (default base, no wslconfig)" { & $docklet install --no-wslconfig }
+            for ($i = 1; $i -le 6; $i++) { Start-Sleep -Seconds 3; StillStopped "install --no-wslconfig, then $($i * 3) s" }
+            Report "notice" "diagnostic" "no start in 18 s after an install that left .wslconfig alone"
+            Step "wslconfig apply (diagnostic)" { & $docklet wslconfig apply }
           } else {
             Step "install" { & $docklet install --base "${{ matrix.base }}" }
           }
