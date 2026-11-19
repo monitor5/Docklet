@@ -67,6 +67,11 @@ jobs:
             return
           }
           function Running { @(wsl --list --running --quiet 2>$null) -contains "docklet" }
+          # Before the first start nothing may boot the distro: every command up
+          # to there only reads files or asks WSL for its lists.
+          function StillStopped([string]$After) {
+            if (Running) { Report "error" "distro started" "the docklet distro runs after: $After | $((wsl --list --verbose 2>$null | Out-String) -replace "`0", "")"; exit 1 }
+          }
           # Runs a cmd.exe command line with a hard timeout; output goes to a file
           # so a hung command can never block the step. Sets $script:Last.
           function Timed([string]$Name, [string]$CommandLine, [int]$Seconds, [bool]$ExpectOk = $true) {
@@ -125,7 +130,9 @@ jobs:
             Step "install" { & $docklet install --base "${{ matrix.base }}" }
           }
           if ((& $docklet status) -ne "stopped") { exit 1 }
+          StillStopped "install and status"
           $base = ((& $docklet base --json 2>$null) | ConvertFrom-Json).data
+          StillStopped "base"
           $ok = $base.installed_base -eq "${{ matrix.base }}" -and $base.default -eq "alpine" -and $base.distro_installed -eq $true
           Report ($(if ($ok) { "notice" } else { "error" })) "docklet base" "installed_base=$($base.installed_base) default=$($base.default)"
           if (-not $ok) { exit 1 }
@@ -142,27 +149,35 @@ jobs:
           $applied = Bytes $wslconfig
           # revert restores the user's file byte for byte; apply puts the key back.
           Step "wslconfig revert" { & $docklet wslconfig revert }
+          StillStopped "wslconfig revert"
           if ((Bytes $wslconfig) -ne $before -or (Test-Path "$wslconfigState\record.txt")) { Report "error" "wslconfig revert" "not restored byte for byte: $(Get-Content $wslconfig -Raw)"; exit 1 }
           Step "wslconfig apply" { & $docklet wslconfig apply }
+          StillStopped "wslconfig apply"
           if ((Bytes $wslconfig) -ne $applied) { Report "error" "wslconfig apply" "not the same as after install: $(Get-Content $wslconfig -Raw)"; exit 1 }
           # A key the user set wins and is reported.
           Step "wslconfig revert (again)" { & $docklet wslconfig revert }
+          StillStopped "wslconfig revert (again)"
           [IO.File]::WriteAllText($wslconfig, "[wsl2]`r`nguiApplications=true`r`n")
           $own = Bytes $wslconfig
           $apply = (& $docklet wslconfig apply --json 2>$null) | ConvertFrom-Json
+          StillStopped "wslconfig apply --json"
           $key = $apply.data.keys | Where-Object { $_.key -eq "guiApplications" }
           $ok = $apply.ok -eq $true -and $key.result -eq "kept" -and $key.file_value -eq "true" -and (Bytes $wslconfig) -eq $own
           Report ($(if ($ok) { "notice" } else { "error" })) "guiApplications=true is kept" "result=$($key.result) file_value=$($key.file_value)"
           if (-not $ok) { exit 1 }
           Step "wslconfig apply with the user's key (text)" { & $docklet wslconfig apply }
+          StillStopped "wslconfig apply, nothing to change"
           # Back to the user's first file, with the light key, for the rest of the job.
           Copy-Item $wslconfigBefore $wslconfig -Force
           Step "wslconfig apply (restore)" { & $docklet wslconfig apply }
+          StillStopped "wslconfig apply (restore)"
           if ((Bytes $wslconfig) -ne $applied) { Report "error" "wslconfig apply" "not the same as after install"; exit 1 }
           # Switching the base without --yes is refused and deletes nothing.
           $other = if ("${{ matrix.base }}" -eq "alpine") { "debian-13" } else { "alpine" }
           Step "base set without --yes" { & $docklet base set $other } 2
+          StillStopped "base set without --yes"
           $refused = (& $docklet base set $other --json 2>$null) | ConvertFrom-Json
+          StillStopped "base set --json"
           $ok = $refused.ok -eq $false -and $refused.error.code -eq "confirmation_required" -and $refused.data.new_base -eq $other -and $refused.data.current_base -eq "${{ matrix.base }}"
           Report ($(if ($ok) { "notice" } else { "error" })) "base set refused" "$($refused.error.code): $($refused.error.message)"
           if (-not $ok) { exit 1 }
