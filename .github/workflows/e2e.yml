@@ -135,6 +135,8 @@ jobs:
           }
           if ((& $docklet status) -ne "stopped") { exit 1 }
           StillStopped "install and status"
+          # Diagnostic: with no Docklet command running, does anything boot the distro?
+          for ($i = 1; $i -le 6; $i++) { Start-Sleep -Seconds 3; StillStopped "install, then $($i * 3) s with no command" }
           $base = ((& $docklet base --json 2>$null) | ConvertFrom-Json).data
           StillStopped "base"
           $ok = $base.installed_base -eq "${{ matrix.base }}" -and $base.default -eq "alpine" -and $base.distro_installed -eq $true
