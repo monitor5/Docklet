@@ -1,8 +1,5 @@
-node_modules/
-dist/
 target/
 *.log
-*.local
 .DS_Store
 .idea/
 .vscode/*
