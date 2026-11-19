@@ -144,6 +144,34 @@ mod tests {
         assert!(normalize(SKILL_MD).starts_with("---\nname: docklet\n"));
     }
 
+    /// A rewrite of the skill must not lose what keeps an agent from
+    /// damaging the user's machine.
+    #[test]
+    fn skill_keeps_the_safety_rules() {
+        let skill = normalize(SKILL_MD);
+        for rule in [
+            "Never run `wsl --unregister`, `wsl --terminate` or `wsl --shutdown` yourself.",
+            "Do not edit `%USERPROFILE%\\.wslconfig`.",
+            "Ask before anything that deletes data",
+        ] {
+            assert!(skill.contains(rule), "the skill lost a rule: {rule}");
+        }
+    }
+
+    #[test]
+    fn skill_frontmatter_is_closed_and_has_a_description() {
+        let skill = normalize(SKILL_MD);
+        let rest = skill.strip_prefix("---\n").unwrap();
+        let (frontmatter, body) = rest.split_once("\n---\n").unwrap();
+        let fields: Vec<&str> = frontmatter
+            .lines()
+            .filter_map(|line| line.split_once(": "))
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(fields, ["name", "description"]);
+        assert!(body.trim_start().starts_with("# Docklet"));
+    }
+
     #[test]
     fn skips_agents_that_are_not_present() {
         let home = TempHome::new("absent");

@@ -13,7 +13,12 @@ sha2 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
+    # `usage`: the system process list and a process's command line.
+    "Wdk_System_SystemInformation",
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Security",
+    # `usage`: the GPU performance counters.
+    "Win32_System_Performance",
     "Win32_System_Threading",
 ] }

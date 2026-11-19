@@ -19,12 +19,33 @@ jobs:
       fail-fast: false
       matrix:
         # Keep in sync with distro/bases.txt.
-        base: [debian-13, ubuntu-26.04]
+        base: [debian-13, ubuntu-26.04, alpine]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - name: Build rootfs (${{ matrix.base }})
         run: ./distro/build.sh "${{ matrix.base }}"
+      # Runs the rootfs as a plain container: no dockerd is started, only the
+      # files of the rootfs contract are checked, so a broken image fails
+      # here and not in the E2E workflow on Windows.
+      - name: Smoke-test the rootfs (${{ matrix.base }})
+        timeout-minutes: 5
+        env:
+          BASE: ${{ matrix.base }}
+        run: |
+          set -eux
+          image="docklet-rootfs-$BASE"
+          docker import "distro/out/rootfs-$BASE.tar.gz" "$image"
+          docker run --rm "$image" test -x /usr/local/bin/docklet-relay
+          docker run --rm "$image" docker --version
+          docker run --rm "$image" dockerd --version
+          docker run --rm "$image" k3d version
+          docker run --rm "$image" cat /etc/wsl.conf
+          docker run --rm "$image" grep -qx '\[boot\]' /etc/wsl.conf
+          if [ "$BASE" = alpine ]; then
+            docker run --rm "$image" sh -n /usr/local/bin/docklet-boot
+          fi
+          docker image rm "$image"
       - uses: actions/upload-artifact@v7
         with:
           name: rootfs-${{ matrix.base }}

@@ -16,7 +16,8 @@ pub struct WslOutput {
 
 /// Runs `wsl.exe` with the given arguments.
 ///
-/// An `Err` means the process could not be started (WSL is not installed).
+/// An `Err` means the process could not be started (WSL is not installed) or,
+/// with `ErrorKind::TimedOut`, that it was started and did not finish in time.
 pub trait WslRunner {
     fn run(&self, args: &[&str]) -> io::Result<WslOutput>;
 }
@@ -87,13 +88,18 @@ impl<R: WslRunner> Wsl<R> {
         Self { runner }
     }
 
-    /// `None` when WSL is missing or too old to answer `--version`.
-    pub fn version(&self) -> Option<WslVersion> {
-        let output = self.runner.run(&["--version"]).ok()?;
-        if !output.success {
-            return None;
-        }
-        parse_version(&output.stdout)
+    /// `Ok(None)` when WSL is missing or too old to answer `--version`. An
+    /// `Err` is a `wsl.exe` that hung: WSL is installed but does not answer.
+    pub fn version(&self) -> io::Result<Option<WslVersion>> {
+        let output = match self.runner.run(&["--version"]) {
+            Ok(output) => output,
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => return Err(err),
+            Err(_) => return Ok(None),
+        };
+        Ok(output
+            .success
+            .then(|| parse_version(&output.stdout))
+            .flatten())
     }
 
     pub fn installed(&self) -> io::Result<Vec<String>> {
