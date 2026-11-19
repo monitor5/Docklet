@@ -231,7 +231,9 @@ pub const COMMANDS: &[Entry] = &[
         about: &[
             "Change a setting. idle-stop <minutes|off>: stop the",
             "engine after that long without use (default: 10);",
-            "it starts again when Docker is used",
+            "it starts again when Docker is used.",
+            "watchers-keep-awake <yes|no>: whether a connection",
+            "that carries nothing counts as use (default: no)",
         ],
         deletes_data: false,
         long_running: false,
@@ -455,15 +457,27 @@ pub struct Setting {
     pub about: &'static str,
 }
 
-pub const SETTINGS_LIST: &[Setting] = &[Setting {
-    key: "idle-stop",
-    values: "<minutes>|off",
-    default: "10",
-    about: "Minutes without a Docker connection or a running container after which the \
-            engine is stopped to free its memory; the next Docker command starts it again. \
-            `off` keeps it running until `docklet stop`. A change applies from the next \
-            `docklet start`",
-}];
+pub const SETTINGS_LIST: &[Setting] = &[
+    Setting {
+        key: "idle-stop",
+        values: "<minutes>|off",
+        default: "10",
+        about: "Minutes without Docker traffic or a running container after which the \
+                engine is stopped to free its memory; the next Docker command starts it \
+                again. `off` keeps it running until `docklet stop`. A change applies from \
+                the next `docklet start`",
+    },
+    Setting {
+        key: "watchers-keep-awake",
+        values: "yes|no",
+        default: "no",
+        about: "Whether a connection that is open but carries nothing, such as Docker \
+                Desktop, an IDE or `docker events` watching the engine, keeps it from \
+                going to sleep. With `no` such a connection is closed when the engine \
+                goes to sleep, and when its program reconnects only to watch, it waits \
+                without waking the engine. A change applies from the next `docklet start`",
+    },
+];
 
 fn command(entry: &Entry) -> Json {
     let usage = std::iter::once(format!("docklet {}", entry.name))
@@ -636,6 +650,16 @@ Other:
         ));
         // What the task of this setting hinges on is said where agents read.
         assert!(idle_stop.about.contains("next `docklet start`"));
+        let watchers = &SETTINGS_LIST[1];
+        assert_eq!(
+            watchers.default,
+            docklet_core::settings::Watchers::default().to_string()
+        );
+        assert!(help_text().contains("(default: no)"));
+        assert!(listed[1].render().starts_with(
+            r#"{"key":"watchers-keep-awake","values":"yes|no","default":"no","description":""#
+        ));
+        assert!(watchers.about.contains("next `docklet start`"));
     }
 
     #[test]

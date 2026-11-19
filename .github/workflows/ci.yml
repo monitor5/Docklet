@@ -29,13 +29,13 @@ jobs:
       # The Tauri shell needs WebKitGTK on Linux and is Windows-only anyway,
       # so Linux covers the platform-neutral crates.
       - name: Clippy
-        run: cargo clippy -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl --all-targets -- -D warnings
+        run: cargo clippy -p docklet-app -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl --all-targets -- -D warnings
       - name: Relay (distro binary)
         run: |
           cargo fmt --manifest-path distro/relay/Cargo.toml --check
           cargo clippy --manifest-path distro/relay/Cargo.toml --locked -- -D warnings
       - name: Test
-        run: cargo test -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl
+        run: cargo test -p docklet-app -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl
 
   windows:
     name: App (Windows)
@@ -66,10 +66,24 @@ jobs:
       - name: Test
         run: cargo test --workspace
       # Open real named pipes and spawn processes, so these tests run here
-      # and never on a developer PC.
+      # and never on a developer PC. docklet-app and docklet-native have none
+      # today; they are listed so that one added there runs here too.
       - name: Test (runner only)
         timeout-minutes: 5
-        run: cargo test -p docklet-proxy -p docklet-wsl -p docklet-cli -- --ignored
+        run: cargo test -p docklet-app -p docklet-native -p docklet-proxy -p docklet-wsl -p docklet-cli -- --ignored
+      # The native app is one executable with nothing to bundle. Its size is
+      # reported with every run, since staying small is the point of it.
+      - name: Build the native app
+        run: cargo build --release -p docklet-native
+      - name: Report the native app's size
+        run: |
+          $size = (Get-Item target/release/docklet-native.exe).Length
+          Write-Host "::notice title=docklet-native.exe::$([math]::Round($size / 1KB)) KB"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docklet-native
+          path: target/release/docklet-native.exe
+          if-no-files-found: error
       - name: Build installer
         run: pnpm tauri build
       - uses: actions/upload-artifact@v7

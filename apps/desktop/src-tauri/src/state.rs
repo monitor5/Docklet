@@ -1,10 +1,20 @@
 //! State shared by the Tauri commands and the tray.
 
-use crate::streams::Streams;
-use crate::supervisor::Supervisor;
+use docklet_app::Backend;
+use tauri::AppHandle;
 
-#[derive(Default)]
+use crate::streams;
+
+/// Engine control and the streams, which live in `docklet-app` so the
+/// native shell runs the same code.
 pub struct AppState {
-    pub supervisor: Supervisor,
-    pub streams: Streams,
+    pub backend: Backend,
+}
+
+impl AppState {
+    pub fn new(app: &AppHandle) -> Self {
+        Self {
+            backend: streams::backend(app),
+        }
+    }
 }

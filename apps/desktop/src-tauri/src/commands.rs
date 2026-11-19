@@ -1,12 +1,12 @@
-//! Tauri commands: thin wrappers over the supervisor (engine lifecycle) and
-//! `docklet-engine` (the Docker API).
+//! Tauri commands: thin wrappers over `docklet-app` (engine lifecycle and
+//! streams) and `docklet-engine` (the Docker API).
 //!
 //! Docker data is returned as bollard's own models, so the frontend sees the
 //! Docker API's JSON field names (`Id`, `Names`, `State`, ...).
 
 use std::io;
 
-use docklet_core::{EngineState, engine};
+use docklet_core::EngineState;
 use docklet_engine::models::{ContainerSummary, ImageSummary, Network, Volume};
 use docklet_engine::{Client, ContainerAction};
 use serde::Serialize;
@@ -14,7 +14,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
-use crate::streams::LogMessage;
+use crate::streams::{self, LogMessage};
 use crate::supervisor;
 
 type CommandResult<T> = Result<T, String>;
@@ -47,15 +47,20 @@ pub struct EngineStatus {
     mirrored_networking: bool,
 }
 
+impl From<docklet_app::EngineStatus> for EngineStatus {
+    fn from(status: docklet_app::EngineStatus) -> Self {
+        Self {
+            state: status.state,
+            bases: status.bases,
+            mirrored_networking: status.mirrored_networking,
+        }
+    }
+}
+
 #[tauri::command]
-pub async fn engine_status() -> CommandResult<EngineStatus> {
-    let (state, mirrored_networking) =
-        blocking(|| Ok((supervisor::status()?, docklet_wsl::mirrored_networking()))).await?;
-    Ok(EngineStatus {
-        state,
-        bases: engine::bases(),
-        mirrored_networking,
-    })
+pub async fn engine_status(app: AppHandle) -> CommandResult<EngineStatus> {
+    let status = blocking(move || supervisor::status(&app)).await?;
+    Ok(status.into())
 }
 
 /// Installs the distro, reporting each step through `progress`.
@@ -84,8 +89,8 @@ pub async fn engine_stop(app: AppHandle) -> CommandResult<()> {
 }
 
 #[tauri::command]
-pub async fn events_watch(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
-    state.streams.watch_events(&app);
+pub async fn events_watch(app: AppHandle) -> CommandResult<()> {
+    streams::watch_events(&app);
     Ok(())
 }
 
@@ -152,16 +157,16 @@ pub async fn open_port(port: u16) -> CommandResult<()> {
 /// log ended. Returns a token for `logs_stop`.
 #[tauri::command]
 pub async fn logs_start(
-    state: State<'_, AppState>,
+    app: AppHandle,
     id: String,
     output: Channel<LogMessage>,
 ) -> CommandResult<u32> {
-    Ok(state.streams.follow_logs(client()?, id, output))
+    Ok(streams::follow_logs(&app, client()?, id, output))
 }
 
 #[tauri::command]
 pub async fn logs_stop(state: State<'_, AppState>, token: u32) -> CommandResult<()> {
-    state.streams.stop_logs(token);
+    state.backend.streams().stop_logs(token);
     Ok(())
 }
 

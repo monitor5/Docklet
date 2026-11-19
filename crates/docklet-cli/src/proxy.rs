@@ -6,6 +6,7 @@ use std::io;
 mod imp {
     use crate::failure::Failure;
     use docklet_core::ProxyMode;
+    use docklet_core::idle::ProxyReport;
     use docklet_proxy::{PipeProxyConfig, RelayCommand, control};
     use std::io;
     use std::time::{Duration, Instant};
@@ -40,6 +41,16 @@ mod imp {
     /// Stops the proxy and waits for it to exit. True when none is left.
     pub fn stop() -> bool {
         control::stop()
+    }
+
+    /// Asks the idle-stop proxy what its connections are doing. `None` when
+    /// it did not answer within two seconds or the answer cannot be read.
+    pub fn report(data_dir: &std::path::Path) -> Option<ProxyReport> {
+        if !control::request_report(Duration::from_secs(2)) {
+            return None;
+        }
+        let bytes = std::fs::read(docklet_core::idle::report_path(data_dir)).ok()?;
+        ProxyReport::parse(&String::from_utf8_lossy(&bytes))
     }
 
     /// `docklet proxy [--trace] [--byte]`: runs the proxy in the foreground,
@@ -82,12 +93,16 @@ mod imp {
         true
     }
 
+    pub fn report(_data_dir: &std::path::Path) -> Option<docklet_core::idle::ProxyReport> {
+        None
+    }
+
     pub fn serve(_trace: bool, _byte_mode: bool) -> Result<(), Failure> {
         Err(Failure::failed("the docklet engine only runs on Windows"))
     }
 }
 
-pub use imp::{ensure_running, is_running, mode, serve, stop};
+pub use imp::{ensure_running, is_running, mode, report, serve, stop};
 
 /// One Docker API request through the pipe. An idle-stop proxy starts the
 /// engine for it if it is asleep. Blocks until Docker answers.
