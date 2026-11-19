@@ -11,7 +11,8 @@ Desktop required.
 ## What works today
 
 - **CLI** (`docklet.exe`): `up`, `status`, `wait`, `doctor`, `bases`, `install`,
-  `start`, `stop`, `uninstall --yes`, `docker <args...>`, `config get|set`,
+  `start`, `stop`, `uninstall --yes`, `base`, `base set <name> --yes`,
+  `wslconfig status|apply|revert`, `docker <args...>`, `config get|set`,
   `cli setup`, `skills status|install|uninstall`, `version`. `docklet up`
   installs, starts and sets up the Docker CLI in one step; `docklet docker ...`
   runs the Windows `docker` CLI against the engine without a path or a context.
@@ -44,8 +45,8 @@ Desktop required.
 
 ## How it works
 
-- **Engine**: a dedicated WSL2 distro named `docklet` (by default Debian 13 +
-  docker-ce, systemd; see [Engine bases](#engine-bases)). Your other distros are
+- **Engine**: a dedicated WSL2 distro named `docklet` (by default Alpine with
+  Docker from its packages; see [Engine bases](#engine-bases)). Your other distros are
   never touched; removing it is `wsl --unregister docklet`.
 - **Connection**: a named pipe `\\.\pipe\docklet_engine`, restricted to the current
   user, relayed into the distro's `/var/run/docker.sock`. The GUI and the Windows

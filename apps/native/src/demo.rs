@@ -151,7 +151,7 @@ const IMAGES: [&str; 5] = [
     "redis:8",
     "python:3.14-slim",
 ];
-const BASES: [&str; 3] = ["debian-13", "ubuntu-26.04", "alpine"];
+const BASES: [&str; 3] = ["alpine", "debian-13", "ubuntu-26.04"];
 const MB: u64 = 1_000_000;
 
 fn containers() -> Vec<Container> {

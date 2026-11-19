@@ -193,9 +193,8 @@ pub fn cpu_percent(previous: &CpuSample, current: &CpuSample, logical_cpus: u32)
     Some((used as f64 / available * 100.0).clamp(0.0, 100.0))
 }
 
-/// The image names of Docklet's own programs: the CLI, the native app, and
-/// the name the app had while it was a WebView.
-const DOCKLET_PROGRAMS: [&str; 3] = ["docklet.exe", "docklet-native.exe", "docklet-desktop.exe"];
+/// The image names of Docklet's own programs: the CLI and the app.
+const DOCKLET_PROGRAMS: [&str; 2] = ["docklet.exe", "docklet-native.exe"];
 
 /// Docklet's processes: its programs, everything they started (the pipe
 /// proxy, relays, consoles), and `wsl.exe` processes that
@@ -1135,8 +1134,8 @@ mod tests {
         let processes = [
             process(1, 0, "explorer.exe", 1),
             process(10, 1, "docklet-native.exe", 10),
-            process(11, 10, "msedgewebview2.exe", 11),
-            process(12, 11, "msedgewebview2.exe", 12),
+            process(11, 10, "cmd.exe", 11),
+            process(12, 11, "cmd.exe", 12),
             process(20, 1, "DOCKLET.EXE", 20),
             process(21, 20, "wsl.exe", 21),
             process(22, 21, "conhost.exe", 22),

@@ -12,7 +12,8 @@ use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use docklet_core::{EngineState, ProxyMode, engine};
+use docklet_core::settings::{self, WslconfigMode};
+use docklet_core::{EngineState, ProxyMode, engine, wslconfig_file};
 use docklet_wsl::{Engine, RootfsSource};
 
 /// A change of engine state that takes a while.
@@ -187,11 +188,50 @@ impl EngineHost for SystemHost {
     }
 
     fn install(&self, base: &str, progress: &mut dyn FnMut(&str)) -> io::Result<()> {
-        Engine::system()?.install(&RootfsSource::Base(base.to_string()), progress)
+        Engine::system()?.install(&RootfsSource::Base(base.to_string()), progress)?;
+        light_vm_settings(progress);
+        Ok(())
     }
 
     fn mirrored_networking(&self) -> bool {
         docklet_wsl::mirrored_networking()
+    }
+}
+
+/// Adds Docklet's light keys to the user's `.wslconfig` after an install, as
+/// `docklet install` does, unless the `wslconfig` setting is `keep`. The
+/// file belongs to the user and the engine works without the keys, so a
+/// refusal or an error is reported as a progress line and never fails the
+/// install. Nothing restarts WSL: the keys count from its next start.
+fn light_vm_settings(progress: &mut dyn FnMut(&str)) {
+    let applied = docklet_wsl::data_dir().and_then(|dir| {
+        let (settings, _) = settings::load(&dir)?;
+        if settings.wslconfig == WslconfigMode::Keep {
+            return Ok(None);
+        }
+        let paths = docklet_wsl::wslconfig_paths()?;
+        wslconfig_file::apply(&paths, &settings.wslconfig_entries()).map(Some)
+    });
+    match applied {
+        Ok(None) => {}
+        Ok(Some(outcome)) => {
+            if let Some(line) = light_vm_line(outcome.changed, outcome.refused.as_deref()) {
+                progress(&line);
+            }
+        }
+        Err(err) => progress(&format!(".wslconfig was left as it is: {err}")),
+    }
+}
+
+/// The progress line for what happened to `.wslconfig`, if anything did.
+fn light_vm_line(changed: bool, refused: Option<&str>) -> Option<String> {
+    match refused {
+        Some(reason) => Some(format!(".wslconfig was left as it is: {reason}")),
+        None if changed => Some(
+            "Light WSL settings written to .wslconfig (Linux GUI apps off in every distro);              they count from the next WSL start. Undo: docklet wslconfig revert"
+                .to_string(),
+        ),
+        None => None,
     }
 }
 
@@ -321,6 +361,18 @@ impl EngineControl {
 
 #[cfg(test)]
 pub(crate) mod testing {
+    #[test]
+    fn the_install_only_mentions_wslconfig_when_something_happened() {
+        assert_eq!(super::light_vm_line(false, None), None);
+        assert!(
+            super::light_vm_line(true, None)
+                .unwrap()
+                .contains("docklet wslconfig revert")
+        );
+        let refused = super::light_vm_line(false, Some("the file is read-only")).unwrap();
+        assert!(refused.ends_with("the file is read-only"));
+    }
+
     use std::sync::Mutex;
 
     use super::*;
