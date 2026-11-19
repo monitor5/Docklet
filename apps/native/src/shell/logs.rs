@@ -2,11 +2,13 @@
 //! line, and the view's window procedure.
 //!
 //! A timer asks the log for news about 12 times a second. A tick on which
-//! nothing arrived costs a comparison; one that brought lines repaints,
-//! and the view then draws only the lines that are new. What a frame costs
-//! decides how soon the next one may follow, so drawing keeps to a few
-//! percent of a processor however fast the log runs. The timer runs only
-//! while the log is open and the window is shown and not minimised.
+//! nothing arrived costs a comparison; one that brought lines draws the
+//! lines that are new and repaints the part of the view they changed.
+//! What a frame costs decides how soon the next one may follow, and none
+//! follows sooner than a quarter of a second, so a slow log costs what its
+//! lines cost and a fast one keeps to a few percent of a processor. The
+//! timer runs only while the log is open and the window is shown and not
+//! minimised.
 
 use std::time::Instant;
 
@@ -34,9 +36,9 @@ use crate::host::ctx;
 use crate::win::{control_down, high_word, low_word, point_of, set_text, shift_down, text_of};
 
 pub(super) const LOG_TIMER: usize = 1;
-/// The view looks for new lines this often, and repaints at most this
-/// often. A frame that replaced the whole page holds the next one back
-/// (`log_view::pause_after`); one that scrolled a few lines in does not.
+/// The view looks for new lines this often. A frame holds the next one
+/// back for three ticks, and for longer the more it cost
+/// (`log_view::pause_after`).
 const FRAME_MS: u32 = 80;
 /// The status line and the scroll bar are controls that repaint when they
 /// are told something new; they are told every this many ticks.
@@ -154,12 +156,14 @@ impl Shell {
         }
     }
 
-    /// Takes in what the source has that the view has not seen. Repaints
-    /// only if that changed the lines on screen: a view that does not
-    /// follow stays as it is while lines pile up below it.
+    /// Takes in what the source has that the view has not seen. Draws and
+    /// repaints only if that changed the lines on screen, and then only
+    /// the part of the view that changed: a view that does not follow
+    /// stays as it is while lines pile up below it.
     fn log_frame(&self) {
         if self.log.poll() {
-            crate::win::invalidate(self.log.hwnd);
+            self.log
+                .refresh(&self.theme(), &self.fonts(), self.dpi.get());
         }
     }
 

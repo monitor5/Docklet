@@ -1,21 +1,18 @@
 //! The lines of a followed log, for a shell that paints only the lines in
 //! view.
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::format::format_count;
 use crate::streams::LogMessage;
 
 /// Lines kept in memory per log view; older lines are dropped.
 pub const LOG_BUFFER_CAP: usize = 50_000;
 
-/// A bounded buffer of log lines. Lives on the UI thread; the batches
-/// arrive as `LogMessage`s.
+/// A bounded buffer of log lines, as the container wrote them, colour
+/// codes included. A view reads it through a [`SharedLog`].
 ///
-/// To paint: ask for `len`, then for `display_line` of each index in view.
-/// Paint again when `generation` differs from the one last painted.
+/// `generation` changes with everything a view repaints for.
 /// `first_index + index` numbers a line for good, so a view that is not at
 /// the bottom can stay on the same lines while older ones are dropped.
 #[derive(Debug)]
@@ -72,14 +69,9 @@ impl LogBuffer {
     }
 
     /// The line at `index` as the container wrote it, colour codes
-    /// included: what to copy to the clipboard.
+    /// included.
     pub fn line(&self, index: usize) -> Option<&str> {
         self.lines.get(index).map(String::as_str)
-    }
-
-    /// The line at `index` without ANSI sequences: what to paint.
-    pub fn display_line(&self, index: usize) -> Option<Cow<'_, str>> {
-        self.line(index).map(strip_ansi)
     }
 
     /// Appends lines, without a line ending they may still carry, and drops
@@ -130,18 +122,6 @@ impl LogBuffer {
     /// Why the log ended, if it did not simply end with its container.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
-    }
-
-    /// The line under the log's title: `12,345 lines · log ended`.
-    pub fn status(&self) -> String {
-        let count = self.len();
-        let lines = if count == 1 { "line" } else { "lines" };
-        let ending = match (self.ended, &self.error) {
-            (false, _) => "",
-            (true, None) => " · log ended",
-            (true, Some(_)) => " · log stopped",
-        };
-        format!("{} {lines}{ending}", format_count(count))
     }
 }
 
@@ -226,50 +206,6 @@ impl LogSource for SharedLog {
             visit(start + index as u64, line);
         }
     }
-}
-
-/// Removes CSI sequences such as colours (`ESC [ 32 m`): the escape
-/// character, `[`, parameter bytes, intermediate bytes and a final byte.
-pub fn strip_ansi(line: &str) -> Cow<'_, str> {
-    const ESCAPE: u8 = 0x1b;
-    if !line.as_bytes().contains(&ESCAPE) {
-        return Cow::Borrowed(line);
-    }
-    let bytes = line.as_bytes();
-    let mut text = String::with_capacity(line.len());
-    // Sequences are ASCII, so the text between them is cut at character
-    // boundaries.
-    let (mut kept, mut at) = (0, 0);
-    while at < bytes.len() {
-        match (bytes[at] == ESCAPE).then(|| csi_end(bytes, at)).flatten() {
-            Some(end) => {
-                text.push_str(&line[kept..at]);
-                kept = end;
-                at = end;
-            }
-            None => at += 1,
-        }
-    }
-    text.push_str(&line[kept..]);
-    Cow::Owned(text)
-}
-
-/// Where the CSI sequence that starts with the escape character at `start`
-/// ends, if one starts there.
-fn csi_end(bytes: &[u8], start: usize) -> Option<usize> {
-    if bytes.get(start + 1) != Some(&b'[') {
-        return None;
-    }
-    let skip = |from: usize, wanted: fn(u8) -> bool| {
-        let run = bytes[from..].iter().take_while(|&&byte| wanted(byte));
-        from + run.count()
-    };
-    let parameters = skip(start + 2, |byte| {
-        byte.is_ascii_digit() || matches!(byte, b';' | b'?')
-    });
-    let intermediates = skip(parameters, |byte| (b' '..=b'/').contains(&byte));
-    let last = *bytes.get(intermediates)?;
-    (b'@'..=b'~').contains(&last).then_some(intermediates + 1)
 }
 
 #[cfg(test)]
@@ -365,22 +301,19 @@ mod tests {
     #[test]
     fn says_how_a_log_ended() {
         let mut buffer = LogBuffer::with_cap(5000);
-        assert_eq!(buffer.status(), "0 lines");
         buffer.append(lines(&["a"]));
-        assert_eq!(buffer.status(), "1 line");
-        buffer.append((0..1233).map(|index| index.to_string()));
-        assert_eq!(buffer.status(), "1,234 lines");
+        assert!(!buffer.ended());
         buffer.apply(LogMessage::Ended { error: None });
         assert!(buffer.ended());
         assert_eq!(buffer.error(), None);
-        assert_eq!(buffer.status(), "1,234 lines · log ended");
+        assert_eq!(buffer.len(), 1);
 
         let mut failed = LogBuffer::new();
         failed.apply(LogMessage::Ended {
             error: Some("no such container".to_string()),
         });
+        assert!(failed.ended());
         assert_eq!(failed.error(), Some("no such container"));
-        assert_eq!(failed.status(), "0 lines · log stopped");
     }
 
     fn visited(log: &SharedLog, first: u64, count: usize) -> Vec<(u64, String)> {
@@ -414,47 +347,6 @@ mod tests {
         assert_ne!(log.generation(), before);
         assert_eq!(log.bounds(), (0, 1));
         assert!(log.read(LogBuffer::ended));
-        assert_eq!(log.read(LogBuffer::status), "1 line · log ended");
-    }
-
-    #[test]
-    fn removes_colour_codes() {
-        assert_eq!(strip_ansi("\u{1b}[32mok\u{1b}[0m done"), "ok done");
-    }
-
-    #[test]
-    fn leaves_plain_text_alone() {
-        let line = "plain [1] text";
-        assert!(matches!(strip_ansi(line), Cow::Borrowed(text) if text == line));
-    }
-
-    #[test]
-    fn removes_sequences_with_parameters_and_intermediates() {
-        assert_eq!(strip_ansi("\u{1b}[1;38;5;208mwarn\u{1b}[m"), "warn");
-        assert_eq!(strip_ansi("a\u{1b}[?25lb\u{1b}[2Kc"), "abc");
-        assert_eq!(strip_ansi("a\u{1b}[0 qb"), "ab");
-    }
-
-    #[test]
-    fn keeps_what_is_not_a_complete_sequence() {
-        // An escape character without `[`, and a sequence cut off by the
-        // end of the line.
-        assert_eq!(strip_ansi("a\u{1b}b"), "a\u{1b}b");
-        assert_eq!(strip_ansi("tail\u{1b}[3"), "tail\u{1b}[3");
-        assert_eq!(strip_ansi("\u{1b}"), "\u{1b}");
-    }
-
-    #[test]
-    fn keeps_text_that_is_not_ascii() {
-        assert_eq!(strip_ansi("\u{1b}[31m오류\u{1b}[0m ✓"), "오류 ✓");
-    }
-
-    #[test]
-    fn the_painted_line_has_no_codes_and_the_kept_one_has() {
-        let mut buffer = LogBuffer::with_cap(2);
-        buffer.append(lines(&["\u{1b}[32mok\u{1b}[0m"]));
-        assert_eq!(buffer.display_line(0).as_deref(), Some("ok"));
-        assert_eq!(buffer.line(0), Some("\u{1b}[32mok\u{1b}[0m"));
-        assert_eq!(buffer.display_line(1), None);
+        assert_eq!(log.read(LogBuffer::len), 1);
     }
 }

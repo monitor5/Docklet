@@ -128,6 +128,11 @@ pub(crate) struct Shell {
     /// A line whose box was clicked: told to screen readers when the table
     /// that shows the change arrives.
     announce: Cell<Option<LineKey>>,
+    /// Per tab, the width of each column whose divider the user dragged,
+    /// in pixels at the window's DPI. They go with the window.
+    fixed_widths: RefCell<Vec<Vec<Option<i32>>>>,
+    /// A divider of the list's header is being dragged.
+    dragging: Cell<bool>,
 
     log_title: HWND,
     log_status: HWND,
@@ -235,6 +240,8 @@ fn create() {
         table: TableView::create(hwnd, ids::LIST),
         keys: RefCell::new(Vec::new()),
         announce: Cell::new(None),
+        fixed_widths: RefCell::new(Vec::new()),
+        dragging: Cell::new(false),
         log_title: static_text(SS_CENTERIMAGE | SS_ENDELLIPSIS),
         log_status: static_text(SS_RIGHT | SS_CENTERIMAGE | SS_ENDELLIPSIS),
         log_jump: button("Jump to end", ids::LOG_JUMP),
@@ -545,8 +552,9 @@ impl Shell {
             self.banner_rect.set(RECT::default());
         }
         if has_usage {
+            let font = self.fonts().ui;
             self.usage
-                .layout(margin, y, width - 2 * margin, px(40), dpi);
+                .layout(margin, y, width - 2 * margin, px(40), dpi, font);
             y += px(40) + px(8);
         }
 
@@ -582,7 +590,7 @@ impl Shell {
             width - 2 * margin,
             height - body - margin,
         );
-        self.table.fit_columns(dpi);
+        self.fit_table();
 
         // Log: title, status and buttons above the view.
         let y = top;
@@ -688,7 +696,10 @@ impl Shell {
     pub(crate) fn usage_changed(&self) {
         // A meter that changed draws itself; only another number of meters
         // moves anything else.
-        let resized = self.usage.set(&ctx().model.borrow().usage);
+        let font = self.fonts().ui;
+        let resized = self
+            .usage
+            .set(&ctx().model.borrow().usage, font, self.dpi.get());
         if resized {
             self.apply_visibility();
             self.layout();
@@ -825,7 +836,8 @@ impl Shell {
     }
 
     fn on_dpi_changed(&self, dpi: u32, suggested: &RECT) {
-        self.dpi.set(Dpi(dpi));
+        let before = self.dpi.replace(Dpi(dpi));
+        self.scale_fixed_widths(before, Dpi(dpi));
         self.apply_fonts();
         // SAFETY: `hwnd` is this window.
         unsafe {
@@ -1034,6 +1046,7 @@ unsafe extern "system" fn main_proc(
             }
         }
         WM_TIMER if wparam.0 == logs::LOG_TIMER => shell.on_log_timer(),
+        tables::WM_DIVIDER_DRAGGED => shell.divider_dragged(wparam.0),
         WM_MOUSEWHEEL if shell.log_open.get() => {
             // The wheel goes to the focused window; the log takes it from
             // anywhere in its page.

@@ -12,12 +12,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, SelectObject, SetTextColor};
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT,
-    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, HDN_ITEMSTATEICONCLICK,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, HDI_WIDTH, HDN_BEGINTRACKW,
+    HDN_DIVIDERDBLCLICKW, HDN_ENDTRACKW, HDN_ITEMCHANGINGW, HDN_ITEMSTATEICONCLICK,
     LIST_VIEW_ITEM_STATE_FLAGS, LVFI_PARTIAL, LVFI_STRING, LVIF_INDENT, LVIF_STATE, LVIF_TEXT,
     LVIS_STATEIMAGEMASK, LVITEMW, LVM_ENSUREVISIBLE, LVN_COLUMNCLICK, LVN_GETDISPINFOW,
-    LVN_ITEMACTIVATE, LVN_ODFINDITEMW, LVN_SETDISPINFOW, NM_CLICK, NM_CUSTOMDRAW, NMCUSTOMDRAW,
-    NMCUSTOMDRAW_DRAW_STAGE, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW,
-    NMLVFINDITEMW, TCN_SELCHANGE,
+    LVN_ITEMACTIVATE, LVN_ODFINDITEMW, LVN_SETDISPINFOW, NM_CLICK, NM_CUSTOMDRAW,
+    NM_RELEASEDCAPTURE, NMCUSTOMDRAW, NMCUSTOMDRAW_DRAW_STAGE, NMHDR, NMHEADERW, NMITEMACTIVATE,
+    NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMLVFINDITEMW, TCN_SELCHANGE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SetFocus, VK_DELETE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE,
@@ -25,15 +26,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DLGC_WANTALLKEYS, DestroyMenu, GetWindowRect, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CHAR,
-    WM_GETDLGCODE, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY, WM_NOTIFY,
+    MF_SEPARATOR, MF_STRING, PostMessageW, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
+    WM_CHAR, WM_GETDLGCODE, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCDESTROY, WM_NOTIFY,
 };
 use windows::core::PCWSTR;
 
 use super::{Shell, ids};
 use crate::boundary::{Line, RowFlags, Table, UiEvent};
 use crate::host::ctx;
-use crate::widgets::columns::Pressed;
+use crate::widgets::columns::{Pressed, fix_after_drag};
+
+/// Posted to the main window when a divider of the list's header was let
+/// go; `wparam` is the column at its left.
+pub(super) const WM_DIVIDER_DRAGGED: u32 = WM_APP + 20;
+/// The narrowest a divider can make a column, in device-independent
+/// pixels: enough to find the divider again.
+const LEAST_COLUMN: i32 = 40;
 use crate::widgets::lines::{self, LineKey};
 use crate::widgets::selection_bar::BarButtons;
 use crate::widgets::table::TableView;
@@ -191,7 +199,7 @@ impl Shell {
         self.table.build_columns(table, dpi, self.fonts().ui);
         self.table.set_count(count);
         // After the count: a vertical scroll bar may have come or gone.
-        self.table.fit_columns(dpi);
+        self.fit_table();
         match focused {
             Some(index) => self.table.focus_item(index, false),
             None if count > 0 && self.table.focused().is_none_or(|focused| focused >= count) => {
@@ -211,6 +219,123 @@ impl Shell {
         self.sync_bar();
         if let Some(index) = announce {
             self.table.announce_state(index);
+        }
+    }
+
+    /// Lays the list's columns out in its width, around the widths the
+    /// user set on this tab.
+    pub(super) fn fit_table(&self) {
+        // Not under a divider that is being dragged: the list has that
+        // column where the pointer is, and a table that arrives meanwhile
+        // must not pull it back. It is laid out when the divider is let go.
+        if self.dragging.get() {
+            return;
+        }
+        let fixed = {
+            let fixed = self.fixed_widths.borrow();
+            fixed.get(self.tab.get()).cloned().unwrap_or_default()
+        };
+        self.table.fit_columns(self.dpi.get(), &fixed);
+    }
+
+    /// Whether the divider at the right of column `column` can be dragged:
+    /// that of a column that shows, the buttons' column not among them.
+    fn divider_moves(&self, column: usize) -> bool {
+        column < self.table.data_columns() && self.table.column_width(column) > 0
+    }
+
+    /// What the list's header says about a divider. Returns the answer if
+    /// the list is not to see the notification.
+    fn header_divider(&self, notice: &NMHEADERW) -> Option<LRESULT> {
+        let column = usize::try_from(notice.iItem).ok()?;
+        match notice.hdr.code {
+            HDN_BEGINTRACKW => {
+                if !self.divider_moves(column) {
+                    // Refused: the drag does not begin.
+                    return Some(LRESULT(1));
+                }
+                self.dragging.set(true);
+            }
+            HDN_ITEMCHANGINGW if self.dragging.get() => {
+                // SAFETY: when not null, the notification's item is valid
+                // for as long as the notification lasts.
+                let item = unsafe { notice.pitem.as_ref() }?;
+                let least = self.dpi.get().px(LEAST_COLUMN);
+                if item.mask.0 & HDI_WIDTH.0 != 0 && item.cxy < least {
+                    // Refused: the column stays as wide as it was.
+                    return Some(LRESULT(1));
+                }
+            }
+            HDN_ENDTRACKW => self.divider_let_go(column),
+            HDN_DIVIDERDBLCLICKW => {
+                if !self.divider_moves(column) {
+                    return Some(LRESULT(0));
+                }
+                // The list makes the column as wide as what is in it; that
+                // is a width the user set like any other.
+                self.divider_let_go(column);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The drag of the divider right of `column` is over. The list takes
+    /// in the last width after this notification; what follows from it is
+    /// done from a message of its own, once the header is done with the
+    /// mouse.
+    fn divider_let_go(&self, column: usize) {
+        self.dragging.set(false);
+        // SAFETY: posting to this thread's own window.
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_DIVIDER_DRAGGED,
+                WPARAM(column),
+                LPARAM(0),
+            );
+        }
+    }
+
+    /// The header let go of the mouse. A drag that ended without saying so
+    /// (the window lost the mouse to something else) is over all the same.
+    fn header_released(&self) {
+        if self.dragging.get() {
+            self.divider_let_go(usize::MAX);
+        }
+    }
+
+    /// Keeps the widths a drag of the divider right of `column` set, and
+    /// lays the other columns out around them.
+    pub(super) fn divider_dragged(&self, column: usize) {
+        let count = self.table.data_columns();
+        if column < count {
+            let widths: Vec<i32> = (0..count)
+                .map(|index| self.table.column_width(index))
+                .collect();
+            let least = self.dpi.get().px(LEAST_COLUMN);
+            let most = crate::win::client_rect(self.table.list).right;
+            let tab = self.tab.get();
+            let mut fixed = self.fixed_widths.borrow_mut();
+            if fixed.len() <= tab {
+                fixed.resize_with(tab + 1, Vec::new);
+            }
+            fix_after_drag(&mut fixed[tab], &widths, column, least, most);
+        }
+        self.table.widths_changed_by_hand();
+        self.fit_table();
+        self.table.redraw_all();
+    }
+
+    /// The window moved to a screen of another DPI: the widths the user
+    /// set are in pixels.
+    pub(super) fn scale_fixed_widths(&self, from: crate::win::Dpi, to: crate::win::Dpi) {
+        let scale =
+            |width: i32| (i64::from(width) * i64::from(to.0) / i64::from(from.0.max(1))) as i32;
+        for tab in self.fixed_widths.borrow_mut().iter_mut() {
+            for width in tab.iter_mut().flatten() {
+                *width = scale(*width);
+            }
         }
     }
 
@@ -1022,6 +1147,19 @@ pub(super) unsafe extern "system" fn list_proc(
                 if header.code == HDN_ITEMSTATEICONCLICK {
                     shell.toggle_all();
                     return LRESULT(0);
+                }
+                if matches!(
+                    header.code,
+                    HDN_BEGINTRACKW | HDN_ITEMCHANGINGW | HDN_ENDTRACKW | HDN_DIVIDERDBLCLICKW
+                ) {
+                    // SAFETY: these codes come with an NMHEADERW.
+                    let notice = unsafe { &*(lparam.0 as *const NMHEADERW) };
+                    if let Some(result) = shell.header_divider(notice) {
+                        return result;
+                    }
+                }
+                if header.code == NM_RELEASEDCAPTURE {
+                    shell.header_released();
                 }
                 if header.code == NM_CUSTOMDRAW {
                     // SAFETY: the code says which structure this is.

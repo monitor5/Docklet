@@ -1,11 +1,6 @@
-//! Pulling an image: checking what was typed, and the progress lines.
-
-use std::collections::VecDeque;
+//! Pulling an image: checking what was typed, and what its button says.
 
 use docklet_engine::ImageRef;
-
-/// Progress lines kept while an image is pulled; older ones are dropped.
-pub const PULL_LINES_CAP: usize = 200;
 
 /// Why what was typed cannot be pulled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,109 +39,9 @@ pub fn pull_button_label(pulling: bool) -> &'static str {
     if pulling { "Pulling…" } else { "Pull" }
 }
 
-/// The newest progress lines of a pull, as `<layer> <status> <percent>%`
-/// (see `docklet_engine::progress_line`). Lives on the UI thread.
-#[derive(Debug)]
-pub struct PullProgress {
-    lines: VecDeque<String>,
-    cap: usize,
-    generation: u64,
-}
-
-impl Default for PullProgress {
-    fn default() -> Self {
-        Self::with_cap(PULL_LINES_CAP)
-    }
-}
-
-impl PullProgress {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_cap(cap: usize) -> Self {
-        Self {
-            lines: VecDeque::new(),
-            cap,
-            generation: 0,
-        }
-    }
-
-    /// Appends a progress line, keeping only the newest ones.
-    pub fn push(&mut self, line: String) {
-        self.lines.push_back(line);
-        let excess = self.lines.len().saturating_sub(self.cap);
-        self.lines.drain(..excess);
-        self.generation += 1;
-    }
-
-    /// Empties the lines when another pull starts.
-    pub fn clear(&mut self) {
-        self.lines.clear();
-        self.generation += 1;
-    }
-
-    pub fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    pub fn line(&self, index: usize) -> Option<&str> {
-        self.lines.get(index).map(String::as_str)
-    }
-
-    pub fn lines(&self) -> impl Iterator<Item = &str> {
-        self.lines.iter().map(String::as_str)
-    }
-
-    /// Changes with every line and clear.
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pushed(cap: usize, lines: &[&str]) -> Vec<String> {
-        let mut progress = PullProgress::with_cap(cap);
-        for line in lines {
-            progress.push(line.to_string());
-        }
-        progress.lines().map(str::to_string).collect()
-    }
-
-    #[test]
-    fn keeps_the_newest_lines() {
-        assert_eq!(pushed(2, &["a", "b", "c"]), ["b", "c"]);
-        assert_eq!(pushed(2, &["a"]), ["a"]);
-    }
-
-    #[test]
-    fn keeps_two_hundred_lines_by_default() {
-        let mut progress = PullProgress::new();
-        for index in 0..PULL_LINES_CAP + 5 {
-            progress.push(index.to_string());
-        }
-        assert_eq!(progress.len(), 200);
-        assert_eq!(progress.line(0), Some("5"));
-        assert_eq!(progress.line(199), Some("204"));
-        assert_eq!(progress.line(200), None);
-    }
-
-    #[test]
-    fn clears_for_the_next_pull() {
-        let mut progress = PullProgress::new();
-        progress.push("a".to_string());
-        let before = progress.generation();
-        progress.clear();
-        assert!(progress.is_empty());
-        assert!(progress.generation() > before);
-    }
 
     #[test]
     fn a_reference_is_trimmed() {
