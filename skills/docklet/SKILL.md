@@ -35,13 +35,17 @@ action; see "Idle stop" below.
   supports. Do not assume a command exists if it is not listed.
 - Never run `wsl --unregister`, `wsl --terminate` or `wsl --shutdown` yourself.
   Other WSL distros on the machine belong to the user. Use `docklet` commands.
-- Do not edit `%USERPROFILE%\.wslconfig`.
-- Ask before anything that deletes data (removing the distro, volumes, images
-  or the Kubernetes cluster). `docklet help --json` marks such commands with
-  `deletes_data: true`; they refuse to run without `--yes`
-  (`confirmation_required`). Docker commands that delete data, such as
-  `docklet docker volume rm` or `docklet docker system prune`, need the same
-  care.
+- Do not edit `%USERPROFILE%\.wslconfig`. It configures every WSL distro of
+  the user. Docklet changes it only through its own code (see "Light WSL VM"
+  below); run `docklet wslconfig apply` or `docklet wslconfig revert`, or
+  change the `wslconfig` and `vm-memory` settings, only when the user asks.
+- Ask before anything that deletes data (removing the distro, reinstalling it
+  on another base, volumes, images or the Kubernetes cluster).
+  `docklet help --json` marks such commands with `deletes_data: true`; they
+  refuse to run without `--yes` (`confirmation_required`), and
+  `docklet base set` then says in `data` what would be deleted. Docker
+  commands that delete data, such as `docklet docker volume rm` or
+  `docklet docker system prune`, need the same care.
 - Do not run the hint of `wsl_missing` or `wsl_outdated` yourself. Installing
   or updating WSL needs an administrator and may need a reboot: tell the user.
 - Give commands marked `long_running: true` a timeout of minutes, not seconds.
@@ -77,19 +81,24 @@ before Docker runs (`not_running`, `docker_cli_missing`).
 
 | Command | Purpose | `data` with `--json` |
 | --- | --- | --- |
-| `docklet up [--base NAME]` | Install if needed, start, set up the Docker CLI and context | `state`, `docker_host`, `pipe`, `docker_cli`, `docker_context`, `changed` |
+| `docklet up [--base NAME] [--no-wslconfig]` | Install if needed, write the light WSL VM settings, start, set up the Docker CLI and context | `state`, `docker_host`, `pipe`, `docker_cli`, `docker_context`, `changed`, `wslconfig` |
 | `docklet docker <args...>` | Run `docker.exe` against the Docklet engine. Wakes a sleeping engine; never starts a stopped one | Docker's own output |
-| `docklet status` | Engine state | `state`, `reason`, `ready`, `hint`, `proxy_running`, `idle_stop`, `pipe`, `docker_host`, `distro`, `rootfs_version`, `wsl_version`, `docklet_version`, `mirrored_networking`, `docker_context`, `docker_cli` |
+| `docklet status` | Engine state | `state`, `reason`, `ready`, `hint`, `proxy_running`, `idle_stop`, `pipe`, `docker_host`, `distro`, `rootfs_version`, `wsl_version`, `docklet_version`, `mirrored_networking`, `docker_context`, `docker_cli`, `wslconfig` |
 | `docklet wait [--timeout SECONDS]` | Block until the engine is usable (default 120 s): running, or sleeping. Starts nothing | `state`, `docker_host`, `pipe`, `waited_seconds` |
 | `docklet doctor` | Check the setup; exit 1 if a check fails | `healthy`, `summary`, `checks` |
 | `docklet start` | Start the engine, or wake it, and wait until Docker is ready | `state`, `docker_host`, `pipe` |
 | `docklet stop` | Stop the engine; frees its memory. It stays off until started | `proxy_running` |
-| `docklet config get [<key>]` | Show the settings, or one | `key`, `value`, and `minutes` (`idle-stop`) or `keep_awake` (`watchers-keep-awake`); without a key, `settings` with one such entry each |
-| `docklet config set <key> <value>` | Change a setting: `idle-stop` takes a number of minutes or `off`, `watchers-keep-awake` takes `yes` or `no`. Applies from the next `docklet start` | the same as `config get <key>`, and `applies_from`, `restart_needed` |
-| `docklet install [--base NAME]` | Download and install the engine distro (`up` does this too) | `distro`, `base`, `rootfs_file` |
+| `docklet config get [<key>]` | Show the settings, or one | `key`, `value`, and `minutes` (`idle-stop`), `keep_awake` (`watchers-keep-awake`) or `megabytes` (`vm-memory`); without a key, `settings` with one such entry each |
+| `docklet config set <key> <value>` | Change a setting: `idle-stop` takes a number of minutes or `off`, `watchers-keep-awake` takes `yes` or `no` (both apply from the next `docklet start`); `wslconfig` takes `light` or `keep`, `vm-memory` a size such as `4GB` or `off` (see "Light WSL VM") | the same as `config get <key>`, and `applies_from`, `restart_needed`; for `vm-memory`, `wslconfig` |
+| `docklet install [--base NAME \| --rootfs FILE\|URL --sha256 HASH] [--no-wslconfig]` | Download and install the engine distro (`up` does this too), and write the light WSL VM settings | `distro`, `base`, `rootfs_file`, `wslconfig` |
 | `docklet bases` | Linux bases available for the engine distro | `default`, `bases` |
+| `docklet base` | The base the engine is installed on, and the available ones | `distro_installed`, `installed_base` (`null` when unknown, `custom` for `--rootfs`), `rootfs`, `default`, `bases` |
+| `docklet base set <name> --yes` | Reinstall the engine on another base. Deletes every container, image and volume in it; ask the user first. Without `--yes` it fails with `confirmation_required` and `data` says what would be deleted | `base`, `previous_base`, `changed` |
+| `docklet wslconfig status` | What Docklet wrote to `.wslconfig` and whether the WSL VM uses it | `path`, `setting`, `vm_memory`, `written`, `kept`, `missing`, `effect`, `pending`, `others_running`, `problem` |
+| `docklet wslconfig apply` | Write the light WSL VM settings; keys the user set are kept. Only when the user asks | `path`, `result`, `reason`, `keys`, `effect`, `undo` |
+| `docklet wslconfig revert` | Remove what Docklet wrote to `.wslconfig`. Only when the user asks | the same as `apply`, and `restored`, `deleted` |
 | `docklet cli setup` | Install the Windows `docker` CLI and Compose if missing, create the `docklet` Docker context (`up` does this too) | `docker_host`, `docker_cli`, `docker_context`, `changed` |
-| `docklet uninstall --yes` | Delete the engine distro and all its data. Ask the user first | `distro` |
+| `docklet uninstall --yes` | Delete the engine distro and all its data, and take Docklet's keys out of `.wslconfig`. Ask the user first | `distro`, `wslconfig` |
 | `docklet skills status` | Show whether this skill is registered and current | `agents` |
 | `docklet skills install` | Register or update this skill for AI agents | `agents` |
 | `docklet skills uninstall` | Remove this skill | `agents` |
@@ -108,7 +117,8 @@ first word of the output is the same state, written with a hyphen
 `fail`), `detail`, and `fix` (a command) when there is one. The checks are
 `wsl`, `distro_installed`, `distro_running`, `dockerd`, `pipe_proxy`,
 `docker_cli`, `compose_plugin`, `docker_context`, `mirrored_networking`,
-`disk_space` and `idle_stop`. `idle_stop` says what keeps the engine awake and
+`wslconfig`, `disk_space` and `idle_stop`. `wslconfig` never fails and has no
+`fix`; see "Light WSL VM". `idle_stop` says what keeps the engine awake and
 names the client program, or which watchers wait while it sleeps; it never
 fails. They are in the order problems have to be solved, so apply the
 first `fix` and run `doctor` again. A `fail` means Docker does not work until
@@ -148,6 +158,28 @@ then says `sleeping`.
   next `docklet start`; when `restart_needed` is true the engine that is
   running keeps the old setting until `docklet stop`. Do not change a
   setting unless the user asks.
+
+## Light WSL VM
+
+`docklet install` and `docklet up` add `guiApplications=false` under `[wsl2]`
+to `%USERPROFILE%\.wslconfig`, unless `--no-wslconfig` is given or the
+`wslconfig` setting is `keep`. That turns off WSLg (Linux GUI apps) for every
+WSL distro of the user and saves about 390 MB. A key the user set is never
+changed (`keys[].result` is `kept`); everything else in the file stays as it
+was. `docklet uninstall` takes Docklet's keys out again.
+
+- The output's `wslconfig` object says what happened: `result` is `changed`,
+  `unchanged`, `skipped`, `refused` (the file is read-only, a link, or in an
+  encoding Docklet cannot write back; `reason` says which) or `failed`.
+- WSL reads the file when its VM starts. `effect` is `in_effect`, `pending`
+  (the VM started before the change), `next_wsl_start` or `unknown`.
+  `status --json` reports the same under `wslconfig`, with `pending: true`
+  for "light settings written but not yet in effect".
+- When it is `pending`, tell the user. Never run `wsl --shutdown` yourself:
+  it stops every distro of the user. With only Docklet's distro running,
+  `docklet stop`, a minute's wait and `docklet start` are enough.
+- `docklet config set vm-memory 4GB` caps the VM's memory; it limits every
+  distro, so set it only when the user asks.
 
 ## Error codes
 

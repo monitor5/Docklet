@@ -1,4 +1,5 @@
-# Bases the docklet rootfs is built for. The first entry is the default.
+# Bases the docklet rootfs is built for. The first entry is the default for a
+# new install; an existing install keeps its base until `docklet base set`.
 #
 # Columns: name, recipe, base image, then optional KEY=VALUE build arguments.
 # The recipe is a stage in distro/Dockerfile that says how the base is built:
@@ -8,6 +9,6 @@
 #        command starts dockerd (distro/apk/docklet-boot).
 #
 # name          recipe  base image          build arguments
+alpine          apk     alpine:3.24
 debian-13       apt     debian:trixie-slim  DOCKER_REPO=debian DOCKER_SUITE=trixie
 ubuntu-26.04    apt     ubuntu:26.04        DOCKER_REPO=ubuntu DOCKER_SUITE=resolute
-alpine          apk     alpine:3.24

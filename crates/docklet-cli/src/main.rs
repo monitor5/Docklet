@@ -9,6 +9,7 @@
 //! - `commands`: what each command does.
 //! - `failure`: error codes and the JSON envelope.
 //! - `json`: the JSON writer.
+//! - `wslconfig`: what the commands do to `.wslconfig`, and how they say so.
 
 mod args;
 mod catalog;
@@ -18,6 +19,7 @@ mod failure;
 mod json;
 mod proxy;
 mod status;
+mod wslconfig;
 
 use std::process::ExitCode;
 

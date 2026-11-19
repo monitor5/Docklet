@@ -65,6 +65,7 @@ pub struct Entry {
 
 const ENGINE: &str = "Engine";
 const SETTINGS: &str = "Settings";
+const WSL_VM: &str = "WSL VM";
 const DOCKER: &str = "Docker client";
 const SKILL: &str = "Agent skill";
 const OTHER: &str = "Other";
@@ -78,12 +79,31 @@ const BASE: Arg = Arg {
     help: None,
 };
 
+const NO_WSLCONFIG: Arg = Arg {
+    name: crate::args::NO_WSLCONFIG,
+    value: None,
+    required: false,
+    variadic: false,
+    about: "Leave %USERPROFILE%\\.wslconfig alone this time; `docklet config set wslconfig \
+            keep` makes it permanent",
+    help: None,
+};
+
+const YES: Arg = Arg {
+    name: "--yes",
+    value: None,
+    required: true,
+    variadic: false,
+    about: "Confirms the deletion; without it nothing is deleted",
+    help: None,
+};
+
 pub const COMMANDS: &[Entry] = &[
     Entry {
         group: ENGINE,
         name: "up",
         aliases: &[],
-        args: &[BASE],
+        args: &[BASE, NO_WSLCONFIG],
         about: &[
             "Install if needed, start, and set up the Docker CLI:",
             "one command to a usable engine, safe to repeat",
@@ -111,9 +131,19 @@ pub const COMMANDS: &[Entry] = &[
                 value: Some("FILE"),
                 required: false,
                 variadic: false,
-                about: "Install from a local rootfs.tar.gz instead of downloading a base",
+                about: "Install from a rootfs.tar.gz of your own, a local file or an https:// \
+                        URL, instead of a published base; needs --sha256",
                 help: Some("...or install it from a local rootfs.tar.gz"),
             },
+            Arg {
+                name: "--sha256",
+                value: Some("HASH"),
+                required: false,
+                variadic: false,
+                about: "The SHA-256 the --rootfs file must have; required with --rootfs",
+                help: Some("or an https:// URL, with its SHA-256 (required)"),
+            },
+            NO_WSLCONFIG,
         ],
         about: &["Download and install the docklet distro"],
         deletes_data: false,
@@ -127,6 +157,41 @@ pub const COMMANDS: &[Entry] = &[
         about: &["List the Linux bases available for `install --base`"],
         deletes_data: false,
         long_running: false,
+    },
+    Entry {
+        group: ENGINE,
+        name: "base",
+        aliases: &[],
+        args: &[],
+        about: &["Show the base the engine is installed on"],
+        deletes_data: false,
+        long_running: false,
+    },
+    Entry {
+        group: ENGINE,
+        name: "base set",
+        aliases: &[],
+        args: &[
+            Arg {
+                name: "name",
+                value: None,
+                required: true,
+                variadic: false,
+                about: "The base to reinstall on, one of `docklet bases`",
+                help: None,
+            },
+            Arg {
+                about: "Confirms the deletion; without it nothing is deleted and the command \
+                        says what would be",
+                ..YES
+            },
+        ],
+        about: &[
+            "Reinstall the engine on another base; deletes",
+            "every container, image and volume in it",
+        ],
+        deletes_data: true,
+        long_running: true,
     },
     Entry {
         group: ENGINE,
@@ -175,14 +240,7 @@ pub const COMMANDS: &[Entry] = &[
         group: ENGINE,
         name: "uninstall",
         aliases: &[],
-        args: &[Arg {
-            name: "--yes",
-            value: None,
-            required: true,
-            variadic: false,
-            about: "Confirms the deletion; without it nothing is deleted",
-            help: None,
-        }],
+        args: &[YES],
         about: &[
             "Delete the docklet distro with all containers,",
             "images and volumes (other distros are untouched)",
@@ -233,8 +291,45 @@ pub const COMMANDS: &[Entry] = &[
             "engine after that long without use (default: 10);",
             "it starts again when Docker is used.",
             "watchers-keep-awake <yes|no>: whether a connection",
-            "that carries nothing counts as use (default: no)",
+            "that carries nothing counts as use (default: no).",
+            "wslconfig <light|keep>: whether install and up write",
+            "the light WSL VM settings (default: light).",
+            "vm-memory <size|off>: cap the memory of the WSL VM",
+            "of every distro, such as 4GB (default: off)",
         ],
+        deletes_data: false,
+        long_running: false,
+    },
+    Entry {
+        group: WSL_VM,
+        name: "wslconfig status",
+        aliases: &[],
+        args: &[],
+        about: &[
+            "Show what Docklet wrote to .wslconfig and whether",
+            "the running WSL VM uses it",
+        ],
+        deletes_data: false,
+        long_running: false,
+    },
+    Entry {
+        group: WSL_VM,
+        name: "wslconfig apply",
+        aliases: &[],
+        args: &[],
+        about: &[
+            "Write the light settings to .wslconfig; keys you",
+            "set yourself are kept",
+        ],
+        deletes_data: false,
+        long_running: false,
+    },
+    Entry {
+        group: WSL_VM,
+        name: "wslconfig revert",
+        aliases: &[],
+        args: &[],
+        about: &["Remove what Docklet wrote to .wslconfig"],
         deletes_data: false,
         long_running: false,
     },
@@ -477,6 +572,26 @@ pub const SETTINGS_LIST: &[Setting] = &[
                 goes to sleep, and when its program reconnects only to watch, it waits \
                 without waking the engine. A change applies from the next `docklet start`",
     },
+    Setting {
+        key: "wslconfig",
+        values: "light|keep",
+        default: "light",
+        about: "With `light`, `docklet install` and `docklet up` add guiApplications=false \
+                (and the vm-memory cap, if set) to %USERPROFILE%\\.wslconfig, which turns off \
+                Linux GUI apps (WSLg) for every WSL distro and saves about 390 MB, and \
+                `docklet uninstall` removes them. Keys the user set are never changed. With \
+                `keep` Docklet changes the file only through `docklet wslconfig apply|revert`. \
+                Changing this setting does not change the file",
+    },
+    Setting {
+        key: "vm-memory",
+        values: "<size>|off",
+        default: "off",
+        about: "A memory cap for the WSL VM, such as 4GB, written to .wslconfig as \
+                [wsl2] memory. It limits every WSL distro, not only Docklet's, and large \
+                builds or containers may run out of memory. Written at once unless \
+                `wslconfig` is `keep`; takes effect the next time WSL starts",
+    },
 ];
 
 fn command(entry: &Entry) -> Json {
@@ -624,8 +739,14 @@ Other:
         assert_eq!(rows("config get"), ["config get [<key>]"]);
         assert_eq!(
             rows("install"),
-            ["install [--base NAME]", "        [--rootfs FILE]"]
+            [
+                "install [--base NAME]",
+                "        [--rootfs FILE]",
+                "        [--sha256 HASH]",
+                "        [--no-wslconfig]"
+            ]
         );
+        assert_eq!(rows("base set"), ["base set <name>", "         --yes"]);
         assert_eq!(rows("version"), ["version, -V, --version"]);
         assert_eq!(rows("status"), ["status"]);
     }
@@ -703,6 +824,8 @@ Other:
                 "status",
                 "install",
                 "bases",
+                "base",
+                "base set",
                 "start",
                 "stop",
                 "wait",
@@ -710,6 +833,9 @@ Other:
                 "uninstall",
                 "config get",
                 "config set",
+                "wslconfig status",
+                "wslconfig apply",
+                "wslconfig revert",
                 "docker",
                 "cli setup",
                 "skills status",
@@ -740,12 +866,19 @@ Other:
         assert_eq!(
             install.render(),
             concat!(
-                r#"{"name":"install","usage":"docklet install [--base NAME] [--rootfs FILE]","#,
+                r#"{"name":"install","usage":"docklet install [--base NAME] [--rootfs FILE] "#,
+                r#"[--sha256 HASH] [--no-wslconfig]","#,
                 r#""aliases":[],"arguments":["#,
                 r#"{"name":"--base","kind":"option","value":"NAME","required":false,"#,
                 r#""description":"Linux base of the distro, one of `docklet bases`; the first is the default"},"#,
                 r#"{"name":"--rootfs","kind":"option","value":"FILE","required":false,"#,
-                r#""description":"Install from a local rootfs.tar.gz instead of downloading a base"}],"#,
+                r#""description":"Install from a rootfs.tar.gz of your own, a local file or an "#,
+                r#"https:// URL, instead of a published base; needs --sha256"},"#,
+                r#"{"name":"--sha256","kind":"option","value":"HASH","required":false,"#,
+                r#""description":"The SHA-256 the --rootfs file must have; required with --rootfs"},"#,
+                r#"{"name":"--no-wslconfig","kind":"flag","required":false,"#,
+                r#""description":"Leave %USERPROFILE%\\.wslconfig alone this time; "#,
+                r#"`docklet config set wslconfig keep` makes it permanent"}],"#,
                 r#""description":"Download and install the docklet distro","group":"Engine","#,
                 r#""deletes_data":false,"long_running":true}"#
             )
@@ -783,13 +916,13 @@ Other:
     }
 
     #[test]
-    fn only_uninstall_deletes_data() {
+    fn only_uninstall_and_base_set_delete_data() {
         let deleting: Vec<&str> = COMMANDS
             .iter()
             .filter(|entry| entry.deletes_data)
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(deleting, ["uninstall"]);
+        assert_eq!(deleting, ["base set", "uninstall"]);
         // Whatever deletes data says how it is confirmed.
         for entry in COMMANDS.iter().filter(|entry| entry.deletes_data) {
             assert!(
@@ -813,6 +946,7 @@ Other:
             [
                 "up",
                 "install",
+                "base set",
                 "start",
                 "stop",
                 "wait",

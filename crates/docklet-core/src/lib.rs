@@ -12,6 +12,7 @@ pub mod system;
 pub mod wsl;
 pub mod wsl_output;
 pub mod wslconfig;
+pub mod wslconfig_file;
 
 pub use state::{EngineState, ProxyMode};
 pub use system::system_program;

@@ -10,17 +10,20 @@ use std::time::{Duration, Instant};
 
 use docklet_core::docker_client::{self, ContextState};
 use docklet_core::doctor::{self, Check, EngineFacts, Facts, Level};
+use docklet_core::engine::{Contents, Installed};
 use docklet_core::idle::ProxyReport;
-use docklet_core::settings::{self, IdleStop, Settings, Watchers};
+use docklet_core::settings::{self, IdleStop, MemorySize, Settings, Watchers, WslconfigMode};
 use docklet_core::skills::{self, InstallOutcome, SkillStatus};
+use docklet_core::wslconfig_file;
 use docklet_core::{ProxyMode, disk, engine};
 use docklet_wsl::tools::{self, CONTEXT_NAME, CliSetup};
 use docklet_wsl::{DISTRO, Engine, RootfsSource};
 
-use crate::args::{Command, ConfigChange, ConfigKey, InstallSource, SkillsAction};
+use crate::args::{Command, ConfigChange, ConfigKey, InstallSource, SkillsAction, WslconfigAction};
 use crate::failure::{self, ErrorCode, Failure, Op};
 use crate::json::{Json, Object};
 use crate::status::{self, StatusFacts, StatusView};
+use crate::wslconfig::{self as light, Auto};
 use crate::{catalog, docker, proxy};
 
 /// Where a command's output goes.
@@ -45,6 +48,16 @@ impl Ui {
             println!("{line}");
         }
     }
+
+    /// Result lines on stdout for people, warnings on stderr always.
+    fn lines(&self, lines: &light::Lines) {
+        for line in &lines.out {
+            self.say(line);
+        }
+        for warning in &lines.warnings {
+            eprintln!("docklet: warning: {warning}");
+        }
+    }
 }
 
 pub enum Outcome {
@@ -59,12 +72,18 @@ pub fn run(ui: &Ui, command: Command) -> Result<Outcome, Failure> {
         Command::Help => help(ui),
         Command::Version => version(ui),
         Command::Bases => bases(ui),
+        Command::Base => base(ui)?,
+        Command::BaseSet { name, confirmed } => base_set(ui, &name, confirmed)?,
         Command::Status => status(ui)?,
-        Command::Install(source) => install(ui, source)?,
+        Command::Install {
+            source,
+            no_wslconfig,
+        } => install(ui, source, no_wslconfig)?,
         Command::Start => start(ui)?,
         Command::Stop => stop(ui)?,
         Command::Uninstall => uninstall(ui)?,
-        Command::Up { base } => up(ui, base)?,
+        Command::Up { base, no_wslconfig } => up(ui, base, no_wslconfig)?,
+        Command::Wslconfig(action) => run_wslconfig(ui, action)?,
         Command::Wait { timeout } => wait(ui, timeout)?,
         Command::Doctor => run_doctor(ui)?,
         Command::Docker(args) => return docker::run(&args).map(Outcome::Exit),
@@ -130,6 +149,10 @@ fn status(ui: &Ui) -> Result<Json, Failure> {
     let proxy = proxy::mode();
     let view = StatusView::of(&facts.state(), proxy);
     let mirrored_networking = warn_if_mirrored_networking();
+    let data_dir = docklet_wsl::data_dir()?;
+    let settings = load_settings(&data_dir);
+    let (path, light_status) =
+        light::status(&settings, || docklet_wsl::vm_state(engine.wsl()).ok());
     Ok(status::status_data(
         &view,
         &StatusFacts {
@@ -138,9 +161,176 @@ fn status(ui: &Ui) -> Result<Json, Failure> {
             mirrored_networking,
             context_name: CONTEXT_NAME,
             context_exists: docker_context(home_dir().as_deref()) != ContextState::Missing,
-            docker_cli: docker::find(&docklet_wsl::data_dir()?),
+            docker_cli: docker::find(&data_dir),
+            wslconfig: light::status_data(path.as_deref(), &settings, &light_status),
         },
     ))
+}
+
+/// The settings, or the defaults where the file cannot be read. `config
+/// get` is where problems in the file are reported.
+fn load_settings(data_dir: &Path) -> Settings {
+    settings::load(data_dir)
+        .map(|(settings, _)| settings)
+        .unwrap_or_default()
+}
+
+/// `docklet base`: the installed base and the published ones.
+fn base(ui: &Ui) -> Result<Json, Failure> {
+    let engine = Engine::system()?;
+    let facts = EngineFacts::gather(engine.wsl());
+    if let Some(blocker) = failure::blocker(&facts, ProxyMode::Plain).filter(|blocker| {
+        !matches!(
+            blocker.code,
+            ErrorCode::NotInstalled | ErrorCode::NotRunning
+        )
+    }) {
+        return Err(blocker);
+    }
+    let distro_installed = facts.installed == Some(Ok(true));
+    let installed = distro_installed.then(|| engine.installed()).flatten();
+    let bases = engine::bases();
+    ui.say(&format!(
+        "Installed: {}",
+        match (&installed, distro_installed) {
+            (_, false) => "nothing (the docklet distro is not installed)".to_string(),
+            (Some(Installed::Base(base)), _) => base.clone(),
+            (Some(Installed::Rootfs { location, .. }), _) => format!("custom rootfs ({location})"),
+            (None, true) => {
+                "unknown (installed by an older Docklet; start the engine to read it)".to_string()
+            }
+        }
+    ));
+    ui.say(&format!(
+        "Available: {} (default: {})",
+        bases.join(", "),
+        engine::default_base()
+    ));
+    let (base, rootfs) = match &installed {
+        Some(Installed::Base(base)) => (Some(base.clone()), None),
+        Some(Installed::Rootfs { location, .. }) => {
+            (Some("custom".to_string()), Some(location.clone()))
+        }
+        None => (None, None),
+    };
+    Ok(Object::new()
+        .set("distro_installed", distro_installed)
+        .set("installed_base", base)
+        .set("rootfs", rootfs)
+        .set("default", engine::default_base())
+        .set("bases", bases)
+        .into())
+}
+
+/// The failure of a `base set` without `--yes`: what the reinstall would
+/// delete, as far as it can be counted without starting anything.
+fn base_set_refusal(name: &str, current: Option<&str>, contents: Option<Contents>) -> Failure {
+    let counted = match contents {
+        Some(contents) => format!(
+            "{} {}, {} {} and {} {}",
+            contents.containers,
+            plural(contents.containers, "container", "containers"),
+            contents.images,
+            plural(contents.images, "image", "images"),
+            contents.volumes,
+            plural(contents.volumes, "volume", "volumes"),
+        ),
+        None => "they were not counted because the engine is not running".to_string(),
+    };
+    let from = current
+        .map(|base| format!(" from {base}"))
+        .unwrap_or_default();
+    let data = Object::new()
+        .set("current_base", current)
+        .set("new_base", name)
+        .set("counted", contents.is_some())
+        .set("containers", contents.map(|c| c.containers))
+        .set("images", contents.map(|c| c.images))
+        .set("volumes", contents.map(|c| c.volumes));
+    Failure::new(
+        ErrorCode::ConfirmationRequired,
+        format!(
+            "`base set` reinstalls the docklet distro{from} on {name}, which deletes every \
+             container, image and volume in it ({counted}); pass --yes to confirm"
+        ),
+    )
+    .hint_owned(format!("docklet base set {name} --yes"))
+    .with_data(data.into())
+}
+
+fn plural(count: u64, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
+}
+
+/// `docklet base set NAME [--yes]`.
+///
+/// Carrying images or volumes across is not offered: it would mean saving
+/// everything to Windows and loading it into the new engine, gigabytes
+/// that can fail half-way; `docker save` and a volume backup container do
+/// it by hand, for what is worth keeping.
+fn base_set(ui: &Ui, name: &str, confirmed: bool) -> Result<Json, Failure> {
+    if !engine::bases().contains(&name) {
+        return Err(Failure::new(
+            ErrorCode::UnknownBase,
+            format!(
+                "unknown base `{name}`; available: {}",
+                engine::bases().join(", ")
+            ),
+        )
+        .hint("docklet bases"));
+    }
+    let engine = Engine::system()?;
+    let facts = EngineFacts::gather(engine.wsl());
+    match failure::blocker(&facts, ProxyMode::Plain) {
+        Some(blocker) if blocker.code == ErrorCode::NotInstalled => {
+            return Err(Failure::new(
+                ErrorCode::NotInstalled,
+                format!("the docklet distro is not installed; `docklet install --base {name}` installs it"),
+            )
+            .hint_owned(format!("docklet install --base {name}")));
+        }
+        Some(blocker) if blocker.code != ErrorCode::NotRunning => return Err(blocker),
+        _ => {}
+    }
+    let current = engine.installed();
+    let current_name = current
+        .as_ref()
+        .map(|installed| installed.name().to_string());
+    if current == Some(Installed::Base(name.to_string())) {
+        ui.say(&format!(
+            "The engine is already installed on {name}; nothing to do."
+        ));
+        return Ok(Object::new()
+            .set("base", name)
+            .set("previous_base", name)
+            .set("changed", false)
+            .into());
+    }
+    if !confirmed {
+        // Counting asks dockerd, which only a running distro may be asked:
+        // a sleeping engine is not woken for it.
+        let contents = (facts.dockerd == Some(true))
+            .then(|| engine.contents().ok())
+            .flatten();
+        return Err(base_set_refusal(name, current_name.as_deref(), contents));
+    }
+    proxy::stop();
+    engine
+        .reinstall(&RootfsSource::Base(name.to_string()), &mut |step| {
+            ui.progress(step)
+        })
+        // Not `Op::Install`: the old distro may still be there, which is not
+        // `already_installed` here.
+        .map_err(|err| engine_failure(ui, &engine, Op::Other, err))?;
+    ui.say(&format!(
+        "Reinstalled on {name}. The old engine's containers, images and volumes are gone. \
+         Run `docklet start` to start the engine."
+    ));
+    Ok(Object::new()
+        .set("base", name)
+        .set("previous_base", current_name)
+        .set("changed", true)
+        .into())
 }
 
 /// Published ports depend on WSL's NAT localhost forwarding. Returns whether
@@ -176,23 +366,33 @@ fn engine_failure(ui: &Ui, engine: &Engine, op: Op, err: io::Error) -> Failure {
     failure::classify(op, err.to_string(), &EngineFacts::gather(engine.wsl()))
 }
 
-fn install(ui: &Ui, source: InstallSource) -> Result<Json, Failure> {
+fn install(ui: &Ui, source: InstallSource, no_wslconfig: bool) -> Result<Json, Failure> {
     let source = match source {
-        InstallSource::DefaultBase => RootfsSource::Base(engine::bases()[0].to_string()),
+        InstallSource::DefaultBase => RootfsSource::Base(engine::default_base().to_string()),
         InstallSource::Base(base) => RootfsSource::Base(base),
-        InstallSource::File(file) => RootfsSource::File(file),
+        InstallSource::File { path, sha256 } => RootfsSource::File { path, sha256 },
+        InstallSource::Url { url, sha256 } => RootfsSource::Url { url, sha256 },
     };
     let engine = Engine::system()?;
     install_distro(ui, &engine, &source)?;
     ui.say("Installed. Run `docklet start` to start the engine.");
+    let settings = load_settings(&docklet_wsl::data_dir()?);
+    let auto = light::auto(&settings, no_wslconfig, false);
+    let effect = light::effect_of(&auto, engine.wsl());
+    ui.lines(&light::auto_lines(&auto, true, effect.as_ref()));
     let (base, file) = match source {
         RootfsSource::Base(base) => (Some(base), None),
-        RootfsSource::File(file) => (None, Some(file.display().to_string())),
+        RootfsSource::File { path, .. } => (None, Some(path.display().to_string())),
+        RootfsSource::Url { url, .. } => (None, Some(url)),
     };
     Ok(Object::new()
         .set("distro", DISTRO)
         .set("base", base)
         .set("rootfs_file", file)
+        .set(
+            "wslconfig",
+            light::auto_data(&auto, effect.map(|(effect, _)| effect)),
+        )
         .into())
 }
 
@@ -202,7 +402,7 @@ fn install_distro(ui: &Ui, engine: &Engine, source: &RootfsSource) -> Result<(),
         .map_err(|err| {
             let base = match source {
                 RootfsSource::Base(base) => Some(base.as_str()),
-                RootfsSource::File(_) => None,
+                RootfsSource::File { .. } | RootfsSource::Url { .. } => None,
             };
             engine_failure(ui, engine, Op::Install { base }, err)
         })
@@ -281,6 +481,8 @@ fn stop(ui: &Ui) -> Result<Json, Failure> {
     Ok(Object::new().set("proxy_running", !proxy_stopped).into())
 }
 
+/// Removes the distro and, unless the `wslconfig` setting is `keep`, what
+/// Docklet wrote to `.wslconfig`.
 fn uninstall(ui: &Ui) -> Result<Json, Failure> {
     let engine = Engine::system()?;
     proxy::stop();
@@ -288,12 +490,35 @@ fn uninstall(ui: &Ui) -> Result<Json, Failure> {
         .uninstall()
         .map_err(|err| engine_failure(ui, &engine, Op::Other, err))?;
     ui.say("The docklet distro is removed.");
-    Ok(Object::new().set("distro", DISTRO).into())
+    let settings = load_settings(&docklet_wsl::data_dir()?);
+    let auto = light::auto(&settings, false, true);
+    let effect = light::effect_of(&auto, engine.wsl());
+    ui.lines(&light::auto_lines(&auto, false, effect.as_ref()));
+    if auto == Auto::Skipped("setting") && has_record() {
+        ui.say(
+            "Docklet's light settings stay in .wslconfig (wslconfig = keep); \
+             `docklet wslconfig revert` removes them.",
+        );
+    }
+    Ok(Object::new()
+        .set("distro", DISTRO)
+        .set(
+            "wslconfig",
+            light::auto_data(&auto, effect.map(|(effect, _)| effect)),
+        )
+        .into())
+}
+
+/// Docklet has keys in `.wslconfig` it could take out again.
+fn has_record() -> bool {
+    docklet_wsl::wslconfig_paths()
+        .and_then(|paths| wslconfig_file::load_record(&paths))
+        .is_ok_and(|record| record.is_some())
 }
 
 /// Installs if needed, starts, and sets up the Docker client. Every step
 /// is skipped when its result is already there.
-fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
+fn up(ui: &Ui, base: Option<String>, no_wslconfig: bool) -> Result<Json, Failure> {
     let engine = Engine::system()?;
     // Looked up before anything is changed: without it the last step fails.
     let home = home()?;
@@ -301,21 +526,46 @@ fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
     let facts = EngineFacts::gather(engine.wsl());
     let mut changed: Vec<&str> = Vec::new();
     // What stands in the way of the engine itself; the proxy comes later.
-    match failure::blocker(&facts, ProxyMode::Plain) {
-        Some(blocker) if blocker.code == ErrorCode::NotInstalled => {
-            let base = base.unwrap_or_else(|| engine::bases()[0].to_string());
-            install_distro(ui, &engine, &RootfsSource::Base(base))?;
-            changed.push("installed_distro");
-        }
-        // WSL itself is missing or broken; that is not `up`'s to repair.
-        Some(blocker) if blocker.code != ErrorCode::NotRunning => return Err(blocker),
-        _ => {
-            if base.is_some() {
-                eprintln!(
-                    "docklet: warning: the docklet distro is already installed; --base is ignored"
-                );
-            }
-        }
+    let blocker = failure::blocker(&facts, ProxyMode::Plain);
+    // WSL itself is missing or broken; that is not `up`'s to repair.
+    if let Some(blocker) = &blocker
+        && !matches!(
+            blocker.code,
+            ErrorCode::NotInstalled | ErrorCode::NotRunning
+        )
+    {
+        return Err(blocker.clone());
+    }
+    let installing = blocker
+        .as_ref()
+        .is_some_and(|blocker| blocker.code == ErrorCode::NotInstalled);
+    // Checked before `.wslconfig` is touched for an install that cannot happen.
+    if let Some(base) = base
+        .as_deref()
+        .filter(|base| installing && !engine::bases().contains(base))
+    {
+        return Err(Failure::new(
+            ErrorCode::UnknownBase,
+            format!(
+                "unknown base `{base}`; available: {}",
+                engine::bases().join(", ")
+            ),
+        )
+        .hint("docklet bases"));
+    }
+    // Before the engine starts, so that a VM it boots reads the file.
+    let settings = load_settings(&docklet_wsl::data_dir()?);
+    let auto = light::auto(&settings, no_wslconfig, false);
+    ui.lines(&light::auto_lines(&auto, installing, None));
+    if auto.changed() {
+        changed.push("wrote_wslconfig");
+    }
+    if installing {
+        let base = base.unwrap_or_else(|| engine::default_base().to_string());
+        install_distro(ui, &engine, &RootfsSource::Base(base))?;
+        changed.push("installed_distro");
+    } else if base.is_some() {
+        eprintln!("docklet: warning: the docklet distro is already installed; --base is ignored");
     }
     // An engine that sleeps behind an idle-stop proxy is usable as it is:
     // the first Docker command wakes it. `up` leaves it asleep rather than
@@ -324,6 +574,11 @@ fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
     if !asleep && facts.dockerd != Some(true) {
         start_engine(ui, &engine)?;
         changed.push("started_engine");
+    }
+    // After the start: whether the VM it ran in read the change.
+    let effect = light::effect_of(&auto, engine.wsl());
+    if let Some((effect, vm)) = &effect {
+        ui.say(&docklet_core::wslconfig::effect_line(*effect, vm, DISTRO));
     }
     if !proxy::is_running() {
         proxy::ensure_running().map_err(|err| engine_failure(ui, &engine, Op::Start, err))?;
@@ -338,7 +593,12 @@ fn up(ui: &Ui, base: Option<String>) -> Result<Json, Failure> {
     ui.say(&usable_line(asleep));
     ui.say(&format!("Docker CLI: {}", setup.docker.display()));
     ui.say("Run Docker with: docklet docker ps");
-    Ok(setup_data(usable_data(asleep), &setup, changed).into())
+    Ok(setup_data(usable_data(asleep), &setup, changed)
+        .set(
+            "wslconfig",
+            light::auto_data(&auto, effect.map(|(effect, _)| effect)),
+        )
+        .into())
 }
 
 fn docker_setup(ui: &Ui, home: &Path) -> io::Result<CliSetup> {
@@ -422,6 +682,8 @@ fn setting_value(settings: &Settings, key: ConfigKey) -> String {
     match key {
         ConfigKey::IdleStop => settings.idle_stop.to_string(),
         ConfigKey::Watchers => settings.watchers.to_string(),
+        ConfigKey::Wslconfig => settings.wslconfig.to_string(),
+        ConfigKey::VmMemory => MemorySize::setting(settings.vm_memory),
     }
 }
 
@@ -429,7 +691,24 @@ fn setting_data(settings: &Settings, key: ConfigKey) -> Object {
     match key {
         ConfigKey::IdleStop => idle_stop_data(settings.idle_stop),
         ConfigKey::Watchers => watchers_data(settings.watchers),
+        ConfigKey::Wslconfig => wslconfig_mode_data(settings.wslconfig),
+        ConfigKey::VmMemory => vm_memory_data(settings.vm_memory),
     }
+}
+
+fn wslconfig_mode_data(mode: WslconfigMode) -> Object {
+    Object::new()
+        .set("key", settings::WSLCONFIG_KEY)
+        .set("value", mode.as_str())
+}
+
+/// The memory cap as `--json` reports it, with the megabytes as a number,
+/// `null` for `off`.
+fn vm_memory_data(size: Option<MemorySize>) -> Object {
+    Object::new()
+        .set("key", settings::VM_MEMORY_KEY)
+        .set("value", MemorySize::setting(size))
+        .set("megabytes", size.map(MemorySize::megabytes))
 }
 
 fn config_set(ui: &Ui, change: ConfigChange) -> Result<Json, Failure> {
@@ -443,6 +722,19 @@ fn config_set(ui: &Ui, change: ConfigChange) -> Result<Json, Failure> {
             settings::save_watchers(&data_dir, watchers)?;
             watchers_data(watchers)
         }
+        ConfigChange::Wslconfig(mode) => {
+            settings::save_wslconfig(&data_dir, mode)?;
+            for line in wslconfig_mode_lines(mode, has_record()) {
+                ui.say(&line);
+            }
+            return Ok(wslconfig_mode_data(mode)
+                .set("applies_from", "next_install_or_up")
+                .into());
+        }
+        ConfigChange::VmMemory(size) => {
+            settings::save_vm_memory(&data_dir, size)?;
+            return config_set_vm_memory(ui, &data_dir, size);
+        }
     };
     // A proxy reads the settings once, when it starts.
     let restart_needed = proxy::is_running();
@@ -453,6 +745,110 @@ fn config_set(ui: &Ui, change: ConfigChange) -> Result<Json, Failure> {
         .set("applies_from", "next_start")
         .set("restart_needed", restart_needed)
         .into())
+}
+
+/// What `config set wslconfig` prints. The setting changes nothing in the
+/// file by itself.
+fn wslconfig_mode_lines(mode: WslconfigMode, docklet_wrote: bool) -> Vec<String> {
+    match mode {
+        WslconfigMode::Light => vec![
+            "wslconfig = light: `docklet install` and `docklet up` write the light WSL VM \
+             settings to .wslconfig, and `docklet uninstall` removes them."
+                .to_string(),
+            "`docklet wslconfig apply` writes them now.".to_string(),
+        ],
+        WslconfigMode::Keep => {
+            let mut lines = vec![
+                "wslconfig = keep: Docklet no longer changes .wslconfig by itself; only \
+                 `docklet wslconfig apply` and `docklet wslconfig revert` do."
+                    .to_string(),
+            ];
+            if docklet_wrote {
+                lines.push(
+                    "What Docklet already wrote stays; `docklet wslconfig revert` removes it."
+                        .to_string(),
+                );
+            }
+            lines
+        }
+    }
+}
+
+/// Saves the memory cap and, unless the `wslconfig` setting is `keep`,
+/// writes it to `.wslconfig` at once.
+fn config_set_vm_memory(
+    ui: &Ui,
+    data_dir: &Path,
+    size: Option<MemorySize>,
+) -> Result<Json, Failure> {
+    let settings = load_settings(data_dir);
+    if let Some(size) = size {
+        eprintln!(
+            "docklet: warning: vm-memory = {size} caps the WSL VM, which every WSL distro \
+             shares, not only Docklet's; large builds or containers may run out of memory"
+        );
+    }
+    let data = vm_memory_data(size);
+    if settings.wslconfig == WslconfigMode::Keep {
+        ui.say(&format!(
+            "vm-memory = {}. .wslconfig was not changed because wslconfig = keep; \
+             `docklet wslconfig apply` writes it.",
+            MemorySize::setting(size)
+        ));
+        return Ok(data
+            .set(
+                "wslconfig",
+                light::auto_data(&Auto::Skipped("setting"), None),
+            )
+            .into());
+    }
+    let auto = light::auto(&settings, false, false);
+    let engine = Engine::system()?;
+    let effect = light::effect_of(&auto, engine.wsl());
+    ui.lines(&light::auto_lines(&auto, true, effect.as_ref()));
+    let effect = effect.map(|(effect, _)| effect);
+    Ok(data
+        .set("wslconfig", light::auto_data(&auto, effect))
+        .into())
+}
+
+/// `docklet wslconfig status|apply|revert`. These run whatever the
+/// `wslconfig` setting says: they are the user asking.
+fn run_wslconfig(ui: &Ui, action: WslconfigAction) -> Result<Json, Failure> {
+    let data_dir = docklet_wsl::data_dir()?;
+    let settings = load_settings(&data_dir);
+    let engine = Engine::system()?;
+    if action == WslconfigAction::Status {
+        let (path, status) = light::status(&settings, || docklet_wsl::vm_state(engine.wsl()).ok());
+        for line in light::status_lines(path.as_deref(), &settings, &status) {
+            ui.say(&line);
+        }
+        return Ok(light::status_data(path.as_deref(), &settings, &status));
+    }
+    let paths = docklet_wsl::wslconfig_paths()?;
+    let path = paths.file.display().to_string();
+    let outcome = match action {
+        WslconfigAction::Apply => wslconfig_file::apply(&paths, &settings.wslconfig_entries())?,
+        _ => wslconfig_file::revert(&paths)?,
+    };
+    let effect = light::effect_of_change(engine.wsl(), Some(&outcome));
+    let lines = light::outcome_lines(&path, &outcome, true, effect.as_ref());
+    for line in &lines.out {
+        ui.say(line);
+    }
+    if !outcome.changed && outcome.refused.is_none() {
+        ui.say(match action {
+            WslconfigAction::Apply => "Nothing to change.",
+            _ => "Nothing to revert: Docklet has nothing in .wslconfig.",
+        });
+    }
+    let data = light::outcome_data(&path, &outcome, effect.map(|(effect, _)| effect)).into();
+    match &outcome.refused {
+        Some(reason) => {
+            Err(Failure::failed(format!("{path} was left alone: {reason}")).with_data(data))
+        }
+        None => Ok(data),
+    }
 }
 
 /// One setting as `--json` reports it: the value as `config set` takes it,
@@ -494,6 +890,9 @@ fn config_set_lines(change: ConfigChange, proxy_running: bool) -> Vec<String> {
              one that carries nothing."
                 .to_string()
         }
+        // Said by `wslconfig_mode_lines` and `config_set_vm_memory`; they
+        // do not wait for a `docklet start`.
+        ConfigChange::Wslconfig(_) | ConfigChange::VmMemory(_) => return Vec::new(),
     };
     let applies = if proxy_running {
         "The change applies from the next `docklet start`. The engine that is running now \
@@ -556,6 +955,7 @@ fn run_doctor(ui: &Ui) -> Result<Json, Failure> {
     let engine = Engine::system()?;
     let data_dir = docklet_wsl::data_dir()?;
     let home = home_dir();
+    let settings = load_settings(&data_dir);
     let facts = Facts {
         engine: EngineFacts::gather(engine.wsl()),
         proxy: proxy::mode(),
@@ -565,6 +965,7 @@ fn run_doctor(ui: &Ui) -> Result<Json, Failure> {
             .is_some_and(|home| docker_client::compose_plugin(home).is_file()),
         docker_context: docker_context(home.as_deref()),
         mirrored_networking: docklet_wsl::mirrored_networking(),
+        wslconfig: light::status(&settings, || docklet_wsl::vm_state(engine.wsl()).ok()).1,
         data_dir: data_dir.display().to_string(),
         free_space: disk::free_space(&data_dir).map_err(|err| err.to_string()),
     };
@@ -825,6 +1226,7 @@ mod tests {
             compose_plugin: false,
             docker_context: ContextState::Missing,
             mirrored_networking: false,
+            wslconfig: docklet_core::wslconfig::Status::default(),
             data_dir: "data".to_string(),
             free_space: Ok(0),
         };
@@ -1093,14 +1495,91 @@ mod tests {
         let settings = Settings {
             idle_stop: IdleStop::After(25),
             watchers: Watchers::KeepAwake,
+            vm_memory: MemorySize::parse("4GB"),
+            ..Settings::default()
         };
         let values: Vec<String> = ConfigKey::ALL
             .into_iter()
             .map(|key| format!("{} = {}", key.name(), setting_value(&settings, key)))
             .collect();
-        assert_eq!(values, ["idle-stop = 25", "watchers-keep-awake = yes"]);
+        assert_eq!(
+            values,
+            [
+                "idle-stop = 25",
+                "watchers-keep-awake = yes",
+                "wslconfig = light",
+                "vm-memory = 4GB"
+            ]
+        );
         let data: Json = setting_data(&settings, ConfigKey::Watchers).into();
         assert!(data.render().contains(r#""keep_awake":true"#));
+        let data: Json = setting_data(&settings, ConfigKey::VmMemory).into();
+        assert_eq!(
+            data.render(),
+            r#"{"key":"vm-memory","value":"4GB","megabytes":4096}"#
+        );
+        let off: Json = vm_memory_data(None).into();
+        assert_eq!(
+            off.render(),
+            r#"{"key":"vm-memory","value":"off","megabytes":null}"#
+        );
+        let mode: Json = setting_data(&settings, ConfigKey::Wslconfig).into();
+        assert_eq!(mode.render(), r#"{"key":"wslconfig","value":"light"}"#);
+    }
+
+    #[test]
+    fn setting_wslconfig_says_what_it_changes_and_what_it_does_not() {
+        let keep = wslconfig_mode_lines(WslconfigMode::Keep, true);
+        assert_eq!(keep.len(), 2);
+        assert!(keep[0].starts_with("wslconfig = keep: "), "{}", keep[0]);
+        assert!(keep[1].contains("`docklet wslconfig revert`"));
+        assert_eq!(wslconfig_mode_lines(WslconfigMode::Keep, false).len(), 1);
+        let light = wslconfig_mode_lines(WslconfigMode::Light, false);
+        assert!(light[1].contains("`docklet wslconfig apply`"));
+    }
+
+    #[test]
+    fn a_base_set_without_yes_says_what_would_be_lost() {
+        let counted = base_set_refusal(
+            "debian-13",
+            Some("alpine"),
+            Some(Contents {
+                containers: 1,
+                images: 12,
+                volumes: 2,
+            }),
+        );
+        assert_eq!(counted.code, ErrorCode::ConfirmationRequired);
+        assert_eq!(counted.code.exit_code(), 2);
+        assert_eq!(
+            counted.message,
+            "`base set` reinstalls the docklet distro from alpine on debian-13, which deletes \
+             every container, image and volume in it (1 container, 12 images and 2 volumes); \
+             pass --yes to confirm"
+        );
+        assert_eq!(counted.hint, Some("docklet base set debian-13 --yes"));
+        assert_eq!(
+            counted.data.unwrap().render(),
+            concat!(
+                r#"{"current_base":"alpine","new_base":"debian-13","counted":true,"#,
+                r#""containers":1,"images":12,"volumes":2}"#
+            )
+        );
+        let uncounted = base_set_refusal("alpine", None, None);
+        assert!(
+            uncounted
+                .message
+                .contains("(they were not counted because the engine is not running)"),
+            "{}",
+            uncounted.message
+        );
+        assert!(
+            uncounted
+                .data
+                .unwrap()
+                .render()
+                .contains(r#""counted":false"#)
+        );
     }
 
     #[test]

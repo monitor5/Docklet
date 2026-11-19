@@ -6,12 +6,13 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use docklet_core::engine::{self, DISTRO_NAME};
+use docklet_core::engine::{self, Contents, DISTRO_NAME, Installed};
 use docklet_core::idle::EngineHooks;
 use docklet_core::wsl::{Wsl, WslOutput, WslRunner};
-use docklet_core::{EngineState, system_program, wsl_output, wslconfig};
+use docklet_core::wslconfig::Vm;
+use docklet_core::{EngineState, system_program, wsl_output, wslconfig, wslconfig_file};
 use sha2::{Digest, Sha256};
 
 pub mod tools;
@@ -145,8 +146,35 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
 pub enum RootfsSource {
     /// A published base, by name (see `docklet_core::engine::bases`).
     Base(String),
-    /// A local `rootfs.tar.gz` that fulfils the rootfs contract.
-    File(PathBuf),
+    /// A local `rootfs.tar.gz` that fulfils the rootfs contract, with the
+    /// SHA-256 it must have.
+    File { path: PathBuf, sha256: String },
+    /// The same, downloaded from an `https://` URL.
+    Url { url: String, sha256: String },
+}
+
+impl RootfsSource {
+    /// What the install record says about this source.
+    fn installed(&self) -> Installed {
+        match self {
+            Self::Base(base) => Installed::Base(base.clone()),
+            Self::File { path, sha256 } => Installed::Rootfs {
+                location: path.display().to_string(),
+                sha256: sha256.clone(),
+            },
+            Self::Url { url, sha256 } => Installed::Rootfs {
+                location: url.clone(),
+                sha256: sha256.clone(),
+            },
+        }
+    }
+}
+
+/// A rootfs that has been fetched and checked, ready to import.
+struct Prepared {
+    path: PathBuf,
+    /// Docklet downloaded it into its cache, so it is deleted after use.
+    downloaded: bool,
 }
 
 /// Directory that holds everything Docklet stores: `%LOCALAPPDATA%\Docklet`.
@@ -198,9 +226,80 @@ impl<R: WslRunner> Engine<R> {
             EngineState::Error(reason) => return Err(io::Error::other(reason)),
             _ => return Err(io::Error::other("the docklet distro is already installed")),
         }
+        let prepared = self.prepare(source, progress)?;
+        self.import(source, prepared, progress)
+    }
 
-        let (rootfs, downloaded) = match source {
-            RootfsSource::File(path) => (path.clone(), false),
+    /// Replaces the installed distro by one from `source`, deleting every
+    /// container, image and volume in it. The new rootfs is downloaded and
+    /// checked before anything is removed, so a failed download leaves the
+    /// old engine as it was. Stopping the pipe proxy first is the caller's
+    /// job.
+    pub fn reinstall(
+        &self,
+        source: &RootfsSource,
+        progress: &mut dyn FnMut(&str),
+    ) -> io::Result<()> {
+        match self.status() {
+            EngineState::NotInstalled => {
+                return Err(io::Error::other(
+                    "the docklet distro is not installed; run `docklet install`",
+                ));
+            }
+            EngineState::WslMissing => return Err(io::Error::other("WSL is not installed")),
+            EngineState::Error(reason) => return Err(io::Error::other(reason)),
+            _ => {}
+        }
+        let prepared = self.prepare(source, progress)?;
+        progress("Removing the old docklet distro");
+        if let Err(err) = self.remove_distro() {
+            if prepared.downloaded {
+                let _ = fs::remove_file(&prepared.path);
+            }
+            return Err(err);
+        }
+        self.import(source, prepared, progress).map_err(|err| {
+            io::Error::other(format!(
+                "the old distro was removed, but the new one could not be imported: {err}"
+            ))
+        })
+    }
+
+    /// Fetches and checks the rootfs of `source`.
+    fn prepare(
+        &self,
+        source: &RootfsSource,
+        progress: &mut dyn FnMut(&str),
+    ) -> io::Result<Prepared> {
+        match source {
+            RootfsSource::File { path, sha256 } => {
+                progress("Verifying SHA-256");
+                let actual = file_sha256(path)?;
+                // The user's own file is never deleted, even when it does
+                // not match.
+                if actual != sha256.to_ascii_lowercase() {
+                    return Err(io::Error::other(format!(
+                        "SHA-256 mismatch for {}: expected {sha256}, got {actual}",
+                        path.display()
+                    )));
+                }
+                Ok(Prepared {
+                    path: path.clone(),
+                    downloaded: false,
+                })
+            }
+            RootfsSource::Url { url, sha256 } => {
+                let cache = self.cache()?;
+                let rootfs = cache.join("rootfs-custom.tar.gz");
+                progress(&format!("Downloading {url}"));
+                download(url, &rootfs)?;
+                progress("Verifying SHA-256");
+                verify_sha256(&rootfs, sha256)?;
+                Ok(Prepared {
+                    path: rootfs,
+                    downloaded: true,
+                })
+            }
             RootfsSource::Base(base) => {
                 let url = engine::rootfs_url(base).ok_or_else(|| {
                     io::Error::other(format!(
@@ -208,8 +307,7 @@ impl<R: WslRunner> Engine<R> {
                         engine::bases().join(", ")
                     ))
                 })?;
-                let cache = self.data_dir.join("cache");
-                fs::create_dir_all(&cache)?;
+                let cache = self.cache()?;
                 let rootfs = cache.join(format!("rootfs-{base}.tar.gz"));
                 let checksum = cache.join(format!("rootfs-{base}.tar.gz.sha256"));
                 progress(&format!("Downloading {url}"));
@@ -218,22 +316,95 @@ impl<R: WslRunner> Engine<R> {
                 progress("Verifying SHA-256");
                 verify_sha256(&rootfs, &fs::read_to_string(&checksum)?)?;
                 let _ = fs::remove_file(&checksum);
-                (rootfs, true)
+                Ok(Prepared {
+                    path: rootfs,
+                    downloaded: true,
+                })
             }
-        };
+        }
+    }
 
+    fn cache(&self) -> io::Result<PathBuf> {
+        let cache = self.data_dir.join("cache");
+        fs::create_dir_all(&cache)?;
+        Ok(cache)
+    }
+
+    /// Imports a prepared rootfs and records what it was made from.
+    fn import(
+        &self,
+        source: &RootfsSource,
+        prepared: Prepared,
+        progress: &mut dyn FnMut(&str),
+    ) -> io::Result<()> {
         let install_dir = self.data_dir.join("distro");
         fs::create_dir_all(&install_dir)?;
         progress("Importing the distro into WSL");
         let imported = self.wsl.import(
             DISTRO_NAME,
             &install_dir.to_string_lossy(),
-            &rootfs.to_string_lossy(),
+            &prepared.path.to_string_lossy(),
         );
-        if downloaded {
-            let _ = fs::remove_file(&rootfs);
+        if prepared.downloaded {
+            let _ = fs::remove_file(&prepared.path);
         }
-        imported
+        imported?;
+        // The distro works without the record; only `docklet base` misses it.
+        let _ = fs::write(
+            self.data_dir.join(Installed::FILE_NAME),
+            source.installed().render(),
+        );
+        Ok(())
+    }
+
+    /// What the installed distro was made from: the record Docklet wrote,
+    /// or, for an install older than the record, the base named inside the
+    /// distro, read only while it runs (reading would start it).
+    pub fn installed(&self) -> Option<Installed> {
+        if let Some(installed) = fs::read_to_string(self.data_dir.join(Installed::FILE_NAME))
+            .ok()
+            .and_then(|text| Installed::parse(&text))
+        {
+            return Some(installed);
+        }
+        if !engine::distro_running(&self.wsl).unwrap_or(false) {
+            return None;
+        }
+        let output = self
+            .wsl
+            .exec(
+                DISTRO_NAME,
+                &["cat", "/usr/local/share/docklet/versions.txt"],
+            )
+            .ok()?;
+        output
+            .success
+            .then(|| engine::base_in_versions(&output.stdout))
+            .flatten()
+            .map(Installed::Base)
+    }
+
+    /// The containers, images and volumes in a running engine. Asks dockerd
+    /// inside the distro, so call it only while the distro runs.
+    pub fn contents(&self) -> io::Result<Contents> {
+        let output = self
+            .wsl
+            .exec(DISTRO_NAME, &["sh", "-c", engine::COUNT_CONTENTS])?;
+        if !output.success {
+            return Err(io::Error::other(format!(
+                "docker could not list the engine's contents: {}",
+                output.stderr.trim()
+            )));
+        }
+        engine::parse_contents(&output.stdout)
+            .ok_or_else(|| io::Error::other("docker's lists could not be counted"))
+    }
+
+    fn remove_distro(&self) -> io::Result<()> {
+        let _ = self.wsl.terminate(DISTRO_NAME);
+        self.wsl.unregister(DISTRO_NAME)?;
+        let _ = fs::remove_file(self.data_dir.join(Installed::FILE_NAME));
+        Ok(())
     }
 
     /// Starts the distro, holds it up with a keepalive process and waits for
@@ -282,8 +453,7 @@ impl<R: WslRunner> Engine<R> {
             EngineState::NotInstalled | EngineState::WslMissing => return Ok(()),
             _ => {}
         }
-        let _ = self.wsl.terminate(DISTRO_NAME);
-        self.wsl.unregister(DISTRO_NAME)?;
+        self.remove_distro()?;
         let _ = fs::remove_dir(self.data_dir.join("distro"));
         Ok(())
     }
@@ -382,11 +552,47 @@ pub fn spawn_detached(_command_line: &str) -> io::Result<()> {
 /// `docklet_core::wslconfig`). The file is only read, never written; a
 /// missing or unreadable file counts as not mirrored.
 pub fn mirrored_networking() -> bool {
-    std::env::var_os("USERPROFILE")
-        .filter(|home| !home.is_empty())
-        .and_then(|home| fs::read(PathBuf::from(home).join(".wslconfig")).ok())
+    wslconfig_path()
+        .and_then(fs::read)
+        .ok()
         // Editors may save it as UTF-16; `decode` handles that and the BOM.
         .is_some_and(|bytes| wslconfig::mirrored_networking(&wsl_output::decode(&bytes)))
+}
+
+/// `%USERPROFILE%\.wslconfig`, which configures the VM of every WSL 2
+/// distro of the user. Docklet changes it only through
+/// `docklet_core::wslconfig_file`.
+pub fn wslconfig_path() -> io::Result<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".wslconfig"))
+        .ok_or_else(|| io::Error::other("USERPROFILE is not set"))
+}
+
+/// The paths `docklet_core::wslconfig_file` works on, for this user.
+pub fn wslconfig_paths() -> io::Result<wslconfig_file::Paths> {
+    Ok(wslconfig_file::Paths::new(wslconfig_path()?, &data_dir()?))
+}
+
+/// Whether the WSL VM runs, for which distros, and since when if the
+/// docklet distro is among them: its `/proc/uptime` is the VM's, since all
+/// distros share one kernel. Nothing runs in the user's other distros, and
+/// a stopped docklet distro is not started to ask.
+pub fn vm_state<R: WslRunner>(wsl: &Wsl<R>) -> io::Result<Vm> {
+    let distros = wsl.running()?;
+    if distros.is_empty() {
+        return Ok(Vm::Stopped);
+    }
+    let booted = if distros.iter().any(|name| name == DISTRO_NAME) {
+        wsl.exec(DISTRO_NAME, &["cat", "/proc/uptime"])
+            .ok()
+            .filter(|output| output.success)
+            .and_then(|output| wslconfig::parse_uptime(&output.stdout))
+            .and_then(|uptime| SystemTime::now().checked_sub(uptime))
+    } else {
+        None
+    };
+    Ok(Vm::Running { distros, booted })
 }
 
 /// Downloads with the `curl.exe` that ships with Windows, which keeps an HTTP
@@ -411,13 +617,8 @@ pub(crate) fn download(url: &str, destination: &Path) -> io::Result<()> {
     }
 }
 
-/// Checks `file` against the first token of a `sha256sum` line.
-pub(crate) fn verify_sha256(file: &Path, checksum_line: &str) -> io::Result<()> {
-    let expected = checksum_line
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+/// The SHA-256 of a file, in lower-case hex.
+fn file_sha256(file: &Path) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut reader = fs::File::open(file)?;
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -428,11 +629,22 @@ pub(crate) fn verify_sha256(file: &Path, checksum_line: &str) -> io::Result<()> 
         }
         hasher.update(&buffer[..n]);
     }
-    let actual: String = hasher
+    Ok(hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
+        .collect())
+}
+
+/// Checks a downloaded `file` against the first token of a `sha256sum`
+/// line, and deletes it when it does not match.
+pub(crate) fn verify_sha256(file: &Path, checksum_line: &str) -> io::Result<()> {
+    let expected = checksum_line
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let actual = file_sha256(file)?;
     if actual == expected {
         Ok(())
     } else {
@@ -588,6 +800,234 @@ mod tests {
         let engine = Engine::new(&runner, PathBuf::new());
         assert!(engine.distro_running().unwrap());
         assert_eq!(engine.running_containers().unwrap(), 2);
+    }
+
+    /// SHA-256 of `abc`.
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    /// A machine with WSL 3 where the docklet distro is installed or not,
+    /// and stopped. Import, terminate and unregister succeed.
+    fn wsl_with(installed: bool) -> ScriptedRunner<impl Fn(&[&str]) -> WslOutput> {
+        scripted(move |args| match args {
+            ["--version"] => output(true, "WSL version: 3.0.5.0\n"),
+            ["--list", "--quiet"] => output(true, if installed { "docklet\n" } else { "" }),
+            ["--list", "--running", "--quiet"] => output(false, ""),
+            ["--import", "docklet", _, _, "--version", "2"] => output(true, ""),
+            ["--terminate", "docklet"] | ["--unregister", "docklet"] => output(true, ""),
+            other => panic!("unexpected wsl call: {other:?}"),
+        })
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("docklet-wsl-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_local_rootfs_is_checked_imported_and_recorded() {
+        let dir = temp_dir("install-file");
+        let rootfs = dir.join("rootfs.tar.gz");
+        fs::write(&rootfs, b"abc").unwrap();
+        let runner = wsl_with(false);
+        let engine = Engine::new(&runner, dir.join("data"));
+        let source = RootfsSource::File {
+            path: rootfs.clone(),
+            sha256: ABC.to_ascii_uppercase(),
+        };
+        engine.install(&source, &mut |_| {}).unwrap();
+        // The user's file stays where it was.
+        assert!(rootfs.exists());
+        let record = fs::read_to_string(dir.join("data").join(Installed::FILE_NAME)).unwrap();
+        assert_eq!(
+            Installed::parse(&record),
+            Some(Installed::Rootfs {
+                location: rootfs.display().to_string(),
+                sha256: ABC.to_ascii_uppercase(),
+            })
+        );
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("--import docklet"))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_local_rootfs_with_another_hash_is_refused_and_kept() {
+        let dir = temp_dir("install-mismatch");
+        let rootfs = dir.join("rootfs.tar.gz");
+        fs::write(&rootfs, b"abd").unwrap();
+        let runner = wsl_with(false);
+        let engine = Engine::new(&runner, dir.join("data"));
+        let source = RootfsSource::File {
+            path: rootfs.clone(),
+            sha256: ABC.to_string(),
+        };
+        let err = engine.install(&source, &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("SHA-256 mismatch"), "{err}");
+        assert!(rootfs.exists());
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("--import"))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_reinstall_checks_the_new_rootfs_before_removing_the_old_distro() {
+        let dir = temp_dir("reinstall");
+        let rootfs = dir.join("rootfs.tar.gz");
+        fs::write(&rootfs, b"abd").unwrap();
+        let runner = wsl_with(true);
+        let engine = Engine::new(&runner, dir.join("data"));
+        let bad = RootfsSource::File {
+            path: rootfs.clone(),
+            sha256: ABC.to_string(),
+        };
+        assert!(engine.reinstall(&bad, &mut |_| {}).is_err());
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("--unregister"))
+        );
+
+        fs::write(&rootfs, b"abc").unwrap();
+        let good = RootfsSource::File {
+            path: rootfs,
+            sha256: ABC.to_string(),
+        };
+        engine.reinstall(&good, &mut |_| {}).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let unregister = calls
+            .iter()
+            .position(|call| call == "--unregister docklet")
+            .unwrap();
+        let import = calls
+            .iter()
+            .position(|call| call.starts_with("--import"))
+            .unwrap();
+        assert!(unregister < import);
+        drop(calls);
+        assert!(matches!(engine.installed(), Some(Installed::Rootfs { .. })));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_reinstall_needs_an_installed_distro() {
+        let runner = wsl_with(false);
+        let engine = Engine::new(&runner, PathBuf::new());
+        let err = engine
+            .reinstall(&RootfsSource::Base("alpine".to_string()), &mut |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn without_a_record_the_base_is_read_only_from_a_running_distro() {
+        let stopped = wsl_with(true);
+        let engine = Engine::new(&stopped, temp_dir("installed-stopped"));
+        assert_eq!(engine.installed(), None);
+        // A stopped distro is not started to ask.
+        assert!(
+            !stopped
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("-d"))
+        );
+
+        let running = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(true, "docklet\n"),
+            [.., "cat", "/usr/local/share/docklet/versions.txt"] => {
+                output(true, "base debian-13\ndocker 29.9.3\n")
+            }
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        let dir = temp_dir("installed-running");
+        let engine = Engine::new(&running, dir.clone());
+        assert_eq!(
+            engine.installed(),
+            Some(Installed::Base("debian-13".to_string()))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_vm_boot_is_asked_only_of_a_running_docklet_distro() {
+        let none = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(false, ""),
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        assert_eq!(vm_state(&Wsl::new(&none)).unwrap(), Vm::Stopped);
+
+        let others = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(true, "Ubuntu\n"),
+            other => panic!("nothing may run in the user's distro: {other:?}"),
+        });
+        assert_eq!(
+            vm_state(&Wsl::new(&others)).unwrap(),
+            Vm::Running {
+                distros: vec!["Ubuntu".to_string()],
+                booted: None
+            }
+        );
+
+        let docklet = scripted(|args| match args {
+            ["--list", "--running", "--quiet"] => output(true, "Ubuntu\ndocklet\n"),
+            [
+                "-d",
+                "docklet",
+                "-u",
+                "root",
+                "--exec",
+                "cat",
+                "/proc/uptime",
+            ] => output(true, "60.00 100.00\n"),
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        let Vm::Running {
+            booted: Some(booted),
+            ..
+        } = vm_state(&Wsl::new(&docklet)).unwrap()
+        else {
+            panic!("expected a boot time");
+        };
+        let ago = SystemTime::now().duration_since(booted).unwrap();
+        assert!(ago >= Duration::from_secs(60) && ago < Duration::from_secs(120));
+    }
+
+    #[test]
+    fn contents_are_counted_with_one_call() {
+        let runner = scripted(|args| match args {
+            ["-d", "docklet", "-u", "root", "--exec", "sh", "-c", line] => {
+                assert_eq!(*line, engine::COUNT_CONTENTS);
+                output(true, "2\n5\n1\n")
+            }
+            other => panic!("unexpected wsl call: {other:?}"),
+        });
+        let contents = Engine::new(&runner, PathBuf::new()).contents().unwrap();
+        assert_eq!(
+            contents,
+            Contents {
+                containers: 2,
+                images: 5,
+                volumes: 1
+            }
+        );
     }
 
     #[test]

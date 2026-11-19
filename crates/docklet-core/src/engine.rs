@@ -43,6 +43,96 @@ pub fn rootfs_url(base: &str) -> Option<String> {
     })
 }
 
+/// The base a new install gets: the first row of `bases.txt`.
+pub fn default_base() -> &'static str {
+    bases()[0]
+}
+
+/// What the installed distro was made from. Docklet writes it next to the
+/// distro's disk when it installs, because WSL itself does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Installed {
+    /// A published base, by name.
+    Base(String),
+    /// A rootfs the user gave, by path or URL, with its SHA-256.
+    Rootfs { location: String, sha256: String },
+}
+
+impl Installed {
+    /// File name of the record, in the data directory.
+    pub const FILE_NAME: &str = "installed.txt";
+
+    pub fn render(&self) -> String {
+        let mut text =
+            "# What the docklet distro was installed from. Written by Docklet.\n".to_string();
+        match self {
+            Self::Base(base) => text.push_str(&format!("base = {base}\n")),
+            Self::Rootfs { location, sha256 } => {
+                text.push_str(&format!("rootfs = {location}\nsha256 = {sha256}\n"));
+            }
+        }
+        text
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let value = |name: &str| {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .filter_map(|line| line.split_once('='))
+                .find(|(key, _)| key.trim() == name)
+                .map(|(_, value)| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        if let Some(base) = value("base") {
+            return Some(Self::Base(base));
+        }
+        Some(Self::Rootfs {
+            location: value("rootfs")?,
+            sha256: value("sha256").unwrap_or_default(),
+        })
+    }
+
+    /// The base's name, or `custom` for a rootfs of the user's.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Base(base) => base,
+            Self::Rootfs { .. } => "custom",
+        }
+    }
+}
+
+/// The base named in the rootfs's `/usr/local/share/docklet/versions.txt`
+/// (`base alpine`), for installs older than the record.
+pub fn base_in_versions(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("base "))
+        .map(|base| base.trim().to_string())
+        .filter(|base| !base.is_empty())
+}
+
+/// What an engine holds that a reinstall deletes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Contents {
+    pub containers: u64,
+    pub images: u64,
+    pub volumes: u64,
+}
+
+/// The shell line that counts [`Contents`] inside the distro, one number per
+/// line. `sort -u`: an image with two tags is one image.
+pub const COUNT_CONTENTS: &str = "docker ps -aq | wc -l; docker images -q | sort -u | wc -l; \
+     docker volume ls -q | wc -l";
+
+pub fn parse_contents(text: &str) -> Option<Contents> {
+    let mut numbers = text.split_whitespace().map(str::parse::<u64>);
+    let contents = Contents {
+        containers: numbers.next()?.ok()?,
+        images: numbers.next()?.ok()?,
+        volumes: numbers.next()?.ok()?,
+    };
+    numbers.next().is_none().then_some(contents)
+}
+
 /// Works out the engine state without changing anything.
 ///
 /// The distro counts as `Running` only when dockerd answers; a distro that is
@@ -256,7 +346,62 @@ mod tests {
 
     #[test]
     fn bases_list_default_first() {
-        assert_eq!(bases(), ["debian-13", "ubuntu-26.04", "alpine"]);
+        assert_eq!(bases(), ["alpine", "debian-13", "ubuntu-26.04"]);
+        assert_eq!(default_base(), "alpine");
+    }
+
+    #[test]
+    fn the_install_record_reads_back() {
+        for installed in [
+            Installed::Base("alpine".to_string()),
+            Installed::Rootfs {
+                location: r"C:\builds\my rootfs.tar.gz".to_string(),
+                sha256: "ab".repeat(32),
+            },
+            Installed::Rootfs {
+                location: "https://example.com/r.tar.gz".to_string(),
+                sha256: "cd".repeat(32),
+            },
+        ] {
+            assert_eq!(Installed::parse(&installed.render()), Some(installed));
+        }
+        assert_eq!(Installed::parse(""), None);
+        assert_eq!(Installed::parse("# base = alpine\n"), None);
+        assert_eq!(
+            Installed::parse("base = debian-13\nfuture = 1\n"),
+            Some(Installed::Base("debian-13".to_string()))
+        );
+        assert_eq!(Installed::Base("alpine".to_string()).name(), "alpine");
+        let custom = Installed::parse("rootfs = x\n").unwrap();
+        assert_eq!(custom.name(), "custom");
+    }
+
+    #[test]
+    fn the_base_is_in_versions_txt() {
+        let versions = "base alpine\ndocker 29.9.3\nk3d 5.8.3\n";
+        assert_eq!(base_in_versions(versions).as_deref(), Some("alpine"));
+        assert_eq!(base_in_versions("docker 29\n"), None);
+        assert_eq!(base_in_versions("base \n"), None);
+    }
+
+    #[test]
+    fn contents_are_three_counts() {
+        assert_eq!(
+            parse_contents("3\n12\n2\n"),
+            Some(Contents {
+                containers: 3,
+                images: 12,
+                volumes: 2
+            })
+        );
+        // busybox `wc -l` pads with spaces.
+        assert_eq!(
+            parse_contents("      0\n      1\n      0\n").map(|c| c.images),
+            Some(1)
+        );
+        for wrong in ["", "1\n2\n", "1\n2\nx\n", "1\n2\n3\n4\n"] {
+            assert_eq!(parse_contents(wrong), None, "{wrong:?}");
+        }
     }
 
     #[test]
