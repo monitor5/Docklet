@@ -53,10 +53,6 @@ pub fn tab_of(kind: ResourceKind) -> usize {
     TABS.iter().position(|tab| *tab == kind).unwrap_or(0)
 }
 
-pub fn kind_of(tab: usize) -> Option<ResourceKind> {
-    TABS.get(tab).copied()
-}
-
 /// What can be done to a row of a list of `kind`, in the order of the
 /// buttons. A row's `view::Row::actions` has a bit for each. The port in
 /// `OpenPort` stands for "a port": the button opens the row's first one,
@@ -592,9 +588,7 @@ mod tests {
         assert_eq!(tab_titles().len(), TABS.len());
         for (tab, kind) in TABS.into_iter().enumerate() {
             assert_eq!(tab_of(kind), tab);
-            assert_eq!(kind_of(tab), Some(kind));
         }
-        assert_eq!(kind_of(4), None);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //! The columns always fit the list: [`table_fit`] decides which show and
 //! which actions have a button. A column that does not fit keeps its place
 //! with no width, so column numbers mean the same at every size and a
-//! screen reader still reads its cell.
+//! screen reader still reads its cell. A divider the user dragged fixes the
+//! width of its column; the others are fitted around it.
 
 use std::cell::{Cell, RefCell};
 
@@ -21,11 +22,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Accessibility::NotifyWinEvent;
 use windows::Win32::UI::Controls::{
     HDF_CHECKBOX, HDF_CHECKED, HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, HDM_GETITEMW,
-    HDM_SETITEMW, HDS_CHECKBOXES, HDS_NOSIZING, HIMAGELIST, ILC_COLOR32, ImageList_Create,
-    ImageList_Destroy, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
-    LVCFMT_CENTER, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMSTATEICON,
-    LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETECOLUMN,
-    LVM_ENSUREVISIBLE, LVM_GETHEADER, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_GETSUBITEMRECT,
+    HDM_SETITEMW, HDS_CHECKBOXES, HIMAGELIST, ILC_COLOR32, ImageList_Create, ImageList_Destroy,
+    LIST_VIEW_ITEM_STATE_FLAGS, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCFMT_CENTER,
+    LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMSTATEICON, LVIR_BOUNDS,
+    LVIS_FOCUSED, LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETECOLUMN, LVM_ENSUREVISIBLE,
+    LVM_GETCOLUMNWIDTH, LVM_GETHEADER, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_GETSUBITEMRECT,
     LVM_INSERTCOLUMNW, LVM_SETCALLBACKMASK, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
     LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETSELECTIONMARK, LVM_SUBITEMHITTEST,
     LVNI_FOCUSED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
@@ -111,12 +112,32 @@ pub fn button_metrics(dpi: Dpi) -> ButtonMetrics {
 
 /// Lays a table's columns and buttons out in a list `available` pixels
 /// wide (see [`fit`]). `buttons` gives the width and the fold number of
-/// each button place.
-pub fn table_fit(available: i32, columns: &[Column], buttons: &[(i32, u8)], dpi: Dpi) -> Fit {
+/// each button place, `fixed` the width of each column whose divider the
+/// user dragged (`None`, or no entry, for the others).
+///
+/// A width the user set is kept as it is: the column neither shares what
+/// is left over nor gives way, and the columns that are still automatic
+/// are laid out in the rest. Should the list be narrower than the fixed
+/// widths and what else never gives way, all of them are squeezed, as
+/// without any: nothing the user does makes the list scroll sideways.
+pub fn table_fit(
+    available: i32,
+    columns: &[Column],
+    fixed: &[Option<i32>],
+    buttons: &[(i32, u8)],
+    dpi: Dpi,
+) -> Fit {
     let columns: Vec<ColumnSpec> = columns
         .iter()
         .enumerate()
         .map(|(index, column)| {
+            if let Some(width) = fixed.get(index).copied().flatten() {
+                return ColumnSpec {
+                    weight: 0,
+                    min: width.max(0),
+                    priority: 0,
+                };
+            }
             // The first column holds the checkbox too.
             let extra = if index == 0 { dpi.px(CHECKBOX_ROOM) } else { 0 };
             ColumnSpec {
@@ -170,14 +191,12 @@ impl TableView {
         // checkboxes along with the text.
         send(list, LVM_SETCALLBACKMASK, LVIS_STATEIMAGEMASK.0 as usize, 0);
         let header = HWND(send(list, LVM_GETHEADER, 0, 0) as *mut _);
-        // SAFETY: adding style bits to the list's own header. The widths
-        // are worked out from the list's width with every change, so a
-        // divider dragged by hand would spring back, or pull a column that
-        // does not fit into a list that then scrolls sideways.
+        // SAFETY: adding a style bit to the list's own header. Its dividers
+        // can be dragged: the window keeps the widths that sets and lays
+        // the other columns out around them (see `table_fit`).
         unsafe {
             let style = GetWindowLongPtrW(header, GWL_STYLE);
-            let wanted = style | (HDS_CHECKBOXES | HDS_NOSIZING) as isize;
-            SetWindowLongPtrW(header, GWL_STYLE, wanted);
+            SetWindowLongPtrW(header, GWL_STYLE, style | HDS_CHECKBOXES as isize);
         }
         Self {
             list,
@@ -286,22 +305,40 @@ impl TableView {
         true
     }
 
+    /// How many columns the table has, the actions column not counted:
+    /// the columns whose dividers can be dragged.
+    pub fn data_columns(&self) -> usize {
+        self.built.borrow().columns.len()
+    }
+
+    /// The width the list has column `index` at right now.
+    pub fn column_width(&self, index: usize) -> i32 {
+        send(self.list, LVM_GETCOLUMNWIDTH, index, 0) as i32
+    }
+
+    /// The user dragged a divider: the list's columns are no longer as
+    /// wide as they were last told to be, and are all told again.
+    pub fn widths_changed_by_hand(&self) {
+        self.sent.borrow_mut().clear();
+    }
+
     /// Lays the columns and the row buttons out in the list's width, so
-    /// that nothing is scrolled sideways (see [`table_fit`]).
-    pub fn fit_columns(&self, dpi: Dpi) {
+    /// that nothing is scrolled sideways (see [`table_fit`]). `fixed` are
+    /// the widths the user set by dragging dividers.
+    pub fn fit_columns(&self, dpi: Dpi, fixed: &[Option<i32>]) {
         // Twice at most. Columns that were too wide had a horizontal scroll
         // bar under them; once they fit it goes, and the vertical one may
         // go with it, which makes the list wider than it was measured.
         for _ in 0..2 {
             let available = client_rect(self.list).right;
-            self.fit_to(available, dpi);
+            self.fit_to(available, dpi, fixed);
             if client_rect(self.list).right == available {
                 break;
             }
         }
     }
 
-    fn fit_to(&self, available: i32, dpi: Dpi) {
+    fn fit_to(&self, available: i32, dpi: Dpi, fixed: &[Option<i32>]) {
         let (fit, has_actions) = {
             let built = self.built.borrow();
             let widths = built.slot_widths.iter();
@@ -309,7 +346,7 @@ impl TableView {
                 .zip(&built.slots)
                 .map(|(&width, slot)| (width, slot.fold))
                 .collect();
-            let fit = table_fit(available, &built.columns, &buttons, dpi);
+            let fit = table_fit(available, &built.columns, fixed, &buttons, dpi);
             // What makes a horizontal scroll bar impossible. Only a list
             // narrower than the menu button alone could break it.
             debug_assert!(fit.total() <= available.max(dpi.px(48)), "{fit:?}");
@@ -607,7 +644,92 @@ mod tests {
     }
 
     fn fit_of(table: &Table, available: i32, dpi: Dpi) -> Fit {
-        table_fit(available, &table.columns, &buttons_of(table, dpi), dpi)
+        table_fit(available, &table.columns, &[], &buttons_of(table, dpi), dpi)
+    }
+
+    /// The same with the widths `fixed` set by the user.
+    fn fit_fixed(table: &Table, available: i32, fixed: &[Option<i32>], dpi: Dpi) -> Fit {
+        table_fit(
+            available,
+            &table.columns,
+            fixed,
+            &buttons_of(table, dpi),
+            dpi,
+        )
+    }
+
+    #[test]
+    fn a_width_the_user_set_is_kept_and_the_others_fit_around_it() {
+        let table = table_of(ResourceKind::Container);
+        for dpi in SCALES.map(Dpi) {
+            let available = list_width(DEFAULT_WINDOW, true, dpi);
+            let automatic = fit_of(&table, available, dpi);
+            // The image column dragged 60 wider, as `fix_after_drag` keeps
+            // it: with the name left of it as it was.
+            let image = automatic.widths[1] + dpi.px(60);
+            let fixed = [Some(automatic.widths[0]), Some(image)];
+            let fit = fit_fixed(&table, available, &fixed, dpi);
+            assert_eq!(fit.widths[0], automatic.widths[0]);
+            assert_eq!(fit.widths[1], image);
+            // Still as wide as the list, to the pixel: no scroll bar, no
+            // gap. The columns right of the divider gave the room.
+            assert_eq!(fit.total(), available, "{} DPI", dpi.0);
+            let rest = |fit: &Fit| fit.widths[2..].iter().sum::<i32>();
+            assert_eq!(rest(&fit), rest(&automatic) - dpi.px(60));
+            // Narrower than it would be by itself works the same way.
+            let narrow = [None, Some(dpi.px(60))];
+            let fit = fit_fixed(&table, available, &narrow, dpi);
+            assert_eq!(fit.widths[1], dpi.px(60));
+            assert_eq!(fit.total(), available);
+            assert!(fit.widths[0] > automatic.widths[0]);
+        }
+    }
+
+    #[test]
+    fn widths_the_user_set_never_make_the_list_scroll_sideways() {
+        for kind in TABS {
+            let table = table_of(kind);
+            let columns = table.columns.len();
+            for dpi in [Dpi(96), Dpi(120), Dpi(192)] {
+                let menu_button_alone = button_metrics(dpi).more + 2 * button_metrics(dpi).gap;
+                // One column made very wide, every column fixed, and a
+                // column made as narrow as a divider allows.
+                let mut wide = vec![None; columns];
+                wide[0] = Some(dpi.px(900));
+                let all = vec![Some(dpi.px(130)); columns];
+                let mut narrow = vec![None; columns];
+                narrow[columns - 1] = Some(dpi.px(40));
+                for fixed in [wide, all, narrow] {
+                    for available in (0..dpi.px(1600)).step_by(13) {
+                        let fit = fit_fixed(&table, available, &fixed, dpi);
+                        assert_eq!(fit.widths.len(), columns);
+                        assert!(
+                            fit.total() <= available.max(menu_button_alone),
+                            "{kind:?} at {} DPI in {available} px with {fixed:?}: {fit:?}",
+                            dpi.0
+                        );
+                        assert!(fit.widths.iter().all(|&width| width >= 0));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_column_the_user_sized_stays_while_the_others_give_way() {
+        let table = table_of(ResourceKind::Container);
+        let dpi = Dpi(96);
+        // Disk I/O, the first column to go in a narrow list, sized by hand.
+        let last = table.columns.len() - 1;
+        let mut fixed = vec![None; table.columns.len()];
+        fixed[last] = Some(120);
+        let available = list_width(SMALLEST_WINDOW, true, dpi);
+        let fit = fit_fixed(&table, available, &fixed, dpi);
+        assert_eq!(fit.widths[last], 120);
+        assert_eq!(fit.total(), available);
+        // The name is still there, and other columns went in its place.
+        assert!(fit.widths[0] > 0);
+        assert!(fit.widths[1..last].contains(&0));
     }
 
     /// The titles of the columns that show, and the labels of the actions

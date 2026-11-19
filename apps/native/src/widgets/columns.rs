@@ -38,6 +38,13 @@ pub fn distribute(available: i32, columns: &[(u16, i32)]) -> Vec<i32> {
             .sum();
         let pool = available - pinned;
         if weight == 0 || pool <= 0 {
+            // Nothing is left to share: what was not pinned has its
+            // minimum, not the share of a pass that pinned another column.
+            for index in 0..columns.len() {
+                if flexible[index] {
+                    widths[index] = columns[index].1.max(0);
+                }
+            }
             break;
         }
         let mut squeezed = false;
@@ -64,6 +71,38 @@ pub fn distribute(available: i32, columns: &[(u16, i32)]) -> Vec<i32> {
         }
     }
     widths
+}
+
+/// Takes in what the user did by dragging the divider at the right of
+/// column `dragged`. `widths` are the columns' widths after the drag and
+/// `fixed` the widths the user had set before, one entry per column, `None`
+/// for a column that is still laid out automatically.
+///
+/// The dragged column keeps the width it was given, and so does every
+/// column left of it that shows: the divider stands where their widths add
+/// up to, and stays where it was dropped only if none of them is laid out
+/// again. The columns right of it are untouched and share what is left. A
+/// column that does not show (width 0) stays automatic. No width is fixed
+/// below `least` or above `most`.
+pub fn fix_after_drag(
+    fixed: &mut Vec<Option<i32>>,
+    widths: &[i32],
+    dragged: usize,
+    least: i32,
+    most: i32,
+) {
+    if dragged >= widths.len() {
+        return;
+    }
+    if fixed.len() < widths.len() {
+        fixed.resize(widths.len(), None);
+    }
+    let most = most.max(least);
+    for (index, &width) in widths.iter().enumerate().take(dragged + 1) {
+        if index == dragged || width > 0 {
+            fixed[index] = Some(width.clamp(least, most));
+        }
+    }
 }
 
 /// A column as the layout sees it, in pixels.
@@ -288,6 +327,25 @@ mod tests {
     }
 
     #[test]
+    fn a_column_that_takes_all_there_is_leaves_the_others_their_minimum() {
+        // By weight each would get 13; the third needs all 40, and the
+        // other two are left with nothing, not with the 13 of that pass.
+        assert_eq!(distribute(40, &[(1, 0), (1, 0), (1, 40)]), vec![0, 0, 40]);
+        assert_eq!(distribute(45, &[(1, 5), (1, 0), (1, 40)]), vec![5, 0, 40]);
+        for available in 0..300 {
+            let columns = [(1, 20), (2, 0), (1, 90), (3, 10)];
+            let widths = distribute(available, &columns);
+            // Never wider than there is, once the minimums fit.
+            if available >= 120 {
+                assert_eq!(widths.iter().sum::<i32>(), available, "{available}");
+            }
+            for (width, (_, min)) in widths.iter().zip(columns) {
+                assert!(*width >= min, "{available}: {widths:?}");
+            }
+        }
+    }
+
+    #[test]
     fn fixed_columns_keep_their_width() {
         let widths = distribute(500, &[(0, 120), (1, 10), (1, 10)]);
         assert_eq!(widths, vec![120, 190, 190]);
@@ -435,6 +493,27 @@ mod tests {
             assert!(fit.total() <= available.max(40), "{available}: {fit:?}");
             assert!(fit.widths.iter().all(|&width| width >= 0));
         }
+    }
+
+    #[test]
+    fn a_dragged_divider_fixes_its_column_and_the_ones_left_of_it() {
+        let mut fixed = Vec::new();
+        // The divider right of the third column was dragged. The second
+        // column does not show, and stays automatic.
+        fix_after_drag(&mut fixed, &[200, 0, 150, 90, 60], 2, 30, 900);
+        assert_eq!(fixed, [Some(200), None, Some(150), None, None]);
+        // Another drag, of the first: the third keeps what it was given.
+        fix_after_drag(&mut fixed, &[260, 0, 150, 70, 40], 0, 30, 900);
+        assert_eq!(fixed, [Some(260), None, Some(150), None, None]);
+        // Dragged shut, or wider than the list: kept within bounds.
+        fix_after_drag(&mut fixed, &[260, 0, 150, 0, 40], 3, 30, 900);
+        assert_eq!(fixed[3], Some(30));
+        fix_after_drag(&mut fixed, &[5000, 0, 150, 30, 40], 0, 30, 900);
+        assert_eq!(fixed[0], Some(900));
+        // A column that is not there changes nothing.
+        let before = fixed.clone();
+        fix_after_drag(&mut fixed, &[1, 2, 3, 4, 5], 5, 30, 900);
+        assert_eq!(fixed, before);
     }
 
     #[test]

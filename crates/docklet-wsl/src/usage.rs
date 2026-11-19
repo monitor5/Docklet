@@ -82,7 +82,7 @@ pub struct DiskSpace {
     pub free_bytes: Option<u64>,
 }
 
-/// Docklet's own processes: `docklet-desktop.exe` with its WebView, the
+/// Docklet's own processes: the app with what it started, the
 /// `docklet.exe` proxy and CLI, and the `wsl.exe` relays and keepalive that
 /// serve the docklet distro.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -193,11 +193,12 @@ pub fn cpu_percent(previous: &CpuSample, current: &CpuSample, logical_cpus: u32)
     Some((used as f64 / available * 100.0).clamp(0.0, 100.0))
 }
 
-/// The image names of Docklet's own programs.
-const DOCKLET_PROGRAMS: [&str; 2] = ["docklet.exe", "docklet-desktop.exe"];
+/// The image names of Docklet's own programs: the CLI, the native app, and
+/// the name the app had while it was a WebView.
+const DOCKLET_PROGRAMS: [&str; 3] = ["docklet.exe", "docklet-native.exe", "docklet-desktop.exe"];
 
-/// Docklet's processes: its programs, everything they started (the WebView
-/// of the window, relays, consoles), and `wsl.exe` processes that
+/// Docklet's processes: its programs, everything they started (the pipe
+/// proxy, relays, consoles), and `wsl.exe` processes that
 /// `is_docklet_wsl` recognises, which catches the keepalive after the
 /// `docklet start` that spawned it has exited.
 ///
@@ -319,6 +320,154 @@ pub fn gpu_for_process(
     }
 }
 
+/// Reads a number of `size` bytes at `at`, little-endian, if it is there.
+fn number_at(bytes: &[u8], at: usize, size: usize) -> Option<u64> {
+    let field = bytes.get(at..at.checked_add(size)?)?;
+    let mut value = [0u8; 8];
+    value.get_mut(..size)?.copy_from_slice(field);
+    Some(u64::from_le_bytes(value))
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<usize> {
+    number_at(bytes, at, 4).map(|value| value as usize)
+}
+
+/// Decodes the UTF-16 text that starts at `bytes` and ends with a NUL or
+/// with the slice into `text`, replacing what it held.
+fn utf16_into(bytes: &[u8], text: &mut String) {
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .take_while(|&unit| unit != 0);
+    text.clear();
+    text.extend(char::decode_utf16(units).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER)));
+}
+
+/// `PERF_DATA_HEADER`, which begins what `PerfQueryCounterData` returns.
+const DATA_HEADER_SIZE: usize = 48;
+/// Where the header's `PerfTime100NSec` is.
+const DATA_HEADER_TIME: usize = 16;
+/// `PERF_COUNTER_HEADER`, which begins the reply to each counter asked for.
+const COUNTER_HEADER_SIZE: usize = 16;
+/// `PERF_COUNTERSET`: several counters of several instances.
+const BLOCK_OF_COUNTER_SET: usize = 6;
+
+/// What [`read_counter_set`] calls per instance: with its name, the IDs of
+/// the counters and their raw values, in the same order.
+pub type InstanceVisitor<'a> = dyn FnMut(&str, &[u32], &[u64]) + 'a;
+
+/// Walks what `PerfQueryCounterData` returns for a query that asks for
+/// every counter of every instance of one counter set, the form the GPU
+/// counters are read in, and calls `visit` for each instance.
+///
+/// Returns when the data was taken, in 100 ns units, which is what a rate
+/// between two samples is divided by; `None` if the reply is not of that
+/// form or is cut short. Every offset is checked against the reply: the
+/// sizes in it are Windows' own, but nothing is read on their word alone.
+pub fn read_counter_set(reply: &[u8], visit: &mut InstanceVisitor<'_>) -> Option<i64> {
+    let taken = number_at(reply, DATA_HEADER_TIME, 8)? as i64;
+    let block = DATA_HEADER_SIZE;
+    let status = u32_at(reply, block)?;
+    let kind = u32_at(reply, block + 4)?;
+    let block_end = block.checked_add(u32_at(reply, block + 8)?)?;
+    if status != 0 || kind != BLOCK_OF_COUNTER_SET || block_end > reply.len() {
+        return None;
+    }
+    // `PERF_MULTI_COUNTERS`: its size, the number of counters, their IDs.
+    let counters = block + COUNTER_HEADER_SIZE;
+    let count = u32_at(reply, counters + 4)?;
+    let ids: Vec<u32> = (0..count)
+        .map(|index| u32_at(reply, counters + 8 + index * 4).map(|id| id as u32))
+        .collect::<Option<_>>()?;
+    // `PERF_MULTI_INSTANCES`: its size with all that follows, and how many.
+    let instances = counters.checked_add(u32_at(reply, counters)?)?;
+    let instance_count = u32_at(reply, instances + 4)?;
+    let mut at = instances + 8;
+    let mut name = String::new();
+    let mut values = Vec::with_capacity(ids.len());
+    for _ in 0..instance_count {
+        // `PERF_INSTANCE_HEADER`: its size with the name, and an ID.
+        let header = u32_at(reply, at)?;
+        let name_end = at.checked_add(header)?;
+        if header < 8 || name_end > block_end {
+            return None;
+        }
+        utf16_into(reply.get(at + 8..name_end)?, &mut name);
+        at = name_end;
+        values.clear();
+        for _ in &ids {
+            // `PERF_COUNTER_DATA`: the size of the value, and of both.
+            let data = u32_at(reply, at)?;
+            let size = u32_at(reply, at + 4)?;
+            if size < 8 || data > size - 8 {
+                return None;
+            }
+            // A value of another size than 4 or 8 bytes is not a number.
+            values.push(match data {
+                4 | 8 => number_at(reply, at + 8, data)?,
+                _ => 0,
+            });
+            at = at.checked_add(size)?;
+        }
+        if at > block_end {
+            return None;
+        }
+        visit(&name, &ids, &values);
+    }
+    Some(taken)
+}
+
+/// The ID of the counter called `wanted` in what
+/// `PerfQueryCounterSetRegistrationInfo` returns for the English names of a
+/// counter set's counters: a count, then per counter its ID and where in
+/// the buffer its name starts.
+pub fn counter_named(names: &[u8], wanted: &str) -> Option<u32> {
+    let count = u32_at(names, 4)?;
+    let mut name = String::new();
+    (0..count).find_map(|index| {
+        let entry = 8 + index * 8;
+        let id = u32_at(names, entry)?;
+        let offset = u32_at(names, entry + 4)?;
+        utf16_into(names.get(offset..)?, &mut name);
+        (name == wanted).then_some(id as u32)
+    })
+}
+
+/// How long each GPU engine has run for one process, at one moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineTimes {
+    /// When the times were taken, in 100 ns units.
+    pub taken: i64,
+    /// Per engine instance, the time it has run for the process, in 100 ns
+    /// units.
+    pub running: Vec<(String, u64)>,
+}
+
+/// How busy each engine was between two samples, in percent: the time it
+/// ran of the time that passed, which is how Windows itself turns the
+/// counter into `Utilization Percentage`. An engine that was not there in
+/// the earlier sample has no figure yet. `None` when no time passed.
+pub fn engine_utilization(
+    previous: &EngineTimes,
+    current: &EngineTimes,
+) -> Option<Vec<(String, f64)>> {
+    let elapsed = current.taken.checked_sub(previous.taken)?;
+    if elapsed <= 0 {
+        return None;
+    }
+    let before: HashMap<&str, u64> = previous
+        .running
+        .iter()
+        .map(|(instance, ran)| (instance.as_str(), *ran))
+        .collect();
+    let busy = current.running.iter().filter_map(|(instance, ran)| {
+        let ran = ran.checked_sub(*before.get(instance.as_str())?)?;
+        Some((instance.clone(), ran as f64 / elapsed as f64 * 100.0))
+    });
+    Some(busy.collect())
+}
+
 /// The distro's virtual disk, under Docklet's data directory.
 pub fn vhdx_path(data_dir: &Path) -> PathBuf {
     data_dir.join("distro").join("ext4.vhdx")
@@ -327,11 +476,20 @@ pub fn vhdx_path(data_dir: &Path) -> PathBuf {
 /// Takes samples of `HostUsage`, keeping what CPU and GPU rates need from
 /// one sample to the next. Create one per window and keep it; a fresh
 /// sampler cannot give CPU or GPU percentages in its first sample.
+///
+/// Everything a sampler holds goes with it: the two counter queries, the
+/// buffers they and the process list are read into. Dropping it when the
+/// window closes leaves nothing of it in the process.
 pub struct UsageSampler {
     data_dir: PathBuf,
     previous_cpu: Option<CpuSample>,
     #[cfg(windows)]
     gpu: Option<windows_impl::GpuCounters>,
+    /// What the process list is read into. Kept, so it is as large as the
+    /// list turned out to be, and a sample asks for the list once and not
+    /// a second time with a larger buffer.
+    #[cfg(windows)]
+    processes: Vec<u64>,
 }
 
 impl UsageSampler {
@@ -342,6 +500,8 @@ impl UsageSampler {
             previous_cpu: None,
             #[cfg(windows)]
             gpu: windows_impl::GpuCounters::open(),
+            #[cfg(windows)]
+            processes: Vec::new(),
         }
     }
 
@@ -354,7 +514,7 @@ impl UsageSampler {
     /// a missing disk or GPU counter shows up as `None` in its field.
     #[cfg(windows)]
     pub fn sample(&mut self) -> io::Result<HostUsage> {
-        let processes = windows_impl::process_list()?;
+        let processes = windows_impl::process_list(&mut self.processes)?;
         let taken = Instant::now();
         let members = docklet_processes(&processes, |process| {
             windows_impl::command_line(process.pid).is_some_and(|line| names_docklet_distro(&line))
@@ -428,19 +588,22 @@ mod windows_impl {
     use windows::Wdk::System::Threading::{
         NtQueryInformationProcess, ProcessCommandLineInformation,
     };
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Performance::{
-        PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
-        PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
-        PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+        PERF_COUNTER_IDENTIFIER, PERF_REG_COUNTER_ENGLISH_NAMES, PERF_WILDCARD_COUNTER,
+        PerfAddCounters, PerfCloseQueryHandle, PerfOpenQueryHandle, PerfQueryCounterData,
+        PerfQueryCounterSetRegistrationInfo,
     };
     use windows::Win32::System::Threading::{
         ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, OpenProcess,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows::core::{PCWSTR, w};
+    use windows::core::{GUID, PCWSTR};
 
-    use super::{GpuUsage, ProcessInfo, gpu_for_process};
+    use super::{
+        EngineTimes, GpuUsage, ProcessInfo, counter_named, engine_utilization, gpu_for_process,
+        read_counter_set,
+    };
 
     const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
     const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
@@ -487,12 +650,16 @@ mod windows_impl {
     /// Every process on the system, from one `NtQuerySystemInformation`
     /// call. Unlike opening each process, this also covers the VM process,
     /// which a normal user may not open.
-    pub(super) fn process_list() -> io::Result<Vec<ProcessInfo>> {
-        // `u64` elements keep the entries' 8-byte fields aligned.
-        let mut buffer = vec![0u64; 64 * 1024];
-        // The list grows between the size query and the call when processes
-        // start; a few attempts with room to spare are enough.
+    ///
+    /// The list is written into `buffer`, which the caller keeps for the
+    /// next call. A megabyte for 400 processes: a call that finds the
+    /// buffer too small, and the new buffer it then takes, add half as
+    /// much again to what a list costs (measured: 10 ms against 7).
+    pub(super) fn process_list(buffer: &mut Vec<u64>) -> io::Result<Vec<ProcessInfo>> {
+        // The list grows between two calls when processes start; a few
+        // attempts with room to spare are enough.
         for _ in 0..4 {
+            // `u64` elements keep the entries' 8-byte fields aligned.
             let bytes = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
             let mut needed = 0u32;
             // SAFETY: the buffer is writable for `bytes` bytes and `needed`
@@ -506,8 +673,7 @@ mod windows_impl {
                 )
             };
             if status.0 == STATUS_INFO_LENGTH_MISMATCH {
-                let words = (needed as usize).max(bytes as usize * 2) / 8 + 8 * 1024;
-                buffer = vec![0u64; words];
+                *buffer = vec![0u64; grown(needed as usize, bytes as usize) / 8];
                 continue;
             }
             if status.is_err() {
@@ -516,11 +682,24 @@ mod windows_impl {
                     status.0
                 )));
             }
-            return Ok(parse_process_list(&buffer));
+            return Ok(parse_process_list(buffer));
         }
         Err(io::Error::other(
             "the process list kept growing while it was read",
         ))
+    }
+
+    /// How many bytes to try next for a list that needed `needed` and did
+    /// not fit `had`: an eighth more than it needed and room for a few
+    /// hundred threads, so the processes that start between two samples
+    /// fit as well. Should Windows not say what it needed, twice what was
+    /// tried.
+    fn grown(needed: usize, had: usize) -> usize {
+        if needed > had {
+            needed + needed / 8 + 64 * 1024
+        } else {
+            (had * 2).max(512 * 1024)
+        }
     }
 
     fn parse_process_list(buffer: &[u64]) -> Vec<ProcessInfo> {
@@ -613,65 +792,225 @@ mod windows_impl {
         unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) }
     }
 
-    /// The PDH query with the three GPU counters, kept open between samples
-    /// because utilisation is a rate of two collections.
-    pub(super) struct GpuCounters {
-        query: PDH_HQUERY,
-        engine: PDH_HCOUNTER,
-        dedicated: PDH_HCOUNTER,
-        shared: PDH_HCOUNTER,
+    /// The counter set `GPU Engine`: per process, adapter and engine, how
+    /// long the engine has run for the process. The graphics kernel has
+    /// registered it under this GUID since it has had the counters
+    /// (Windows 10 1709).
+    const GPU_ENGINE: GUID = GUID::from_u128(0x978c167d_4764_4d9c_9824_14747351dc81);
+    /// The counter set `GPU Process Memory`: per process and adapter.
+    const GPU_PROCESS_MEMORY: GUID = GUID::from_u128(0xf802502b_77b4_4713_81b3_3be05759da5d);
+
+    /// One query for every counter of every instance of one counter set,
+    /// through the PerfLib consumer calls of advapi32.
+    struct CounterQuery {
+        handle: HANDLE,
+        /// What the last collection returned, kept so the next one finds
+        /// the room it needs at once.
+        reply: Vec<u64>,
     }
 
-    // SAFETY: PDH handles are not tied to the thread that opened them, and
-    // `&mut self` on every use keeps two threads from using them at once.
-    unsafe impl Send for GpuCounters {}
+    // SAFETY: a query handle is not tied to the thread that opened it, and
+    // `&mut self` on every use keeps two threads from using it at once.
+    unsafe impl Send for CounterQuery {}
 
-    impl GpuCounters {
-        /// `None` when PDH or the GPU counter sets are not there.
-        pub(super) fn open() -> Option<Self> {
-            let mut query = PDH_HQUERY(std::ptr::null_mut());
-            // SAFETY: `query` is a valid place for the handle.
-            if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
+    impl CounterQuery {
+        /// `None` when the counter set is not there.
+        fn open(set: &GUID) -> Option<Self> {
+            let mut handle = HANDLE::default();
+            // SAFETY: `handle` is a valid place for the handle.
+            if unsafe { PerfOpenQueryHandle(PCWSTR::null(), &mut handle) } != 0 {
                 return None;
             }
-            let mut counters = Self {
-                query,
-                engine: PDH_HCOUNTER(std::ptr::null_mut()),
-                dedicated: PDH_HCOUNTER(std::ptr::null_mut()),
-                shared: PDH_HCOUNTER(std::ptr::null_mut()),
+            // From here on a failure drops `query`, which closes the handle.
+            let query = Self {
+                handle,
+                reply: vec![0u64; 8],
             };
-            let paths = [
-                w!("\\GPU Engine(*)\\Utilization Percentage"),
-                w!("\\GPU Process Memory(*)\\Dedicated Usage"),
-                w!("\\GPU Process Memory(*)\\Shared Usage"),
-            ];
-            let slots = [
-                &mut counters.engine,
-                &mut counters.dedicated,
-                &mut counters.shared,
-            ];
-            for (path, slot) in paths.into_iter().zip(slots) {
-                // SAFETY: the query is open, the path is a static wide
-                // string and `slot` a valid place for the handle. On failure
-                // `counters` is dropped, which closes the query.
-                if unsafe { PdhAddEnglishCounterW(query, path, 0, slot) } != 0 {
+            // A `PERF_COUNTER_IDENTIFIER` and, right after it, the name of
+            // the instances asked for: `*`, every one. As `u64`s the block
+            // is aligned for the identifier, and a multiple of 8 bytes long
+            // as the call demands.
+            let mut block = [0u64; 6];
+            let size = size_of_val(&block) as u32;
+            let identifier = PERF_COUNTER_IDENTIFIER {
+                CounterSetGuid: *set,
+                Status: 0,
+                Size: size,
+                CounterId: PERF_WILDCARD_COUNTER,
+                // Not filtered by instance ID.
+                InstanceId: u32::MAX,
+                Index: 0,
+                Reserved: 0,
+            };
+            // SAFETY: the block holds the identifier (40 bytes) and the two
+            // UTF-16 units of the name with its NUL after it, and stays
+            // where it is for the call, which reads `size` bytes and writes
+            // the identifier's status back.
+            let status = unsafe {
+                let start = block.as_mut_ptr().cast::<PERF_COUNTER_IDENTIFIER>();
+                start.write(identifier);
+                start.add(1).cast::<u16>().write(u16::from(b'*'));
+                match PerfAddCounters(handle, start, size) {
+                    0 => start.read().Status,
+                    failed => failed,
+                }
+            };
+            (status == 0).then_some(query)
+        }
+
+        /// Takes the counters now. What it returns is good until the next
+        /// call.
+        fn collect(&mut self) -> Option<&[u8]> {
+            // The instances come and go with the processes that use the
+            // GPU, and the size of the reply with them.
+            for _ in 0..3 {
+                let room = u32::try_from(self.reply.len() * 8).unwrap_or(u32::MAX);
+                let mut actual = 0u32;
+                // SAFETY: the buffer is writable for `room` bytes and
+                // aligned for the header the call writes at its start;
+                // `actual` is a valid place for the size.
+                let status = unsafe {
+                    PerfQueryCounterData(
+                        self.handle,
+                        Some(self.reply.as_mut_ptr().cast()),
+                        room,
+                        &mut actual,
+                    )
+                };
+                if actual > room {
+                    let wanted = actual as usize + actual as usize / 4;
+                    self.reply = vec![0u64; wanted.div_ceil(8)];
+                    continue;
+                }
+                if status != 0 {
                     return None;
                 }
+                // SAFETY: the call wrote `actual` bytes, which is no more
+                // than the buffer holds; bytes have no alignment.
+                return Some(unsafe {
+                    std::slice::from_raw_parts(self.reply.as_ptr().cast::<u8>(), actual as usize)
+                });
             }
-            // The first collection is the baseline for the utilisation rate.
-            // SAFETY: the query is open.
-            unsafe { PdhCollectQueryData(query) };
-            Some(counters)
+            None
+        }
+    }
+
+    impl Drop for CounterQuery {
+        fn drop(&mut self) {
+            // SAFETY: the handle was opened by `open` and is closed once,
+            // which also frees what the query collected into.
+            unsafe { PerfCloseQueryHandle(self.handle) };
+        }
+    }
+
+    /// The English names of the counters of `set`, in the form
+    /// `counter_named` reads.
+    fn counter_names(set: &GUID) -> Option<Vec<u8>> {
+        let mut size = 0u32;
+        // SAFETY: without a buffer the call only says how large one must
+        // be; `size` is a valid place for that.
+        unsafe {
+            PerfQueryCounterSetRegistrationInfo(
+                PCWSTR::null(),
+                set,
+                PERF_REG_COUNTER_ENGLISH_NAMES,
+                0,
+                None,
+                &mut size,
+            )
+        };
+        let mut names = vec![0u8; size as usize];
+        // SAFETY: the call is told the buffer's length by the slice.
+        let status = unsafe {
+            PerfQueryCounterSetRegistrationInfo(
+                PCWSTR::null(),
+                set,
+                PERF_REG_COUNTER_ENGLISH_NAMES,
+                0,
+                Some(&mut names),
+                &mut size,
+            )
+        };
+        (status == 0 && !names.is_empty()).then_some(names)
+    }
+
+    /// The GPU counters, kept open between samples because utilisation is
+    /// a rate between two of them.
+    ///
+    /// They are read with the PerfLib consumer calls and not with PDH. PDH
+    /// finds counters by name, and for that loads the names and help texts
+    /// of every counter on the system: a quarter of a second of processor
+    /// time when the query is opened, and 5 MB that stay in the process
+    /// for good, also after the query is closed. These calls take a counter
+    /// set by its GUID, a sample costs about a millisecond, and closing
+    /// the queries gives back all they held.
+    pub(super) struct GpuCounters {
+        engines: CounterQuery,
+        memory: CounterQuery,
+        /// The IDs of `Utilization Percentage`, `Dedicated Usage` and
+        /// `Shared Usage` in their counter sets.
+        utilization: u32,
+        dedicated: u32,
+        shared: u32,
+        /// The process the last sample was of, and how long its engines
+        /// had run then.
+        previous: Option<(u32, EngineTimes)>,
+    }
+
+    impl GpuCounters {
+        /// `None` when the GPU counter sets are not there.
+        pub(super) fn open() -> Option<Self> {
+            let engine_names = counter_names(&GPU_ENGINE)?;
+            let memory_names = counter_names(&GPU_PROCESS_MEMORY)?;
+            Some(Self {
+                utilization: counter_named(&engine_names, "Utilization Percentage")?,
+                dedicated: counter_named(&memory_names, "Dedicated Usage")?,
+                shared: counter_named(&memory_names, "Shared Usage")?,
+                engines: CounterQuery::open(&GPU_ENGINE)?,
+                memory: CounterQuery::open(&GPU_PROCESS_MEMORY)?,
+                previous: None,
+            })
         }
 
         pub(super) fn read(&mut self, pid: u32) -> Option<GpuUsage> {
-            // SAFETY: the query is open.
-            if unsafe { PdhCollectQueryData(self.query) } != 0 {
-                return None;
-            }
-            let engines = counter_array(self.engine);
-            let dedicated = counter_array(self.dedicated)?;
-            let shared = counter_array(self.shared)?;
+            // Instances are named `pid_1234_luid_...`.
+            let of_process = format!("pid_{pid}_");
+            let value = |ids: &[u32], values: &[u64], wanted: u32| {
+                let at = ids.iter().position(|&id| id == wanted)?;
+                values.get(at).copied()
+            };
+
+            // The raw value of the utilisation counter is the time the
+            // engine has run; the percentage is its rate.
+            let utilization = self.utilization;
+            let mut running = Vec::new();
+            let taken = read_counter_set(self.engines.collect()?, &mut |instance, ids, values| {
+                if instance.starts_with(&of_process)
+                    && let Some(ran) = value(ids, values, utilization)
+                {
+                    running.push((instance.to_string(), ran));
+                }
+            })?;
+            let current = EngineTimes { taken, running };
+            let engines = match &self.previous {
+                Some((before, times)) if *before == pid => engine_utilization(times, &current),
+                _ => None,
+            };
+            self.previous = Some((pid, current));
+
+            let (dedicated_id, shared_id) = (self.dedicated, self.shared);
+            let (mut dedicated, mut shared) = (Vec::new(), Vec::new());
+            read_counter_set(self.memory.collect()?, &mut |instance, ids, values| {
+                if !instance.starts_with(&of_process) {
+                    return;
+                }
+                if let Some(bytes) = value(ids, values, dedicated_id) {
+                    dedicated.push((instance.to_string(), bytes as f64));
+                }
+                if let Some(bytes) = value(ids, values, shared_id) {
+                    shared.push((instance.to_string(), bytes as f64));
+                }
+            })?;
             Some(gpu_for_process(
                 pid,
                 engines.as_deref(),
@@ -679,66 +1018,6 @@ mod windows_impl {
                 &shared,
             ))
         }
-    }
-
-    impl Drop for GpuCounters {
-        fn drop(&mut self) {
-            // SAFETY: the query was opened by `open` and is closed once,
-            // which also frees its counters.
-            unsafe { PdhCloseQuery(self.query) };
-        }
-    }
-
-    /// Instance names and values of a wildcard counter. Instances whose
-    /// value is not valid yet are left out; `None` when the array cannot be
-    /// read at all, as for a rate counter after one collection.
-    fn counter_array(counter: PDH_HCOUNTER) -> Option<Vec<(String, f64)>> {
-        let item_size = size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-        let mut bytes = 0u32;
-        // The instance list can grow between the size query and the read.
-        for _ in 0..3 {
-            let mut count = 0u32;
-            let mut items =
-                vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); (bytes as usize).div_ceil(item_size)];
-            let buffer = (!items.is_empty()).then_some(items.as_mut_ptr());
-            // SAFETY: `items` holds at least `bytes` bytes, suitably aligned
-            // for the items PDH writes at its start; the names it points to
-            // are written into the same buffer, which outlives their use.
-            let status = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    counter,
-                    PDH_FMT_DOUBLE,
-                    &mut bytes,
-                    &mut count,
-                    buffer,
-                )
-            };
-            if status == PDH_MORE_DATA {
-                continue;
-            }
-            if status != 0 {
-                return None;
-            }
-            let count = (count as usize).min(items.len());
-            let values = items[..count]
-                .iter()
-                .filter(|item| {
-                    matches!(
-                        item.FmtValue.CStatus,
-                        PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
-                    )
-                })
-                .map(|item| {
-                    // SAFETY: PDH_FMT_DOUBLE fills the double, and the name
-                    // is a NUL-terminated string inside `items`.
-                    let value = unsafe { item.FmtValue.Anonymous.doubleValue };
-                    let name = unsafe { item.szName.to_string() }.unwrap_or_default();
-                    (name, value)
-                })
-                .collect();
-            return Some(values);
-        }
-        None
     }
 }
 
@@ -855,7 +1134,7 @@ mod tests {
     fn docklet_processes_are_its_programs_their_children_and_its_wsl_clients() {
         let processes = [
             process(1, 0, "explorer.exe", 1),
-            process(10, 1, "docklet-desktop.exe", 10),
+            process(10, 1, "docklet-native.exe", 10),
             process(11, 10, "msedgewebview2.exe", 11),
             process(12, 11, "msedgewebview2.exe", 12),
             process(20, 1, "DOCKLET.EXE", 20),
@@ -1011,7 +1290,192 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
-    /// Reads the real process list, PDH counters and disk. Read-only, starts
+    /// A counter block as Windows lays it out, built by hand: the data
+    /// header, one `PERF_COUNTERSET` block with the counters `ids`, and per
+    /// instance its name and one value per counter, of 8 bytes each.
+    fn counter_reply(taken: i64, ids: &[u32], instances: &[(&str, &[u64])]) -> Vec<u8> {
+        fn put(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn pad(bytes: &mut Vec<u8>) {
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+        }
+        // `PERF_MULTI_COUNTERS` and the IDs after it.
+        let mut counters = Vec::new();
+        put(&mut counters, 0);
+        put(&mut counters, ids.len() as u32);
+        ids.iter().for_each(|&id| put(&mut counters, id));
+        pad(&mut counters);
+        let size = counters.len() as u32;
+        counters[..4].copy_from_slice(&size.to_le_bytes());
+        // `PERF_MULTI_INSTANCES` and the instances after it.
+        let mut body = Vec::new();
+        put(&mut body, 0);
+        put(&mut body, instances.len() as u32);
+        for (name, values) in instances {
+            let mut header = Vec::new();
+            put(&mut header, 0);
+            // The instance's ID, which nothing here reads.
+            put(&mut header, 7);
+            for unit in name.encode_utf16().chain([0]) {
+                header.extend_from_slice(&unit.to_le_bytes());
+            }
+            pad(&mut header);
+            let size = header.len() as u32;
+            header[..4].copy_from_slice(&size.to_le_bytes());
+            body.extend(header);
+            for value in *values {
+                put(&mut body, 8);
+                put(&mut body, 16);
+                body.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let size = body.len() as u32;
+        body[..4].copy_from_slice(&size.to_le_bytes());
+
+        let mut reply = vec![0u8; DATA_HEADER_SIZE];
+        reply[4..8].copy_from_slice(&1u32.to_le_bytes());
+        reply[DATA_HEADER_TIME..DATA_HEADER_TIME + 8].copy_from_slice(&taken.to_le_bytes());
+        // `PERF_COUNTER_HEADER`: status, type, size, reserved.
+        put(&mut reply, 0);
+        put(&mut reply, BLOCK_OF_COUNTER_SET as u32);
+        put(
+            &mut reply,
+            (COUNTER_HEADER_SIZE + counters.len() + body.len()) as u32,
+        );
+        put(&mut reply, 0);
+        reply.extend(counters);
+        reply.extend(body);
+        let total = reply.len() as u32;
+        reply[..4].copy_from_slice(&total.to_le_bytes());
+        reply
+    }
+
+    /// An instance as `read_counter_set` hands it over: name, IDs, values.
+    type Instance = (String, Vec<u32>, Vec<u64>);
+
+    fn instances_of(reply: &[u8]) -> Option<(i64, Vec<Instance>)> {
+        let mut seen = Vec::new();
+        let taken = read_counter_set(reply, &mut |name, ids, values| {
+            seen.push((name.to_string(), ids.to_vec(), values.to_vec()));
+        })?;
+        Some((taken, seen))
+    }
+
+    #[test]
+    fn a_counter_block_gives_each_instance_its_name_and_values() {
+        let engine = "pid_900_luid_0x00000000_0x0000B7A8_phys_0_eng_3_engtype_Video Decode";
+        let reply = counter_reply(
+            134_395_393_361_026_445,
+            &[1, 2],
+            &[
+                (engine, &[11, 22]),
+                ("pid_12_luid_0x0_0x1_phys_0", &[0, u64::MAX]),
+            ],
+        );
+        let (taken, seen) = instances_of(&reply).unwrap();
+        assert_eq!(taken, 134_395_393_361_026_445);
+        assert_eq!(
+            seen,
+            [
+                (engine.to_string(), vec![1, 2], vec![11, 22]),
+                (
+                    "pid_12_luid_0x0_0x1_phys_0".to_string(),
+                    vec![1, 2],
+                    vec![0, u64::MAX]
+                ),
+            ]
+        );
+        // A counter set nothing uses right now has no instances.
+        let (_, none) = instances_of(&counter_reply(5, &[1, 2, 3, 4, 5], &[])).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_counter_block_that_is_cut_short_or_of_another_form_is_not_read() {
+        let reply = counter_reply(5, &[1, 2], &[("pid_1_a", &[1, 2]), ("pid_2_b", &[3, 4])]);
+        assert!(instances_of(&reply).is_some());
+        // Cut anywhere, it is refused and nothing past its end is read.
+        for length in 0..reply.len() {
+            assert_eq!(instances_of(&reply[..length]), None, "cut at {length}");
+        }
+        // An error block, a block of another type.
+        let mut failed = reply.clone();
+        failed[DATA_HEADER_SIZE] = 5;
+        assert_eq!(instances_of(&failed), None);
+        let mut other = reply.clone();
+        other[DATA_HEADER_SIZE + 4] = 4;
+        assert_eq!(instances_of(&other), None);
+        // Sizes that point outside the block.
+        let mut wild = reply.clone();
+        let instances = DATA_HEADER_SIZE + COUNTER_HEADER_SIZE + 16;
+        wild[instances + 4..instances + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(instances_of(&wild), None);
+        let mut wild = reply;
+        wild[instances + 8..instances + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(instances_of(&wild), None);
+    }
+
+    #[test]
+    fn a_counter_is_found_by_its_english_name() {
+        // A count, then per counter its ID and where its name starts.
+        let names = ["Running Time", "Utilization Percentage"];
+        let mut buffer = vec![0u8; 8 + names.len() * 8];
+        buffer[4..8].copy_from_slice(&(names.len() as u32).to_le_bytes());
+        for (index, name) in names.iter().enumerate() {
+            let offset = buffer.len() as u32;
+            let entry = 8 + index * 8;
+            buffer[entry..entry + 4].copy_from_slice(&(index as u32 + 1).to_le_bytes());
+            buffer[entry + 4..entry + 8].copy_from_slice(&offset.to_le_bytes());
+            for unit in name.encode_utf16().chain([0]) {
+                buffer.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        assert_eq!(counter_named(&buffer, "Utilization Percentage"), Some(2));
+        assert_eq!(counter_named(&buffer, "Running Time"), Some(1));
+        assert_eq!(counter_named(&buffer, "Running"), None);
+        assert_eq!(counter_named(&buffer[..20], "Utilization Percentage"), None);
+        assert_eq!(counter_named(&[], "Running Time"), None);
+    }
+
+    fn times(taken: i64, running: &[(&str, u64)]) -> EngineTimes {
+        EngineTimes {
+            taken,
+            running: running
+                .iter()
+                .map(|(instance, ran)| (instance.to_string(), *ran))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_engine_is_as_busy_as_the_time_it_ran_of_the_time_that_passed() {
+        // Two seconds apart, in 100 ns units.
+        let before = times(1_000, &[("3d", 500), ("copy", 100), ("gone", 9)]);
+        let after = times(
+            20_001_000,
+            &[("3d", 5_000_500), ("copy", 100), ("new", 70_000)],
+        );
+        let busy = engine_utilization(&before, &after).unwrap();
+        assert_eq!(busy.len(), 2);
+        assert_eq!(busy[0].0, "3d");
+        assert!((busy[0].1 - 25.0).abs() < 1e-9);
+        assert_eq!(busy[1], ("copy".to_string(), 0.0));
+        // An engine that was not there before has no figure yet, and the
+        // busiest of none is an idle process.
+        assert_eq!(
+            gpu_for_process(1, Some(&[]), &[], &[]).utilization_percent,
+            Some(0.0)
+        );
+        // No time passed, or the clock went back: no figures at all.
+        assert_eq!(engine_utilization(&after, &after), None);
+        assert_eq!(engine_utilization(&after, &before), None);
+        // A counter that went back, as after the process restarted.
+        let restarted = times(40_001_000, &[("3d", 10)]);
+        assert_eq!(engine_utilization(&after, &restarted), Some(Vec::new()));
+    }
+
+    /// Reads the real process list, GPU counters and disk. Read-only, starts
     /// nothing, and is bounded by its two samples and one pause.
     #[cfg(windows)]
     #[test]
@@ -1039,6 +1503,11 @@ mod tests {
             assert!(usage.disk.free_bytes.is_some_and(|free| free > 0));
         }
         // The process list is never empty, and this test is not Docklet.
-        assert!(windows_impl::process_list().unwrap().len() > 10);
+        let mut buffer = Vec::new();
+        assert!(windows_impl::process_list(&mut buffer).unwrap().len() > 10);
+        // The buffer that fitted the list fits it again: one call.
+        let kept = buffer.len();
+        assert!(windows_impl::process_list(&mut buffer).unwrap().len() > 10);
+        assert_eq!(buffer.len(), kept);
     }
 }

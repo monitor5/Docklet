@@ -136,24 +136,14 @@ mod proxy {
     }
 }
 
-/// The real WSL, distro and pipe proxy of this user.
+/// The real WSL, distro and pipe proxy of this user. The pipe proxy is
+/// this same executable in `--proxy` mode.
 #[derive(Debug, Clone, Default)]
-pub struct SystemHost {
-    proxy_command: Option<String>,
-}
+pub struct SystemHost;
 
 impl SystemHost {
-    /// A host whose pipe proxy is this same executable in `--proxy` mode.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A host whose pipe proxy is started with `command_line`, for a shell
-    /// that has no `--proxy` mode of its own (`"C:\...\docklet.exe" proxy`).
-    pub fn with_proxy_command(command_line: impl Into<String>) -> Self {
-        Self {
-            proxy_command: Some(command_line.into()),
-        }
+        Self
     }
 }
 
@@ -184,10 +174,7 @@ impl EngineHost for SystemHost {
     fn spawn_proxy(&self) -> io::Result<()> {
         // Detached, so the Windows docker CLI keeps working when the app
         // exits.
-        let command_line = match &self.proxy_command {
-            Some(command_line) => command_line.clone(),
-            None => format!("\"{}\" --proxy", std::env::current_exe()?.display()),
-        };
+        let command_line = format!("\"{}\" --proxy", std::env::current_exe()?.display());
         docklet_wsl::spawn_detached(&command_line)
     }
 
@@ -250,10 +237,6 @@ impl EngineControl {
         }
     }
 
-    pub fn host(&self) -> &Arc<dyn EngineHost> {
-        &self.host
-    }
-
     /// The transition this process runs now, if any.
     pub fn in_flight(&self) -> Option<Transition> {
         self.supervisor.in_flight()
@@ -278,11 +261,6 @@ impl EngineControl {
             bases: engine::bases(),
             mirrored_networking: self.host.mirrored_networking(),
         })
-    }
-
-    /// See [`reachable`].
-    pub fn reachable(&self) -> bool {
-        reachable(self.host.as_ref())
     }
 
     /// Installs the distro from the published rootfs for `base`, or for the
@@ -543,12 +521,12 @@ mod tests {
     fn a_sleeping_engine_is_not_reachable_whichever_proxy_runs() {
         for proxy in [ProxyMode::Plain, ProxyMode::IdleStop] {
             let host = FakeHost::new(EngineState::Stopped, proxy);
-            assert!(!EngineControl::new(host).reachable());
+            assert!(!reachable(host.as_ref()));
         }
         let no_proxy = FakeHost::new(EngineState::Running, ProxyMode::Down);
-        assert!(!EngineControl::new(no_proxy).reachable());
+        assert!(!reachable(no_proxy.as_ref()));
         let up = FakeHost::new(EngineState::Running, ProxyMode::Plain);
-        assert!(EngineControl::new(up).reachable());
+        assert!(reachable(up.as_ref()));
     }
 
     #[test]

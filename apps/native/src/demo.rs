@@ -45,6 +45,15 @@ pub struct DemoOptions {
     /// Start in the state of one message screen instead of running: wsl,
     /// install, installing, stopped, sleeping, starting or error.
     pub screen: Option<String>,
+    /// How many lines a second a followed log prints, instead of
+    /// [`LINES_PER_SECOND`]: 20 is a container that talks now and then.
+    pub lines_per_second: Option<u64>,
+}
+
+/// How many lines are due `elapsed` after a log started at `rate` lines a
+/// second.
+fn lines_due(elapsed: Duration, rate: u64) -> u64 {
+    u64::try_from(elapsed.as_millis().saturating_mul(u128::from(rate)) / 1000).unwrap_or(u64::MAX)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -380,6 +389,8 @@ struct Inner {
     figures: Gate,
     /// Open while a log is followed and the window shows it.
     logging: Gate,
+    /// Lines a second a followed log prints.
+    rate: u64,
 }
 
 impl Inner {
@@ -450,7 +461,7 @@ impl Inner {
         }
     }
 
-    /// Log lines into the followed log, at `LINES_PER_SECOND` while the gate
+    /// Log lines into the followed log, at the demo's rate while the gate
     /// is open.
     fn feed(&self) {
         let mut sequence = 0u64;
@@ -459,11 +470,13 @@ impl Inner {
             let started = Instant::now();
             let mut accounted = 0u64;
             while self.logging.is_open() {
-                let due = started.elapsed().as_millis() as u64 * LINES_PER_SECOND / 1000;
+                let due = lines_due(started.elapsed(), self.rate);
                 let batch = (due - accounted).min(MAX_BURST);
                 accounted = due;
                 let log = lock(&self.state).log.as_ref().map(|(_, log)| log.clone());
-                if let Some(log) = log {
+                // A tick on which no line is due adds nothing, as a real
+                // log that is quiet sends nothing.
+                if let Some(log) = log.filter(|_| batch > 0) {
                     log.append((0..batch).map(|_| {
                         let mut line = String::with_capacity(128);
                         fake_line(&mut line, sequence);
@@ -517,6 +530,7 @@ impl Demo {
             acting: AtomicBool::new(false),
             figures: Gate::new(),
             logging: Gate::new(),
+            rate: options.lines_per_second.unwrap_or(LINES_PER_SECOND),
         });
         let sampler = inner.clone();
         thread::spawn(move || sampler.sample());
@@ -832,8 +846,19 @@ mod tests {
         };
         let options = DemoOptions {
             screen: screen.map(str::to_string),
+            lines_per_second: None,
         };
         (Demo::start(Arc::new(sink), &options), messages)
+    }
+
+    #[test]
+    fn a_slow_log_has_ticks_on_which_no_line_is_due() {
+        // 20 lines a second: one every 50 ms, none in between.
+        assert_eq!(lines_due(Duration::from_millis(49), 20), 0);
+        assert_eq!(lines_due(Duration::from_millis(50), 20), 1);
+        assert_eq!(lines_due(Duration::from_secs(5), 20), 100);
+        assert_eq!(lines_due(Duration::from_millis(10), LINES_PER_SECOND), 100);
+        assert_eq!(lines_due(Duration::from_secs(3), 0), 0);
     }
 
     #[test]

@@ -2,10 +2,11 @@
 //! loop: requests go in as method calls that return at once, results come
 //! back as [`Message`]s.
 //!
-//! The shell's part is a [`Sink`] that posts each message to its UI thread
-//! (`PostMessageW` with the message boxed in `LPARAM`), and a handler there
-//! that feeds the models: `ListModel`, `UsageModel`, `LogBuffer`,
-//! `PullProgress`.
+//! The shell's part is a [`Sink`] that hands each message to its UI thread,
+//! and a `Controller` there that feeds the models with them.
+//!
+//! Engine control and the streams are joined here: a start subscribes to
+//! Docker's events, a stop closes the streams first.
 //!
 //! Nothing in here talks to Docker unless the last status poll said the
 //! engine runs. That is what keeps a sleeping engine asleep: a list, an
@@ -29,8 +30,7 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::backend::Backend;
-use crate::control::{EngineHost, EngineStatus, SystemHost, Transition};
+use crate::control::{EngineControl, EngineHost, EngineStatus, SystemHost, Transition};
 use crate::logs::SharedLog;
 use crate::policy::{
     EVENT_DEBOUNCE, WindowState, next_poll_delay, reloads_lists, repolls_status, sampling,
@@ -38,7 +38,7 @@ use crate::policy::{
 };
 use crate::pull::{ReferenceError, check_reference};
 use crate::removal::{self, PruneTarget, RemovalPlan};
-use crate::streams::{DockerEvent, HostReading, LogMessage, StreamSink};
+use crate::streams::{DockerEvent, HostReading, LogMessage, StreamSink, Streams};
 use crate::table::{Table, containers_table, images_table, networks_table, volumes_table};
 
 /// What a Docker request is answered with when the engine does not run.
@@ -119,7 +119,8 @@ pub enum Message {
         reference: String,
         error: Option<String>,
     },
-    /// Lines of a followed log, or its end. `token` is what `follow_logs`
+    /// The end of a followed log; its lines go into the buffer it is
+    /// followed into, not through here. `token` is what `follow_logs_into`
     /// returned.
     Log { token: u32, message: LogMessage },
     /// The host's figures, every two seconds while they are sampled.
@@ -158,7 +159,11 @@ pub struct App {
 }
 
 struct Inner {
-    backend: Backend,
+    /// Installs, starts and stops the engine. Its calls block, on
+    /// `wsl.exe` for the most part: they run on the blocking pool.
+    control: EngineControl,
+    /// Docker's events, followed logs and the usage figures.
+    streams: Streams,
     runtime: Handle,
     sink: Arc<dyn Sink>,
     /// Asks the poll task for a poll now.
@@ -203,11 +208,11 @@ impl App {
     }
 
     /// The app for the engine on `host`, on a runtime the caller keeps
-    /// alive. `SystemHost::with_proxy_command` is the host for a shell that
-    /// has no `--proxy` mode of its own.
-    pub fn with_host(runtime: Handle, host: Arc<dyn EngineHost>, sink: Arc<dyn Sink>) -> Self {
+    /// alive.
+    fn with_host(runtime: Handle, host: Arc<dyn EngineHost>, sink: Arc<dyn Sink>) -> Self {
         let inner = Arc::new_cyclic(|inner: &Weak<Inner>| Inner {
-            backend: Backend::new(host, runtime.clone(), Arc::new(Relay(inner.clone()))),
+            control: EngineControl::new(host.clone()),
+            streams: Streams::new(runtime.clone(), host, Arc::new(Relay(inner.clone()))),
             runtime: runtime.clone(),
             sink,
             poll_now: Notify::new(),
@@ -255,7 +260,7 @@ impl App {
                 shared.state = None;
             }
         }
-        let streams = self.inner.backend.streams();
+        let streams = &self.inner.streams;
         streams.set_window(window);
         if window == WindowState::Hidden {
             // `Gone` ended them already, with the logs.
@@ -288,15 +293,20 @@ impl App {
         self.engine_request(Transition::Installing, move |inner| {
             let mut progress =
                 |step: &str| inner.sink.post(Message::InstallProgress(step.to_string()));
-            inner.backend.install(base, &mut progress)
+            inner.control.install(base, &mut progress)
         });
     }
 
-    /// Starts the engine, or wakes it. `EngineRequestDone` and a `Status`
-    /// follow. A request while another one runs is turned away with an
-    /// error that says which.
+    /// Starts the engine, or wakes it, and subscribes to Docker's events if
+    /// there is a window. `EngineRequestDone` and a `Status` follow. A
+    /// request while another one runs is turned away with an error that
+    /// says which.
     pub fn start(&self) {
-        self.engine_request(Transition::Starting, |inner| inner.backend.start());
+        self.engine_request(Transition::Starting, |inner| {
+            inner.control.start()?;
+            inner.streams.watch_events();
+            Ok(())
+        });
     }
 
     /// Stops the engine and its pipe proxy. `EngineRequestDone` and a
@@ -312,7 +322,10 @@ impl App {
         }
         self.inner.apply_sampling();
         self.engine_request(Transition::Stopping, |inner| {
-            let outcome = inner.backend.stop();
+            // The streams go first, inside the transition, so the window
+            // is not told that the engine disconnected when it was asked
+            // to stop.
+            let outcome = inner.control.stop(|| inner.streams.stop_all());
             let _shared = inner.shared();
             inner.stops.fetch_add(1, Ordering::Relaxed);
             outcome
@@ -356,10 +369,10 @@ impl App {
         self.inner.shared().list = kind;
         self.inner.apply_sampling();
         let Some(kind) = kind else {
-            return self.inner.backend.streams().stop_events();
+            return self.inner.streams.stop_events();
         };
         if self.inner.may_use_docker() {
-            self.inner.backend.streams().watch_events();
+            self.inner.streams.watch_events();
         }
         self.reload(kind);
     }
@@ -434,44 +447,27 @@ impl App {
         });
     }
 
-    /// Follows a container's logs, starting with its last 500 lines. `Log`
-    /// messages with the returned token follow; the last one is `Ended`,
-    /// unless the log is stopped from here.
-    pub fn follow_logs(&self, id: String) -> u32 {
-        self.follow(id, |sink, token, message| {
-            sink.post(Message::Log { token, message });
-        })
-    }
-
     /// Follows a container's logs into `log`, starting with its last 500
     /// lines. The lines go into the buffer on the thread that reads them
     /// and never through the sink: a view polls the buffer's generation.
     /// Only the end arrives as a message, `Log` with `Ended` and the
     /// returned token, unless the log is stopped from here.
     pub fn follow_logs_into(&self, id: String, log: SharedLog) -> u32 {
-        self.follow(id, move |sink, token, message| match message {
-            LogMessage::Lines(lines) => log.append(lines),
-            LogMessage::Ended { .. } => {
-                log.apply(message.clone());
-                sink.post(Message::Log { token, message });
-            }
-        })
-    }
-
-    fn follow(
-        &self,
-        id: String,
-        mut deliver: impl FnMut(&dyn Sink, u32, LogMessage) + Send + 'static,
-    ) -> u32 {
-        let streams = self.inner.backend.streams();
+        let streams = &self.inner.streams;
         let token = streams.log_token();
         let sink = self.inner.sink.clone();
-        let mut output = move |message: LogMessage| {
-            deliver(sink.as_ref(), token, message);
+        let output = move |message: LogMessage| {
+            match message {
+                LogMessage::Lines(lines) => log.append(lines),
+                LogMessage::Ended { .. } => {
+                    log.apply(message.clone());
+                    sink.post(Message::Log { token, message });
+                }
+            }
             ControlFlow::Continue(())
         };
         match self.inner.client() {
-            Ok(client) => streams.follow_logs_as(token, client, id, output),
+            Ok(client) => streams.follow_logs(token, client, id, output),
             Err(error) => {
                 let error = Some(error);
                 let _ = output(LogMessage::Ended { error });
@@ -482,7 +478,7 @@ impl App {
 
     /// Stops a followed log. No `Ended` follows.
     pub fn stop_logs(&self, token: u32) {
-        self.inner.backend.streams().stop_logs(token);
+        self.inner.streams.stop_logs(token);
     }
 
     /// Says whether the window shows usage figures. While it does and is
@@ -516,7 +512,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.poll.abort();
-        self.inner.backend.streams().set_window(WindowState::Gone);
+        self.inner.streams.set_window(WindowState::Gone);
         if let Some(runtime) = self.runtime.take() {
             // Not waited for: an install in flight would hold up the exit.
             runtime.shutdown_background();
@@ -567,15 +563,15 @@ impl Inner {
         // The containers' figures are columns of their list and nothing
         // else: every round of them is a request per running container.
         let listed = shared.list == Some(ResourceKind::Container);
-        let streams = self.backend.streams();
-        streams.set_usage(shown && sampled.host, shown && sampled.containers && listed);
+        self.streams
+            .set_usage(shown && sampled.host, shown && sampled.containers && listed);
     }
 
     /// Polls the engine state once and tells the shell.
     async fn poll(self: &Arc<Self>) {
         let stops = self.stops.load(Ordering::Relaxed);
         let inner = self.clone();
-        let status = self.runtime.spawn_blocking(move || inner.backend.status());
+        let status = self.runtime.spawn_blocking(move || inner.control.status());
         let result = match status.await {
             Ok(status) => status.map_err(text),
             Err(panic) => Err(panic.to_string()),
@@ -946,7 +942,8 @@ mod tests {
             }
         );
 
-        let token = harness.app.follow_logs("abc".to_string());
+        let log = SharedLog::new();
+        let token = harness.app.follow_logs_into("abc".to_string(), log);
         let error = Some(NOT_RUNNING.to_string());
         let message = LogMessage::Ended { error };
         assert_eq!(harness.next(), Message::Log { token, message });
