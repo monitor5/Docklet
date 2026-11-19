@@ -93,6 +93,9 @@ pub struct StatusFacts {
     pub context_name: &'static str,
     pub context_exists: bool,
     pub docker_cli: Option<DockerCli>,
+    /// Docklet's keys in `.wslconfig`, as `crate::wslconfig::status_data`
+    /// reports them.
+    pub wslconfig: Json,
 }
 
 pub fn status_data(view: &StatusView, facts: &StatusFacts) -> Json {
@@ -124,6 +127,7 @@ pub fn status_data(view: &StatusView, facts: &StatusFacts) -> Json {
                 .as_ref()
                 .map(|cli| docker_cli(&cli.path, cli.on_path)),
         )
+        .set("wslconfig", facts.wslconfig.clone())
         .into()
 }
 
@@ -284,6 +288,7 @@ mod tests {
                 path: PathBuf::from("docker.exe"),
                 on_path: true,
             }),
+            wslconfig: Json::Null,
         };
         let expected = format!(
             concat!(
@@ -294,7 +299,7 @@ mod tests {
                 r#""rootfs_version":"{rootfs}","wsl_version":"3.0.5","#,
                 r#""docklet_version":"{docklet}","mirrored_networking":false,"#,
                 r#""docker_context":{{"name":"docklet","exists":true}},"#,
-                r#""docker_cli":{{"path":"docker.exe","on_path":true}}}}"#
+                r#""docker_cli":{{"path":"docker.exe","on_path":true}},"wslconfig":null}}"#
             ),
             rootfs = ROOTFS_VERSION.trim(),
             docklet = env!("CARGO_PKG_VERSION"),
@@ -312,6 +317,7 @@ mod tests {
             context_name: "docklet",
             context_exists: false,
             docker_cli: None,
+            wslconfig: Json::Null,
         };
         let rendered = status_data(&view, &facts).render();
         assert!(rendered.starts_with(concat!(
@@ -322,7 +328,7 @@ mod tests {
         assert!(rendered.contains(r#""wsl_version":null"#));
         assert!(rendered.contains(r#""mirrored_networking":true"#));
         assert!(rendered.contains(r#""docker_context":{"name":"docklet","exists":false}"#));
-        assert!(rendered.ends_with(r#""docker_cli":null}"#));
+        assert!(rendered.ends_with(r#""docker_cli":null,"wslconfig":null}"#));
     }
 
     #[test]
@@ -335,6 +341,7 @@ mod tests {
             context_name: "docklet",
             context_exists: true,
             docker_cli: None,
+            wslconfig: Json::Null,
         };
         let rendered = status_data(&view, &facts).render();
         assert!(
@@ -357,6 +364,7 @@ mod tests {
             context_name: "docklet",
             context_exists: false,
             docker_cli: None,
+            wslconfig: Json::Null,
         };
         assert!(!status_data(&view, &facts).render().contains("\\n"));
     }

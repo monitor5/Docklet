@@ -84,6 +84,11 @@ jobs:
             Report ($(if ($ok) { "notice" } else { "error" })) "$Name - $state - $($script:Last.Ms) ms" "[$state] $($script:Last.Text)"
             if (-not $ok) { exit 1 }
           }
+          $wslconfig = "$env:USERPROFILE\.wslconfig"
+          $wslconfigState = "$env:LOCALAPPDATA\Docklet\wslconfig"
+          $wslconfigBefore = "$env:RUNNER_TEMP\wslconfig.before"
+          # A file's bytes as one comparable string; empty when there is no file.
+          function Bytes([string]$Path) { if (Test-Path $Path) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) } else { "" } }
           '@
           Set-Content -Path "$env:RUNNER_TEMP\helper.ps1" -Value $helper
       - name: Wait for the rootfs release
@@ -102,12 +107,77 @@ jobs:
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "status (fresh)" { & $docklet status }
           if ((& $docklet status) -notlike "not-installed*") { exit 1 }
+      # The user's own .wslconfig, which Docklet must keep byte for byte: a
+      # UTF-8 BOM, CRLF, a comment and a key at its default value.
+      - name: 1b. a .wslconfig of the user's
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          $utf8Bom = [Text.UTF8Encoding]::new($true)
+          $text = "# E2E: the user's own file, kept byte for byte`r`n[wsl2]`r`nlocalhostForwarding=true`r`n"
+          [IO.File]::WriteAllBytes($wslconfig, [byte[]]($utf8Bom.GetPreamble() + $utf8Bom.GetBytes($text)))
+          Copy-Item $wslconfig $wslconfigBefore
+          Report "notice" ".wslconfig before install" (Get-Content $wslconfig -Raw)
       - name: 2. install
         timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
-          Step "install" { & $docklet install --base "${{ matrix.base }}" }
+          # Every base is installed by name, except alpine, which proves that
+          # a plain install picks it.
+          if ("${{ matrix.base }}" -eq "alpine") {
+            Step "install (default base)" { & $docklet install }
+          } else {
+            Step "install" { & $docklet install --base "${{ matrix.base }}" }
+          }
           if ((& $docklet status) -ne "stopped") { exit 1 }
+          $base = ((& $docklet base --json 2>$null) | ConvertFrom-Json).data
+          $ok = $base.installed_base -eq "${{ matrix.base }}" -and $base.default -eq "alpine" -and $base.distro_installed -eq $true
+          Report ($(if ($ok) { "notice" } else { "error" })) "docklet base" "installed_base=$($base.installed_base) default=$($base.default)"
+          if (-not $ok) { exit 1 }
+      - name: 2b. light WSL VM settings in .wslconfig
+        timeout-minutes: 8
+        run: |
+          . "$env:RUNNER_TEMP\helper.ps1"
+          $before = Bytes $wslconfigBefore
+          # The install added the light key and kept the user's lines.
+          $text = Get-Content $wslconfig -Raw
+          $ok = $text -match "(?m)^guiApplications=false\r?$" -and $text -like "*localhostForwarding=true*" -and (Test-Path "$wslconfigState\record.txt") -and (Bytes "$wslconfigState\wslconfig.backup") -eq $before
+          Report ($(if ($ok) { "notice" } else { "error" })) ".wslconfig after install" "$text | record: $(Get-Content "$wslconfigState\record.txt" -Raw -ErrorAction SilentlyContinue)"
+          if (-not $ok) { exit 1 }
+          $applied = Bytes $wslconfig
+          # revert restores the user's file byte for byte; apply puts the key back.
+          Step "wslconfig revert" { & $docklet wslconfig revert }
+          if ((Bytes $wslconfig) -ne $before -or (Test-Path "$wslconfigState\record.txt")) { Report "error" "wslconfig revert" "not restored byte for byte: $(Get-Content $wslconfig -Raw)"; exit 1 }
+          Step "wslconfig apply" { & $docklet wslconfig apply }
+          if ((Bytes $wslconfig) -ne $applied) { Report "error" "wslconfig apply" "not the same as after install: $(Get-Content $wslconfig -Raw)"; exit 1 }
+          # A key the user set wins and is reported.
+          Step "wslconfig revert (again)" { & $docklet wslconfig revert }
+          [IO.File]::WriteAllText($wslconfig, "[wsl2]`r`nguiApplications=true`r`n")
+          $own = Bytes $wslconfig
+          $apply = (& $docklet wslconfig apply --json 2>$null) | ConvertFrom-Json
+          $key = $apply.data.keys | Where-Object { $_.key -eq "guiApplications" }
+          $ok = $apply.ok -eq $true -and $key.result -eq "kept" -and $key.file_value -eq "true" -and (Bytes $wslconfig) -eq $own
+          Report ($(if ($ok) { "notice" } else { "error" })) "guiApplications=true is kept" "result=$($key.result) file_value=$($key.file_value)"
+          if (-not $ok) { exit 1 }
+          Step "wslconfig apply with the user's key (text)" { & $docklet wslconfig apply }
+          # Back to the user's first file, with the light key, for the rest of the job.
+          Copy-Item $wslconfigBefore $wslconfig -Force
+          Step "wslconfig apply (restore)" { & $docklet wslconfig apply }
+          if ((Bytes $wslconfig) -ne $applied) { Report "error" "wslconfig apply" "not the same as after install"; exit 1 }
+          # Switching the base without --yes is refused and deletes nothing.
+          $other = if ("${{ matrix.base }}" -eq "alpine") { "debian-13" } else { "alpine" }
+          Step "base set without --yes" { & $docklet base set $other } 2
+          $refused = (& $docklet base set $other --json 2>$null) | ConvertFrom-Json
+          $ok = $refused.ok -eq $false -and $refused.error.code -eq "confirmation_required" -and $refused.data.new_base -eq $other -and $refused.data.current_base -eq "${{ matrix.base }}"
+          Report ($(if ($ok) { "notice" } else { "error" })) "base set refused" "$($refused.error.code): $($refused.error.message)"
+          if (-not $ok) { exit 1 }
+          if ((& $docklet status) -ne "stopped") { Report "error" "base set" "the engine changed after a refused base set"; exit 1 }
+          $light = ((& $docklet wslconfig status --json 2>$null) | ConvertFrom-Json).data
+          Report "notice" "wslconfig status before the start" "effect=$($light.effect) written=$($light.written -join ',')"
+          # The import may have left the WSL VM running with the old settings.
+          # The runner has no other distro, so the test shuts WSL down to make
+          # the next start boot a VM that reads the file. Docklet itself never
+          # runs this.
+          wsl --shutdown
       - name: 3. start, docker info, pipe tests
         timeout-minutes: 20
         run: |
@@ -191,6 +261,17 @@ jobs:
           Report ($(if ($ok) { "notice" } else { "error" })) "status data" "state=$($status.state) ready=$($status.ready) proxy_running=$($status.proxy_running) idle_stop=$($status.idle_stop)"
           if (-not $ok) { exit 1 }
           if ($seen["doctor"].healthy -ne $true) { Report "error" "doctor data" "healthy is not true"; exit 1 }
+          # The engine started a VM after the light key was written.
+          $light = $status.wslconfig
+          $ok = $light.effect -eq "in_effect" -and $light.pending -eq $false -and ($light.written -contains "guiApplications=false")
+          Report ($(if ($ok) { "notice" } else { "error" })) "light settings in effect" "effect=$($light.effect) pending=$($light.pending) written=$($light.written -join ',')"
+          if (-not $ok) { exit 1 }
+          $check = $seen["doctor"].checks | Where-Object { $_.id -eq "wslconfig" }
+          Report "notice" "doctor wslconfig" "$($check.status): $($check.detail)"
+          # Reported, not checked: what WSLg leaves in the distro, and the VM's memory.
+          $wslg = (wsl -d docklet --exec sh -c 'ls -a /mnt/wslg 2>&1 | head -n 5' | Out-String).Trim()
+          $vm = Get-Process vmmemWSL, vmmem -ErrorAction SilentlyContinue | Select-Object -First 1
+          Report "notice" "WSLg and VM memory" "/mnt/wslg: $wslg | VM working set MB: $([int]($vm.WorkingSet64 / 1MB))"
           # docklet docker: the Docker CLI against the Docklet pipe, no --context needed.
           Timed "docklet-docker-version" "`"$docklet`" docker version --format {{.Server.Version}}" 60
           if ($Last.Text.Trim() -notlike "29.*") { Report "error" "docklet-docker-version" "unexpected server version"; exit 1 }
@@ -407,6 +488,11 @@ jobs:
           Step "uninstall without --yes" { & $docklet uninstall } 2
           Step "uninstall" { & $docklet uninstall --yes }
           if ((& $docklet status) -notlike "not-installed*") { exit 1 }
+          # Uninstall takes Docklet's key out: the user's file is back, byte for byte.
+          $restored = (Bytes $wslconfig) -eq (Bytes $wslconfigBefore) -and -not (Test-Path "$wslconfigState\record.txt")
+          Report ($(if ($restored) { "notice" } else { "error" })) ".wslconfig after uninstall" "$(Get-Content $wslconfig -Raw -ErrorAction SilentlyContinue)"
+          if (-not $restored) { exit 1 }
+          Remove-Item $wslconfig -Force
 
   # `docklet-desktop.exe --proxy` and `docklet-native.exe --proxy` serve the
   # same pipe as `docklet proxy`. The CLI's own proxy is stopped first so the

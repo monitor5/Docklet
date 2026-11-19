@@ -59,25 +59,90 @@ Desktop required.
 ## Engine bases
 
 `docklet install --base <name>` picks the Linux base of the engine distro;
-`docklet bases` lists them. All of them run the same Docker Engine API, so
-containers, images and the Windows `docker` / `docker compose` CLIs behave the
-same on each.
+`docklet bases` lists them and `docklet base` shows the one installed. All of
+them run the same Docker Engine API, so containers, images and the Windows
+`docker` / `docker compose` CLIs behave the same on each.
 
-| Base                  | What it is                                                                  |
-| --------------------- | --------------------------------------------------------------------------- |
-| `debian-13` (default) | Debian 13, systemd, docker-ce from Docker's own repository                  |
-| `ubuntu-26.04`        | Ubuntu 26.04, otherwise the same as `debian-13`                             |
-| `alpine`              | Alpine Linux 3.24, no init system, Docker from Alpine's packages (unpinned) |
+| Base               | What it is                                                                  |
+| ------------------ | --------------------------------------------------------------------------- |
+| `alpine` (default) | Alpine Linux 3.24, no init system, Docker from Alpine's packages (unpinned) |
+| `debian-13`        | Debian 13, systemd, docker-ce from Docker's own repository                  |
+| `ubuntu-26.04`     | Ubuntu 26.04, otherwise the same as `debian-13`                             |
 
-Pick `alpine` if you want the engine small and quick: a 76 MiB download instead
-of 169 MiB, and about 3 s instead of 14 s until Docker answers after a start or
-a wake (see [docs/spikes.md](docs/spikes.md)). The
-trade-offs only concern the engine distro itself, not your containers: its
-userland is musl and busybox, there is no systemd (a boot script starts dockerd
-and nothing restarts it if it exits), Docker's version follows Alpine's
-packages rather than Docker's own repository, and the buildx and compose CLI
-plugins are not installed inside the distro. The Windows-side `docker compose`
-is unaffected.
+`alpine` is the default because it is the lightest: a 76 MiB download instead
+of 169 MiB, about 3 s instead of 14 s until Docker answers after a start or a
+wake, and a WSL VM of 1168 MB against 1402 MB for Debian with systemd (see
+[docs/spikes.md](docs/spikes.md)). An install made before it became the
+default keeps its base; nothing reinstalls by itself.
+
+Pick `debian-13` or `ubuntu-26.04` when you need what Alpine leaves out. The
+differences only concern the engine distro itself, not your containers:
+
+- **systemd**: on the Debian family it starts dockerd and restarts it if it
+  exits. On Alpine a boot script starts dockerd and nothing restarts it.
+- **docker-ce from Docker's repository**: the Debian family gets Docker's own
+  packages; Alpine's Docker follows Alpine's packages and their versions.
+- **buildx and compose inside the distro**: installed on the Debian family,
+  not on Alpine. The Windows-side `docker compose` and `docker buildx` are
+  unaffected; this only matters if you run Docker from a shell inside the
+  `docklet` distro.
+- **glibc**: Alpine's userland is musl and busybox.
+
+To switch, `docklet base set <name> --yes` reinstalls the engine on another
+base. It deletes every container, image and volume in the engine; without
+`--yes` it changes nothing and says what would be deleted (counted when the
+engine is running). Docklet does not carry images or volumes across: save what
+you want to keep first, for example with `docklet docker save -o images.tar
+<image>` and a volume backup through a container, and load it afterwards.
+
+A rootfs you built yourself (it has to fulfil the same contract as
+`distro/`'s) installs with
+`docklet install --rootfs <file or https:// URL> --sha256 <hash>`; the hash is
+required, and a file that does not match is refused (and kept).
+
+## Light WSL VM settings
+
+WSL runs every WSL 2 distro of a user in one VM, configured by
+`%USERPROFILE%\.wslconfig`. Out of the box that VM also runs WSLg, the
+support for Linux GUI apps, which took about 390 MB of the 1168 MB an idle
+Alpine engine cost on one PC. So `docklet install` and `docklet up` add one
+key to the file:
+
+```ini
+[wsl2]
+# Added by Docklet; `docklet wslconfig revert` removes it.
+guiApplications=false
+```
+
+- **What it costs**: Linux GUI apps, and their sound, stop working in every
+  distro, not only Docklet's. If you use them, keep WSLg (see below).
+- **Your file stays yours**: comments, other sections and keys, their order,
+  the line endings and the encoding (UTF-8 with or without BOM, UTF-16) are
+  kept. A key you set yourself wins: with `guiApplications=true` in the file
+  Docklet says so and changes nothing. A file that is read-only, a symbolic
+  link, or in an encoding Docklet cannot write back unchanged is left alone,
+  with a warning.
+- **Undo**: before its first change Docklet copies the file to
+  `%LOCALAPPDATA%\Docklet\wslconfig\wslconfig.backup` and records which keys
+  it added. `docklet wslconfig revert` removes those keys and nothing else; if
+  you have not touched the file since, it is put back byte for byte.
+  `docklet uninstall` does the same.
+- **Opt out**: `docklet install --no-wslconfig` or `docklet up --no-wslconfig`
+  for once; `docklet config set wslconfig keep` for good. Then Docklet changes
+  the file only when you run `docklet wslconfig apply` or `revert`.
+- **Memory cap**: `docklet config set vm-memory 4GB` adds `memory=4GB` the
+  same way (about 140 MB less in the measurement, see
+  [docs/spikes.md](docs/spikes.md)); `off` removes it. It limits every
+  distro, and large builds or containers may run out of memory, so it is off
+  by default.
+- **When it takes effect**: WSL reads the file when its VM starts. Docklet
+  never runs `wsl --shutdown`, since other distros may be running your work.
+  If the VM was already running, Docklet says so: run `wsl --shutdown` once
+  those distros are idle, or, with only Docklet's distro running, `docklet
+  stop`, wait a minute for the VM to stop, and `docklet start`.
+  `docklet wslconfig status`, `docklet doctor` and `docklet status --json`
+  tell whether the settings are in effect; they compare when the VM booted
+  (the docklet distro's `/proc/uptime`) with when the file was written.
 
 ## Idle stop
 
