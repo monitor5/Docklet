@@ -5,8 +5,8 @@ dedicated WSL2 distro, with Kubernetes you can switch on and off. No Docker
 Desktop required.
 
 > Status: early development. Milestones M0 to M2 are done (engine lifecycle in
-> the CLI, Windows `docker` CLI through the pipe). M3 (desktop UI and tray) is in
-> review. Nothing here is ready for daily use yet.
+> the CLI, Windows `docker` CLI through the pipe). M3 (the native window and
+> tray icon) is in review. Nothing here is ready for daily use yet.
 
 ## What works today
 
@@ -31,15 +31,15 @@ Desktop required.
   one step after a confirmation, and each tab can remove what is unused and
   report the space it got back. Closing the window leaves only the tray icon
   and gives the memory back.
-- **Web app** (`docklet-desktop.exe`, Tauri 2 + WebView2): the earlier window
-  with the same lists and logs, without the usage figures and the bulk
-  removal. It stays until the native app has replaced it.
 
 ## What does not work yet
 
 - Bind mounts of Windows paths (`-v C:\project:/app`).
 - Kubernetes.
 - Registering the CLI on `PATH`.
+- An installer. The native app is a single executable that is not packaged
+  yet; the earlier installer came from the Tauri bundler, which is gone with
+  the web window.
 - An updater.
 
 ## How it works
@@ -53,8 +53,7 @@ Desktop required.
 - **Kubernetes**: a single-node k3d cluster that is started and stopped on demand.
 - **App**: a native Win32 window and tray icon (`apps/native`) on top of
   `docklet-app`, which holds everything that is not drawing. Measured on one
-  PC: about 30 MB with the window open against about 350 MB for the WebView2
-  window (see [docs/spikes.md](docs/spikes.md)).
+  PC: about 30 MB with the window open (see [docs/spikes.md](docs/spikes.md)).
 
 ## Engine bases
 
@@ -112,24 +111,21 @@ Windows 11 22H2 or later (x64) with WSL 2.4.4 or later.
 
 ## Development
 
-Prerequisites: Rust (the pinned toolchain installs itself through `rust-toolchain.toml`),
-the MSVC C++ build tools, Node 24 or later, and pnpm.
+Prerequisites: Rust (the pinned toolchain installs itself through `rust-toolchain.toml`)
+and the MSVC C++ build tools. There is nothing else to install: no Node, no
+WebView2.
 
 ```sh
-pnpm install
-pnpm dev        # run the app
-pnpm lint       # Biome
-pnpm test       # Vitest
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-pnpm build      # NSIS installer in target/release/bundle/nsis
+cargo build --release -p docklet-cli -p docklet-native   # target/release/docklet.exe, docklet-native.exe
 ```
 
 ## Layout
 
 | Path                    | Contents                                                                 |
 | ----------------------- | ------------------------------------------------------------------------ |
-| `apps/desktop`          | React UI and the Tauri shell (`src-tauri`)                               |
 | `apps/native`           | The native Win32 app                                                     |
 | `crates/docklet-app`    | Application logic without a UI toolkit: control, lists, selection, usage |
 | `crates/docklet-cli`    | The `docklet` command line                                               |

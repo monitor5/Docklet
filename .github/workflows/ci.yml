@@ -26,8 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
-      # The Tauri shell needs WebKitGTK on Linux and is Windows-only anyway,
-      # so Linux covers the platform-neutral crates.
+      # The native app is Win32 and does not build on Linux, so Linux covers
+      # the platform-neutral crates.
       - name: Clippy
         run: cargo clippy -p docklet-app -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl --all-targets -- -D warnings
       - name: Relay (distro binary)
@@ -36,31 +36,21 @@ jobs:
           cargo clippy --manifest-path distro/relay/Cargo.toml --locked -- -D warnings
       - name: Test
         run: cargo test -p docklet-app -p docklet-cli -p docklet-core -p docklet-engine -p docklet-proxy -p docklet-wsl
+      # The only JSON file in the repository that a program reads at run time
+      # (dockerd's config). A syntax error would stop the engine from starting.
+      - name: JSON syntax
+        run: jq empty distro/rootfs/etc/docker/daemon.json
 
   windows:
     name: App (Windows)
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: pnpm
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Biome
-        run: pnpm biome ci .
-      - name: Frontend tests
-        run: pnpm -r test
       - name: Format
         run: cargo fmt --all --check
-      # generate_context! needs the frontend bundle at compile time.
-      - name: Build frontend
-        run: pnpm --filter "@docklet/desktop" build
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
@@ -71,23 +61,23 @@ jobs:
       - name: Test (runner only)
         timeout-minutes: 5
         run: cargo test -p docklet-app -p docklet-native -p docklet-proxy -p docklet-wsl -p docklet-cli -- --ignored
-      # The native app is one executable with nothing to bundle. Its size is
-      # reported with every run, since staying small is the point of it.
-      - name: Build the native app
-        run: cargo build --release -p docklet-native
-      - name: Report the native app's size
+      # Both programs are single executables with nothing to bundle. Their
+      # sizes are reported with every run, since staying small is the point.
+      - name: Build the CLI and the native app
+        run: cargo build --release -p docklet-cli -p docklet-native
+      - name: Report the executables' sizes
         run: |
-          $size = (Get-Item target/release/docklet-native.exe).Length
-          Write-Host "::notice title=docklet-native.exe::$([math]::Round($size / 1KB)) KB"
+          foreach ($name in "docklet", "docklet-native") {
+            $size = (Get-Item "target/release/$name.exe").Length
+            Write-Host "::notice title=$name.exe::$([math]::Round($size / 1KB)) KB"
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docklet
+          path: target/release/docklet.exe
+          if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
           name: docklet-native
           path: target/release/docklet-native.exe
-          if-no-files-found: error
-      - name: Build installer
-        run: pnpm tauri build
-      - uses: actions/upload-artifact@v7
-        with:
-          name: docklet-nsis
-          path: target/release/bundle/nsis/*.exe
           if-no-files-found: error

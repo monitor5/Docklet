@@ -9,20 +9,16 @@ on:
     paths:
       - .github/workflows/e2e.yml
       - crates/**
-      - apps/desktop/src-tauri/**
       - apps/native/**
       - distro/**
       - Cargo.lock
-      - pnpm-lock.yaml
   pull_request:
     paths:
       - .github/workflows/e2e.yml
       - crates/**
-      - apps/desktop/src-tauri/**
       - apps/native/**
       - distro/**
       - Cargo.lock
-      - pnpm-lock.yaml
 
 permissions:
   contents: read
@@ -408,42 +404,28 @@ jobs:
           Step "uninstall" { & $docklet uninstall --yes }
           if ((& $docklet status) -notlike "not-installed*") { exit 1 }
 
-  # `docklet-desktop.exe --proxy` and `docklet-native.exe --proxy` serve the
-  # same pipe as `docklet proxy`. The CLI's own proxy is stopped first so the
-  # desktop binary takes over, and the desktop's before the native one does.
-  desktop-proxy:
+  # `docklet-native.exe --proxy` serves the same pipe as `docklet proxy`, and
+  # `docklet-native.exe --tray` is the app with only its tray icon. The CLI's
+  # own proxy is stopped first so the native binary takes over.
+  native-app:
     runs-on: windows-2025
-    # Two proxies are put through the same steps, and each waits for an idle
-    # engine to stop.
-    timeout-minutes: 45
+    # Two steps wait for an idle engine to stop.
+    timeout-minutes: 30
     env:
       # Keep in sync with distro/bases.txt.
       BASE: debian-13
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: pnpm
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - name: Install JS dependencies
-        timeout-minutes: 5
-        run: pnpm install --frozen-lockfile
-      # generate_context! needs the frontend bundle at compile time.
-      - name: Build frontend
-        timeout-minutes: 5
-        run: pnpm --filter "@docklet/desktop" build
-      - name: Build the CLI, the desktop app and the native app
+      - name: Build the CLI and the native app
         timeout-minutes: 15
-        run: cargo build --release -p docklet-cli -p docklet-desktop -p docklet-native
+        run: cargo build --release -p docklet-cli -p docklet-native
       - name: Define helpers
         run: |
           $helper = @'
           $docklet = "$env:GITHUB_WORKSPACE\target\release\docklet.exe"
-          $desktop = "$env:GITHUB_WORKSPACE\target\release\docklet-desktop.exe"
           $native = "$env:GITHUB_WORKSPACE\target\release\docklet-native.exe"
           function Report([string]$Kind, [string]$Title, [string]$Text) {
             $flat = ($Text -replace "`0", "" -replace "\s*\r?\n\s*", " | ").Trim()
@@ -499,93 +481,21 @@ jobs:
           Report "notice" "status without proxy" "$line"
           if ($line -notlike "starting*") { Report "error" "status without proxy" "expected a line starting with 'starting'"; exit 1 }
           if (-not (Running)) { Report "error" "proxy stop" "the engine stopped with the proxy"; exit 1 }
-      - name: 2. desktop proxy mode
+      - name: 2. native proxy mode
         timeout-minutes: 10
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "cli setup" { & $docklet cli setup }
           $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
           $docker = "`"$dockerExe`" --context docklet"
-          $app = Start-Process $desktop -ArgumentList "--proxy" -WindowStyle Hidden -PassThru
-          $ready = $false
-          for ($i = 0; $i -lt 20 -and -not $ready; $i++) {
-            if ((& $docklet status | Select-Object -First 1) -eq "running") { $ready = $true } else { Start-Sleep -Seconds 1 }
-          }
-          Report ($(if ($ready) { "notice" } else { "error" })) "desktop proxy ready" "status running within 20 s: $ready"
-          if (-not $ready) { taskkill /F /T /PID $app.Id | Out-Null; exit 1 }
-          Timed "pipe-version" "$docker version --format {{.Server.Version}}" 30
-          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "pipe-version" "unexpected server version"; exit 1 }
-          Timed "pipe-hello-world" "$docker run --rm hello-world" 120
-          Timed "pipe-half-close" "echo hi| $docker run -i --rm alpine cat" 90
-          if ($Last.Text.Trim() -notlike "*hi") { Report "error" "pipe-half-close" "output is not hi"; exit 1 }
-          # The proxy must be idle once the clients are gone.
-          $before = (Get-Process docklet-desktop -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
-          Start-Sleep -Seconds 10
-          $after = (Get-Process docklet-desktop -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
-          $delta = [math]::Round($after - $before, 2)
-          $relays = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" | Where-Object { $_.CommandLine -like "*docklet-relay*" }).Count
-          Report ($(if ($delta -le 1 -and $relays -eq 0) { "notice" } else { "error" })) "desktop proxy idle" "CPU seconds in 10 s: $delta; relay processes left: $relays"
-          if ($delta -gt 1 -or $relays -ne 0) { exit 1 }
-      # The desktop binary's proxy stops an unused engine and wakes it, like
-      # the CLI's. Leaves the proxy up for step 3, engine running or asleep.
-      - name: 2b. desktop proxy, idle stop and wake on connect
-        timeout-minutes: 10
-        env:
-          # Read by the proxy when it starts. The public setting counts
-          # minutes; a test cannot wait that long.
-          DOCKLET_IDLE_STOP_SECONDS: "20"
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
-          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
-          $docker = "`"$dockerExe`" --context docklet"
-          # The proxy from step 2 serves with idle stop, at the default time.
-          $idle = ((& $docklet status --json 2>$null) | ConvertFrom-Json).data.idle_stop
-          Report ($(if ($idle -eq $true) { "notice" } else { "error" })) "desktop proxy mode" "idle_stop=$idle"
-          if ($idle -ne $true) { exit 1 }
-          # Replace it by one that starts with the short idle time.
-          Step "proxy stop" { & $docklet proxy stop }
-          for ($i = 0; $i -lt 10 -and (Get-Process docklet-desktop -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
-          $app = Start-Process $desktop -ArgumentList "--proxy" -WindowStyle Hidden -PassThru
-          $ready = $false
-          for ($i = 0; $i -lt 20 -and -not $ready; $i++) {
-            if ((& $docklet status | Select-Object -First 1) -eq "running") { $ready = $true } else { Start-Sleep -Seconds 1 }
-          }
-          if (-not $ready) { Report "error" "desktop proxy ready" "status not running within 20 s"; taskkill /F /T /PID $app.Id | Out-Null; exit 1 }
-          # Nothing connects from here on: the distro must stop while the proxy stays.
-          $watch = [Diagnostics.Stopwatch]::StartNew()
-          while ((Running) -and $watch.Elapsed.TotalSeconds -lt 180) { Start-Sleep -Seconds 2 }
-          if (Running) { Report "error" "desktop idle stop" "distro still running after 180 s"; exit 1 }
-          if (-not (Get-Process docklet-desktop -ErrorAction SilentlyContinue)) { Report "error" "desktop idle stop" "the proxy is gone"; exit 1 }
-          $line = (& $docklet status | Select-Object -First 1)
-          Report ($(if ($line -like "sleeping*") { "notice" } else { "error" })) "desktop idle stop" "asleep after about $([int]$watch.Elapsed.TotalSeconds) s; status: $line"
-          if ($line -notlike "sleeping*") { exit 1 }
-          Timed "desktop-wake-version" "$docker version --format {{.Server.Version}}" 180
-          if ($Last.Text.Trim() -notlike "29.*") { Report "error" "desktop-wake-version" "unexpected server version"; exit 1 }
-          Report "notice" "desktop wake duration" "$($Last.Ms) ms"
-          $line = (& $docklet status | Select-Object -First 1)
-          if ($line -ne "running") { Report "error" "desktop wake" "status after the wake: $line"; exit 1 }
-      # The native app's proxy mode, with the same checks as the desktop's.
-      # It takes the pipe over from the desktop proxy of step 2b.
-      - name: 2c. native proxy mode
-        timeout-minutes: 10
-        run: |
-          . "$env:RUNNER_TEMP\helper.ps1"
-          $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
-          $docker = "`"$dockerExe`" --context docklet"
-          Step "proxy stop" { & $docklet proxy stop }
-          for ($i = 0; $i -lt 10 -and (Get-Process docklet-desktop -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
-          if (Get-Process docklet-desktop -ErrorAction SilentlyContinue) { Report "error" "proxy stop" "the desktop proxy is still running"; exit 1 }
           $app = Start-Process $native -ArgumentList "--proxy" -WindowStyle Hidden -PassThru
-          # The engine may have stopped between the two proxies. Either way
-          # the proxy is ready once the state names it: running or sleeping.
           $ready = $false
           for ($i = 0; $i -lt 20 -and -not $ready; $i++) {
-            $line = (& $docklet status | Select-Object -First 1)
-            if ($line -eq "running" -or $line -like "sleeping*") { $ready = $true } else { Start-Sleep -Seconds 1 }
+            if ((& $docklet status | Select-Object -First 1) -eq "running") { $ready = $true } else { Start-Sleep -Seconds 1 }
           }
-          Report ($(if ($ready) { "notice" } else { "error" })) "native proxy ready" "status within 20 s: $line"
+          Report ($(if ($ready) { "notice" } else { "error" })) "native proxy ready" "status running within 20 s: $ready"
           if (-not $ready) { taskkill /F /T /PID $app.Id | Out-Null; exit 1 }
-          Timed "native-pipe-version" "$docker version --format {{.Server.Version}}" 180
+          Timed "native-pipe-version" "$docker version --format {{.Server.Version}}" 30
           if ($Last.Text.Trim() -notlike "29.*") { Report "error" "native-pipe-version" "unexpected server version"; exit 1 }
           Timed "native-pipe-hello-world" "$docker run --rm hello-world" 120
           Timed "native-pipe-half-close" "echo hi| $docker run -i --rm alpine cat" 90
@@ -601,7 +511,7 @@ jobs:
           if ($delta -gt 1 -or $relays -ne 0) { exit 1 }
       # The native binary's proxy stops an unused engine and wakes it, like
       # the CLI's. Leaves the proxy up for the next steps, engine running.
-      - name: 2d. native proxy, idle stop and wake on connect
+      - name: 2b. native proxy, idle stop and wake on connect
         timeout-minutes: 10
         env:
           # Read by the proxy when it starts. The public setting counts
@@ -611,7 +521,7 @@ jobs:
           . "$env:RUNNER_TEMP\helper.ps1"
           $dockerExe = ((& $docklet cli setup) | Where-Object { $_ -like "Docker CLI: *" }) -replace "^Docker CLI: ", ""
           $docker = "`"$dockerExe`" --context docklet"
-          # The proxy from step 2c serves with idle stop, at the default time.
+          # The proxy from step 2 serves with idle stop, at the default time.
           $idle = ((& $docklet status --json 2>$null) | ConvertFrom-Json).data.idle_stop
           Report ($(if ($idle -eq $true) { "notice" } else { "error" })) "native proxy mode" "idle_stop=$idle"
           if ($idle -ne $true) { exit 1 }
@@ -641,12 +551,12 @@ jobs:
           if ($line -ne "running") { Report "error" "native wake" "status after the wake: $line"; exit 1 }
       # The native app with only its tray icon holds nothing: no child
       # process, no CPU, and it leaves a sleeping engine asleep. The proxy of
-      # step 2d, which is the same executable, is told apart by process ID.
-      - name: 2e. native app in the tray
+      # step 2b, which is the same executable, is told apart by process ID.
+      - name: 2c. native app in the tray
         timeout-minutes: 10
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
-          # Nothing connects: the engine goes back to sleep after the wake of step 2d.
+          # Nothing connects: the engine goes back to sleep after the wake of step 2b.
           $watch = [Diagnostics.Stopwatch]::StartNew()
           while ((Running) -and $watch.Elapsed.TotalSeconds -lt 180) { Start-Sleep -Seconds 2 }
           if (Running) { Report "error" "tray" "distro still running after 180 s"; exit 1 }
@@ -675,20 +585,19 @@ jobs:
           . "$env:RUNNER_TEMP\helper.ps1"
           Step "stop" { & $docklet stop }
           # The proxy exits on the stop event; give it a moment to unwind.
-          # It is the native one since step 2c; the desktop's went there.
-          for ($i = 0; $i -lt 10 -and (Get-Process docklet-desktop, docklet-native -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
-          $left = @(Get-Process docklet-desktop, docklet-native -ErrorAction SilentlyContinue)
+          for ($i = 0; $i -lt 10 -and (Get-Process docklet-native -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
+          $left = @(Get-Process docklet-native -ErrorAction SilentlyContinue)
           if ($left.Count -gt 0) {
             Report "error" "stop" "still running after stop: $(($left | ForEach-Object { $_.ProcessName }) -join ', ')"
             $left | ForEach-Object { taskkill /F /T /PID $_.Id | Out-Null }
             exit 1
           }
           if (Running) { Report "error" "stop" "docklet still listed as running"; exit 1 }
-          Report "notice" "after stop" "no docklet-desktop or docklet-native process, distro not running"
+          Report "notice" "after stop" "no docklet-native process, distro not running"
       - name: Cleanup
         if: always()
         timeout-minutes: 8
         run: |
           . "$env:RUNNER_TEMP\helper.ps1"
-          Get-Process docklet-desktop, docklet-native -ErrorAction SilentlyContinue | ForEach-Object { taskkill /F /T /PID $_.Id | Out-Null }
+          Get-Process docklet-native -ErrorAction SilentlyContinue | ForEach-Object { taskkill /F /T /PID $_.Id | Out-Null }
           Step "uninstall" { & $docklet uninstall --yes }
